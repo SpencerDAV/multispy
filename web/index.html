@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MultiSpy</title>
+<style>
+  :root {
+    --bg: #15171b;
+    --surface: #1c1f25;
+    --surface-2: #23272f;
+    --border: #32373f;
+    --text: #e4e7ec;
+    --text-dim: #969ca8;
+    --accent: #5a9cff;
+    --good: #43c47c;
+    --warn: #e5a53f;
+    --bad: #e5604f;
+    --axis-x: #ff5a5a;
+    --axis-y: #4ddb7f;
+    --axis-z: #5a9cff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+    overflow: hidden;
+  }
+  button, input, select { font: inherit; color: inherit; }
+
+  #app { display: grid; grid-template-rows: auto 1fr auto; height: 100%; }
+
+  /* ---------------------------------------------------------- toolbar */
+  #toolbar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 8px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  #toolbar .title { font-weight: 600; letter-spacing: .2px; }
+  #toolbar .title span { color: var(--text-dim); font-weight: 400; margin-left: 6px; }
+  .spacer { flex: 1; }
+  .group { display: flex; align-items: center; gap: 1px; }
+  .group > button {
+    background: var(--surface-2); border: 1px solid var(--border);
+    padding: 5px 10px; cursor: pointer;
+  }
+  .group > button:first-child { border-radius: 5px 0 0 5px; }
+  .group > button:last-child { border-radius: 0 5px 5px 0; }
+  .group > button:hover { background: #2c313a; }
+  .group > button.on { background: var(--accent); border-color: var(--accent); color: #0d1016; font-weight: 600; }
+  .group > button.axis0.on { background: var(--axis-x); border-color: var(--axis-x); }
+  .group > button.axis1.on { background: var(--axis-y); border-color: var(--axis-y); }
+  .group > button.axis2.on { background: var(--axis-z); border-color: var(--axis-z); }
+  button.action {
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 5px 12px; cursor: pointer;
+  }
+  button.action:hover { background: #2c313a; }
+  button.action.primary { background: var(--accent); border-color: var(--accent); color: #0d1016; font-weight: 600; }
+  button.action.primary:hover { filter: brightness(1.1); }
+  button.action:disabled { opacity: .45; cursor: default; }
+  .toggle { display: flex; align-items: center; gap: 5px; color: var(--text-dim); cursor: pointer; }
+  .toggle input { accent-color: var(--accent); }
+
+  /* ------------------------------------------------------------- body */
+  #body { display: grid; grid-template-columns: 150px 1fr 310px; min-height: 0; }
+
+  /* ---------------------------------------------------------- filmstrip */
+  #filmstrip { background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; padding: 6px; }
+  .film {
+    position: relative; margin-bottom: 6px; border: 2px solid transparent;
+    border-radius: 5px; overflow: hidden; cursor: pointer; background: #000;
+  }
+  .film.sel { border-color: var(--accent); }
+  .film img { display: block; width: 100%; height: auto; opacity: .82; }
+  .film.sel img { opacity: 1; }
+  .film .meta {
+    position: absolute; inset: auto 0 0 0; display: flex; justify-content: space-between;
+    padding: 2px 5px; font-size: 10px; background: linear-gradient(transparent, #000c);
+  }
+  .film .dot { width: 7px; height: 7px; border-radius: 50%; align-self: center; }
+  .film.off img { opacity: .3; filter: grayscale(1); }
+
+  /* ------------------------------------------------------------- canvas */
+  #stage { position: relative; min-width: 0; background: #0d0f12; }
+  #canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  #hint {
+    position: absolute; left: 10px; bottom: 10px; padding: 5px 9px;
+    background: #000a; border: 1px solid var(--border); border-radius: 5px;
+    color: var(--text-dim); font-size: 11px; pointer-events: none; max-width: 60%;
+  }
+  #zoombadge {
+    position: absolute; right: 10px; bottom: 10px; padding: 4px 8px;
+    background: #000a; border: 1px solid var(--border); border-radius: 5px;
+    color: var(--text-dim); font-size: 11px; pointer-events: none;
+  }
+
+  /* -------------------------------------------------------------- panel */
+  #panel { background: var(--surface); border-left: 1px solid var(--border); overflow-y: auto; }
+  .section { border-bottom: 1px solid var(--border); }
+  .section > h3 {
+    margin: 0; padding: 8px 10px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .7px; color: var(--text-dim); font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .section > h3 .count { color: var(--text); background: var(--surface-2);
+    border-radius: 9px; padding: 1px 7px; font-size: 10px; letter-spacing: 0; }
+  .section .inner { padding: 0 10px 10px; }
+  .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+  .row .k { color: var(--text-dim); }
+  .row .v { font-variant-numeric: tabular-nums; }
+
+  .ptlist { max-height: 260px; overflow-y: auto; }
+  .pt {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 7px; align-items: center;
+    padding: 4px 6px; border-radius: 4px; cursor: pointer;
+  }
+  .pt:hover { background: var(--surface-2); }
+  .pt.sel { background: #2b3c57; }
+  .pt .swatch { width: 9px; height: 9px; border-radius: 50%; background: var(--text-dim); }
+  .pt.here .swatch { background: var(--good); }
+  .pt .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pt .err { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .pt .err.hi { color: var(--bad); }
+
+  .imglist .ir {
+    display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
+    padding: 3px 6px; border-radius: 4px; cursor: pointer; align-items: center;
+  }
+  .imglist .ir:hover { background: var(--surface-2); }
+  .imglist .ir .n { font-variant-numeric: tabular-nums; font-size: 11px; }
+  .note { color: var(--warn); font-size: 11px; margin: 3px 0; }
+  .note.bad { color: var(--bad); }
+  .msg { color: var(--text-dim); font-size: 11px; margin: 3px 0; }
+  .empty { color: var(--text-dim); font-size: 11px; font-style: italic; }
+
+  .axiscounts { display: flex; gap: 6px; }
+  .axiscounts div {
+    flex: 1; text-align: center; padding: 4px; border-radius: 4px;
+    background: var(--surface-2); font-variant-numeric: tabular-nums;
+  }
+  .axiscounts div.x { border-bottom: 2px solid var(--axis-x); }
+  .axiscounts div.y { border-bottom: 2px solid var(--axis-y); }
+  .axiscounts div.z { border-bottom: 2px solid var(--axis-z); }
+  .axiscounts div.short { color: var(--warn); }
+
+  .smallbtn {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 8px; cursor: pointer; font-size: 11px;
+  }
+  .smallbtn:hover { background: #2c313a; }
+  .cons { font-size: 11px; }
+  .cons li { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; }
+  .cons li > span:first-child { flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .cons ul { list-style: none; margin: 0; padding: 0; }
+  .cons .err { color: var(--text-dim); font-variant-numeric: tabular-nums; flex: none; }
+  .cons .err.hi { color: var(--bad); }
+  .x-btn { background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 0 3px; }
+  .x-btn:hover { color: var(--bad); }
+  input[type=text], input[type=number], select {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 3px 6px; width: 100%;
+  }
+
+  /* ---------------------------------------------------------- statusbar */
+  #statusbar {
+    display: flex; align-items: center; gap: 12px; padding: 5px 12px;
+    background: var(--surface); border-top: 1px solid var(--border);
+    color: var(--text-dim); font-size: 11px;
+  }
+  #statusbar .ok { color: var(--good); }
+  #statusbar .warn { color: var(--warn); }
+  #statusbar .bad { color: var(--bad); }
+  #statusbar .dirty { color: var(--warn); }
+
+  /* ------------------------------------------------------- project menu */
+  #projwrap { position: relative; }
+  #projmenu {
+    position: absolute; top: 100%; left: 0; margin-top: 5px; z-index: 40;
+    min-width: 320px; max-height: 60vh; overflow-y: auto;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 6px; box-shadow: 0 10px 28px #000a; padding: 8px;
+  }
+  #projmenu[hidden] { display: none; }
+  #projmenu .head { color: var(--text-dim); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .6px; margin: 6px 2px 4px; }
+  #projmenu .pr {
+    display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
+    padding: 5px 7px; border-radius: 4px; cursor: pointer;
+  }
+  #projmenu .pr:hover { background: #2f3540; }
+  #projmenu .pr.cur { background: #2b3c57; }
+  #projmenu .pr .sub { color: var(--text-dim); font-size: 11px; }
+  #projmenu .newrow { display: flex; gap: 5px; margin-top: 4px; }
+  #projmenu .path { color: var(--text-dim); font-size: 10px; word-break: break-all;
+    padding: 4px 2px 0; border-top: 1px solid var(--border); margin-top: 7px; }
+
+  /* ----------------------------------------------------------- dropzone */
+  #dropzone {
+    position: absolute; inset: 0; z-index: 30; display: none;
+    align-items: center; justify-content: center;
+    background: #0d0f12e0; border: 3px dashed var(--accent); border-radius: 8px;
+    font-size: 17px; color: var(--accent); font-weight: 600; pointer-events: none;
+  }
+  #dropzone.on { display: flex; }
+
+  /* -------------------------------------------------------- film remove */
+  .film .rm {
+    position: absolute; top: 3px; right: 3px; width: 19px; height: 19px;
+    border: none; border-radius: 4px; background: #000b; color: #fff;
+    cursor: pointer; line-height: 1; font-size: 13px; padding: 0;
+    opacity: 0; transition: opacity .12s;
+  }
+  .film:hover .rm { opacity: 1; }
+  .film .rm:hover { background: var(--bad); }
+
+  #uploadrow { padding: 4px 2px 0; }
+  #uploadrow progress { width: 100%; height: 5px; }
+
+  /* ------------------------------------------------- focal observability */
+  .v-good { color: var(--good); }
+  .v-weak { color: var(--warn); }
+  .v-poor, .v-unusable { color: var(--bad); }
+  .obs-head { font-size: 15px; font-variant-numeric: tabular-nums; margin: 1px 0 4px; }
+  .obs-bar { height: 5px; background: var(--surface-2); border-radius: 3px; overflow: hidden; margin-bottom: 7px; }
+  .obs-bar span { display: block; height: 100%; }
+  .obs-bar span.good { background: var(--good); }
+  .obs-bar span.weak { background: var(--warn); }
+  .obs-bar span.poor, .obs-bar span.unusable { background: var(--bad); }
+  table.obs { width: 100%; border-collapse: collapse; font-size: 11px; }
+  table.obs th { color: var(--text-dim); font-weight: 400; text-align: right; padding: 1px 0; }
+  table.obs th:first-child { text-align: left; }
+  table.obs td { text-align: right; padding: 1px 0; font-variant-numeric: tabular-nums; }
+  table.obs td:first-child { text-align: left; font-weight: 600; }
+  table.obs td.lever.hi { color: var(--bad); }
+  table.obs td.lever.mid { color: var(--warn); }
+  .obs-advice { color: var(--warn); font-size: 11px; margin-top: 6px; }
+
+  /* ------------------------------------------------------- focal controls */
+  .focalbox { border: 1px solid var(--border); border-radius: 5px; padding: 6px 7px; margin-top: 7px; }
+  .focalrow { display: flex; gap: 4px; margin: 5px 0; }
+  .focalrow input { flex: 1; min-width: 0; }
+  .focalrow select { width: 72px; flex: none; }
+  .focalrow button { flex: none; }
+  .focalnow { font-size: 14px; font-variant-numeric: tabular-nums; }
+  .focalnow .est { color: var(--text-dim); font-size: 11px; font-style: italic; }
+  #exifrow { margin: 4px 0; }
+  #exifrow button { margin-left: 4px; }
+
+  /* ------------------------------------------------------------ 3D view */
+  #view3d { position: absolute; inset: 0; z-index: 20; background: #0b0d10; }
+  #view3d[hidden] { display: none; }
+  #canvas3d { display: block; width: 100%; height: 100%; cursor: grab; }
+  #view3dbar {
+    position: absolute; left: 0; right: 0; top: 0; display: flex; gap: 6px;
+    align-items: center; padding: 6px 9px; background: #12151add;
+    border-bottom: 1px solid var(--border); font-size: 11px; color: var(--text-dim);
+  }
+  #view3dtitle { font-weight: 600; color: var(--text); margin-right: 4px; }
+  #view3dbar .est { font-style: italic; }
+  #view3dbar .smallbtn.on { background: var(--accent); border-color: var(--accent); color: #0d1016; }
+
+  /* ------------------------------------------------------ known objects */
+  .objlist { max-height: 300px; overflow-y: auto; }
+  .obj {
+    display: grid; grid-template-columns: auto 1fr auto; gap: 7px; align-items: center;
+    padding: 4px 6px; border-radius: 4px; cursor: pointer;
+  }
+  .obj:hover { background: var(--surface-2); }
+  .obj.sel { background: #2b3c57; }
+  .obj .swatch { width: 9px; height: 9px; border-radius: 2px; background: var(--text-dim); }
+  .obj.placed .swatch { background: var(--axis-z); }
+  .obj.locked .swatch { background: var(--good); border-radius: 50%; }
+  .obj .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .obj .err { font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .obj .err.hi { color: var(--bad); }
+
+  .tpl {
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 6px 7px; margin-bottom: 6px;
+  }
+  .tpl.sel { border-color: var(--accent); }
+  .tpl .tplhead { display: flex; justify-content: space-between; gap: 6px; align-items: center; }
+  .tpl .tplhead b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .unitrow { display: flex; gap: 4px; margin-top: 5px; align-items: center; }
+  .unitrow select { width: 68px; flex: none; }
+  .unitrow .est { flex: 1; min-width: 0; font-size: 10px; color: var(--text-dim); font-style: italic; }
+
+  .anchorlist { max-height: 170px; overflow-y: auto; margin-top: 5px; }
+  .anchorlist .an {
+    display: grid; grid-template-columns: auto 1fr auto auto; gap: 6px;
+    align-items: center; padding: 2px 4px; border-radius: 3px; cursor: pointer;
+    font-size: 11px;
+  }
+  .anchorlist .an:hover { background: var(--surface-2); }
+  .anchorlist .an.sel { background: #2b3c57; }
+  .anchorlist .an .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); }
+  .anchorlist .an.marked .dot { background: var(--good); }
+  .anchorlist .an .n { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .rigtable { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
+  .rigtable td { padding: 1px 0; font-variant-numeric: tabular-nums; text-align: right; }
+  .rigtable td:first-child { text-align: left; color: var(--text-dim); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="toolbar">
+    <div class="title">MultiSpy</div>
+    <div id="projwrap">
+      <button class="action" id="btn-project" title="Switch or create a project">
+        <span id="projname">—</span> &#9662;
+      </button>
+      <div id="projmenu" hidden></div>
+    </div>
+
+    <div class="group" id="modes">
+      <button data-mode="lines" title="Draw control lines (L)">Lines</button>
+      <button data-mode="points" title="Mark tie points (P)">Points</button>
+      <button data-mode="objects" title="Mark anchors on a known object (O)">Objects</button>
+      <button data-mode="select" title="Select and move (S)">Select</button>
+    </div>
+
+    <div class="group" id="axes">
+      <button class="axis0" data-axis="0" title="X axis (1)">X</button>
+      <button class="axis1" data-axis="1" title="Y axis (2)">Y</button>
+      <button class="axis2" data-axis="2" title="Z axis (3)">Z</button>
+    </div>
+
+    <div class="spacer"></div>
+
+    <label class="toggle" title="Extend control lines to their vanishing point (V)">
+      <input type="checkbox" id="showvp" checked> VP rays
+    </label>
+    <label class="toggle" title="Show reprojection error vectors (R)">
+      <input type="checkbox" id="showresid" checked> Residuals
+    </label>
+    <label class="toggle" title="Overlay the solved ground plane grid (G)">
+      <input type="checkbox" id="showgrid"> Grid
+    </label>
+    <label class="toggle" title="Overlay each placed object's model, projected through this camera (M)">
+      <input type="checkbox" id="showmodels" checked> Models
+    </label>
+
+    <button class="action" id="btn-3d" title="Orbit the solved scene (D)">3D</button>
+    <button class="action" id="btn-help" title="Tutorial and reference (?)">Help</button>
+    <button class="action" id="btn-save" title="Ctrl+S">Save</button>
+    <button class="action" id="btn-export">Export</button>
+    <button class="action primary" id="btn-solve" title="Enter">Solve</button>
+  </div>
+
+  <div id="body">
+    <div id="filmstrip"></div>
+
+    <div id="stage">
+      <canvas id="canvas"></canvas>
+      <div id="view3d" hidden>
+        <canvas id="canvas3d"></canvas>
+        <div id="view3dbar">
+          <span id="view3dtitle">Scene</span>
+          <button class="smallbtn" id="v3-scene">scene</button>
+          <button class="smallbtn" id="v3-template">model</button>
+          <button class="smallbtn" id="v3-fit">fit</button>
+          <span class="spacer" style="flex:1"></span>
+          <span class="est">drag orbit &middot; shift-drag pan &middot; wheel zoom</span>
+          <button class="smallbtn" id="v3-close">close</button>
+        </div>
+      </div>
+      <div id="hint"></div>
+      <div id="zoombadge"></div>
+      <div id="dropzone">Drop photos, or a CAD model (OBJ / STL / PLY)</div>
+    </div>
+
+    <div id="panel">
+      <div class="section">
+        <h3>Solve</h3>
+        <div class="inner" id="solvepanel"></div>
+      </div>
+      <div class="section">
+        <h3>This image <span class="count" id="imgcount"></span></h3>
+        <div class="inner" id="imgpanel"></div>
+      </div>
+      <div class="section">
+        <h3>Focal check <span class="count" id="obsverdict"></span></h3>
+        <div class="inner" id="obspanel"></div>
+      </div>
+      <div class="section">
+        <h3>Known objects <span class="count" id="objcount"></span></h3>
+        <div class="inner" id="objpanel"></div>
+      </div>
+      <div class="section">
+        <h3>Tie points <span class="count" id="ptcount"></span></h3>
+        <div class="inner" id="ptpanel"></div>
+      </div>
+      <div class="section">
+        <h3>Constraints</h3>
+        <div class="inner" id="conspanel"></div>
+      </div>
+      <div class="section">
+        <h3>Per-image residuals</h3>
+        <div class="inner" id="imglistpanel"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="statusbar">
+    <span id="status">ready</span>
+    <span class="spacer" style="flex:1"></span>
+    <span id="dirty"></span>
+  </div>
+</div>
+<input type="file" id="fileinput" multiple accept="image/*" hidden>
+<input type="file" id="modelinput" accept=".obj,.stl,.ply" hidden>
+<script src="/web/viewer3d.js"></script>
+<script src="/web/app.js"></script>
+</body>
+</html>

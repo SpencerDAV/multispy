@@ -1,0 +1,35 @@
+# Your own projects. These hold real photos and marks, and the app creates the
+# folder on first run, so it is never something to track.
+projects/
+
+# Generated demo scenes. Both are rebuilt in one command, so the photos do not
+# belong in history:
+#   .venv\Scripts\python.exe demo\make_demo.py
+#   .venv\Scripts\python.exe demo\make_rig_demo.py
+demo/photos/
+demo/project.multispy
+demo_rig/
+demo_practice/
+demo_rig_practice/
+demo_blank/
+
+# Export output, written next to whichever project produced it
+export/
+**/export/
+
+# Virtual environment (~220 MB)
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
