@@ -84,6 +84,48 @@ canvas**.
 
 ---
 
+## Or run it in a browser, with nothing installed
+
+**[spencerdav.github.io/multispy](https://spencerdav.github.io/multispy/)**
+
+The same solver, in a tab. Drop in photos and a CAD model, mark them, press
+Solve, download the exports. There is no install and no sign-up.
+
+It is not a demo or a cut-down version. The page loads CPython — numpy, scipy
+and Pillow included — through [Pyodide](https://pyodide.org) and runs the very
+same `multispy` package in-process, so it produces identical numbers. On the
+synthetic rig scene, the browser and the command line agree to the decimal:
+focal 3198.8 px, reprojection RMS 1.209 px, body shape error 0.55–0.72 mm,
+baselines 225.2 / 450.0 / 675.0 / 900.3 mm. The solve itself takes about a
+quarter of a second.
+
+**Nothing is uploaded.** There is no server to upload to — the whole thing runs
+in the tab, so photos of parts and tooling never leave the machine. That is the
+main reason to hand someone this link rather than a hosted service.
+
+Three things differ, all of them consequences of a browser having no disk:
+
+- **First load is about 20 MB** and takes a few seconds, then it is cached. It
+  waits behind a button rather than downloading on arrival.
+- **Saving is a download.** The project comes back as a zip with its photos
+  inside, because the marks alone would reopen pointing at files that are not
+  there. Reopen it by dropping that zip back in.
+- **Close the tab and it is gone.** Download the project to keep it.
+
+Memory is the real limit: a 4000 × 3000 photo is about 36 MB decoded, so thirty
+is comfortable and two hundred is not. For large sets, run it locally.
+
+Build it yourself with:
+
+```bat
+.venv\Scripts\python.exe tools\build_static.py --serve 8800
+```
+
+which assembles `dist/` and serves it, so the static path can be exercised
+without deploying anything.
+
+---
+
 ## Projects and photos
 
 Everything is managed in the app; no paths on the command line.
@@ -563,16 +605,26 @@ multispy/
                 bundle adjustment
   project.py    data model and JSON persistence
   export.py     COLMAP, Blender, nerfstudio, PLY, rig layout
-  server.py     local HTTP server for the UI
+  webapp.py     every operation behind the UI, independent of transport --
+                shared by the local server and the browser build
+  server.py     local HTTP server: transport only, JSON in and out
   docpage.py    renders these docs as pages the app links to (/docs/...)
   __main__.py   CLI
 web/
   app.js        marking UI (canvas, vanilla JS)
   viewer3d.js   3D view, a software renderer on a 2D canvas
+  backend.js    sends the UI's requests to the local server, or to Pyodide
+  config.js     which of the two this page is talking to
+tools/
+  build_static.py  assembles the browser build into dist/
 tests/          synthetic ground-truth validation
 demo/           synthetic scene generators (box scene, camera array)
 projects/       your projects, one folder each (created on first run)
 ```
+
+`webapp.py` is the reason the browser build is the same application rather than a
+copy of it: both front ends call the same `Workspace`, and only the transport
+differs.
 
 A project folder holds `project.multispy`, its `photos/`, and `models/` for any
 CAD models added to it, so it stays self-contained and portable.

@@ -304,6 +304,27 @@
   .rigtable { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
   .rigtable td { padding: 1px 0; font-variant-numeric: tabular-nums; text-align: right; }
   .rigtable td:first-child { text-align: left; color: var(--text-dim); }
+
+  /* ------------------------------------------------------------ launcher */
+  #launcher {
+    position: fixed; inset: 0; z-index: 100; display: flex;
+    align-items: center; justify-content: center; background: var(--bg);
+  }
+  #launcher[hidden] { display: none; }
+  .launchbox { max-width: 520px; padding: 28px 32px; text-align: center; }
+  .launchbox h1 { margin: 0 0 4px; font-size: 30px; letter-spacing: -.3px; }
+  .launchbox p { color: var(--text-dim); margin: 10px 0; }
+  .launchbox p.lead { color: var(--text); }
+  .launchbox button { margin-top: 14px; padding: 9px 22px; font-size: 14px; }
+  .launchbox progress {
+    display: block; width: 100%; height: 5px; margin-top: 16px;
+    accent-color: var(--accent);
+  }
+  .launchbox progress[value="0"] { visibility: hidden; }
+  #launchnote { color: var(--text-dim); font-size: 11px; margin-top: 7px; min-height: 16px; }
+  .launchlinks { margin-top: 22px; font-size: 12px; color: var(--text-dim); }
+  .launchlinks a { color: var(--accent); text-decoration: none; }
+  .launchlinks a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -412,9 +433,30 @@
     <span id="dirty"></span>
   </div>
 </div>
+<div id="launcher" hidden>
+  <div class="launchbox">
+    <h1>MultiSpy</h1>
+    <p>Vanishing-point calibration across a whole photo set, with known-object
+       placement for solving camera-array layouts.</p>
+    <p class="lead">This page runs the real solver — CPython, numpy, scipy and all —
+       inside your browser. <b>Nothing is uploaded.</b> Your photos never leave
+       this tab, because there is no server to send them to.</p>
+    <button class="action primary" id="launchbtn">Start MultiSpy</button>
+    <progress id="launchprog" max="100" value="0"></progress>
+    <div id="launchnote">about 20 MB on first load, then cached</div>
+    <div class="launchlinks">
+      <a href="docs/tutorial.html">Tutorial</a> ·
+      <a href="docs/readme.html">Reference</a> ·
+      <a href="https://github.com/SpencerDAV/multispy">Source</a>
+    </div>
+  </div>
+</div>
 <input type="file" id="fileinput" multiple accept="image/*" hidden>
 <input type="file" id="modelinput" accept=".obj,.stl,.ply" hidden>
-<script src="/web/viewer3d.js"></script>
-<script src="/web/app.js"></script>
+<input type="file" id="projectinput" accept=".multispy,.zip,application/zip" hidden>
+<script src="config.js"></script>
+<script src="viewer3d.js"></script>
+<script src="backend.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

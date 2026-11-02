@@ -33,3 +33,6 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Static build output (rebuilt by tools/build_static.py)
+dist/

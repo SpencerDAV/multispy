@@ -147,14 +147,13 @@ function clearDirty() {
 
 /* --------------------------------------------------------------------- api */
 
+/** One request to whichever front end is behind this page.
+ *
+ *  Over HTTP when a Python process is serving, or straight into the same Python
+ *  running under Pyodide when the page is static. Callers cannot tell, and do
+ *  not need to. */
 async function api(path, body) {
-  const opts = body === undefined
-    ? {}
-    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
-  const res = await fetch(path, opts);
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-  return data;
+  return Backend.call(path, body);
 }
 
 /** Strip the server-only annotations before posting the project back. */
@@ -221,14 +220,7 @@ async function uploadModel(file) {
   if (state.dirty) await saveNow();
   try {
     setStatus(`reading ${file.name}…`);
-    const res = await fetch(`/api/upload_model?name=${encodeURIComponent(file.name)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: file,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-
+    const data = await Backend.addFileUpload('model', file);
     state.meshes.set(data.template, data.mesh);
     adopt(data);
     state.activeTemplate = data.template;
@@ -288,10 +280,77 @@ async function saveNow() {
     setStatus('saving…');
     await api('/api/state', { project: projectPayload() });
     clearDirty();
-    setStatus('saved', 'ok');
+    if (Backend.isStatic()) {
+      // no disk to save to, so saving is a download -- and it has to carry the
+      // photos, or reopening it would restore marks pointing at nothing
+      await Backend.saveBundle(state.project.name);
+      setStatus('downloaded project + photos — keep it to reopen this work', 'ok');
+    } else {
+      setStatus('saved', 'ok');
+    }
   } catch (err) {
     setStatus(`save failed: ${err.message}`, 'bad');
   }
+}
+
+/** Open a .multispy, or a zip of one with its photos. Static mode only. */
+async function openProjectFile(file) {
+  if (state.dirty && !confirm('This project has unsaved changes. Open anyway?')) return;
+  try {
+    setStatus(`opening ${file.name}…`);
+    const data = await Backend.openFile(file);
+    for (const bmp of state.bitmaps.values()) bmp.close?.();
+    state.bitmaps.clear();
+    state.meshes.clear();
+    state.current = null;
+    state.activePoint = null;
+    state.activeInstance = null;
+    state.activeAnchor = null;
+    state.report = null;
+    state.rig = null;
+    adopt(data);
+    $('projmenu').hidden = true;
+    clearDirty();
+    showProjectName();
+    buildFilmstrip();
+    if (state.current) await selectImage(state.current, true);
+    renderPanels();
+    syncViewer();
+    render();
+
+    const missing = Object.values(state.meta).filter((m) => !m.exists).length;
+    setStatus(
+      missing
+        ? `opened — ${missing} photo(s) are not in this file; drop them back in to see them`
+        : `opened ${state.project.name}`,
+      missing ? 'warn' : 'ok'
+    );
+  } catch (err) {
+    setStatus(`could not open: ${err.message}`, 'bad');
+  }
+}
+
+async function newStaticProject(name) {
+  if (state.dirty && !confirm('This project has unsaved changes. Start a new one anyway?')) return;
+  await Backend.resetProject(name);
+  for (const bmp of state.bitmaps.values()) bmp.close?.();
+  state.bitmaps.clear();
+  state.meshes.clear();
+  state.current = null;
+  state.report = null;
+  state.rig = null;
+  state.activeInstance = null;
+  state.activeAnchor = null;
+  state.activeTemplate = null;
+  adopt(await api('/api/state'));
+  $('projmenu').hidden = true;
+  clearDirty();
+  showProjectName();
+  buildFilmstrip();
+  renderPanels();
+  syncViewer();
+  render();
+  setStatus('empty project — drop photos onto the canvas to start', 'ok');
 }
 
 async function solveNow() {
@@ -326,7 +385,10 @@ async function solveNow() {
 async function exportNow() {
   try {
     setStatus('exporting…');
-    const data = await api('/api/export', { project: projectPayload() });
+    // the workspace needs this session's edits before it writes anything
+    await api('/api/state', { project: projectPayload() });
+    clearDirty();
+    const data = await Backend.exportAll();
     setStatus(`exported to ${data.out_dir}`, 'ok');
   } catch (err) {
     setStatus(`export failed: ${err.message}`, 'bad');
@@ -375,13 +437,7 @@ async function uploadFiles(files) {
   const failed = [];
   for (const file of list) {
     try {
-      const res = await fetch(`/api/upload?name=${encodeURIComponent(file.name)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': file.type || 'application/octet-stream' },
-        body: file,
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      await Backend.addFileUpload('photo', file);
       added++;
     } catch (err) {
       failed.push(`${file.name}: ${err.message}`);
@@ -437,6 +493,7 @@ async function removeImage(imageId) {
     });
     state.bitmaps.get(imageId)?.close?.();
     state.bitmaps.delete(imageId);
+    Backend.forgetPhoto(imageId);
     if (state.current === imageId) state.current = null;
     adopt(data);
     clearDirty();
@@ -455,6 +512,7 @@ async function removeImage(imageId) {
 async function toggleProjectMenu() {
   const menu = $('projmenu');
   if (!menu.hidden) { menu.hidden = true; return; }
+  if (Backend.isStatic()) { renderStaticProjectMenu(menu); return; }
   menu.innerHTML = '<div class="head">loading…</div>';
   menu.hidden = false;
   try {
@@ -485,6 +543,49 @@ async function toggleProjectMenu() {
   } catch (err) {
     menu.innerHTML = `<div class="head">${escapeHtml(err.message)}</div>`;
   }
+}
+
+/* Static mode has no projects directory to list: a tab has one project, and it
+ * lives only until the tab closes. So the menu offers the three things that do
+ * make sense there -- take it with you, bring one back, start over -- and says
+ * plainly that nothing is being stored anywhere. */
+function renderStaticProjectMenu(menu) {
+  menu.innerHTML =
+    '<div class="head">This project</div>'
+    + '<div class="newrow"><input type="text" id="projrename" style="flex:1" '
+    + `value="${escapeHtml(state.project ? state.project.name : 'untitled')}" `
+    + 'placeholder="name"><button class="smallbtn" id="projdl">download</button></div>'
+    + '<div class="msg" style="margin:4px 2px">Downloads a zip with the project and its '
+    + 'photos, so you can reopen it later or hand it to someone.</div>'
+    + '<div class="head">Open</div>'
+    + '<div class="newrow"><button class="smallbtn" id="projopen" style="flex:1">'
+    + 'choose a .multispy or .zip…</button></div>'
+    + '<div class="head">New</div>'
+    + '<div class="newrow"><button class="smallbtn" id="projnew" style="flex:1">'
+    + 'start an empty project</button></div>'
+    + '<div class="path">Running entirely in this tab. Nothing is uploaded anywhere — '
+    + 'your photos never leave the machine, and they are gone when the tab closes, '
+    + 'so download the project to keep it.</div>';
+  menu.hidden = false;
+
+  const rename = $('projrename');
+  rename.onchange = (e) => {
+    const name = e.target.value.trim();
+    if (name && state.project) { state.project.name = name; markDirty(); showProjectName(); }
+  };
+  $('projdl').onclick = async () => {
+    try {
+      await api('/api/state', { project: projectPayload() });
+      clearDirty();
+      await Backend.saveBundle(state.project.name);
+      menu.hidden = true;
+      setStatus('downloaded project + photos', 'ok');
+    } catch (err) {
+      setStatus(`download failed: ${err.message}`, 'bad');
+    }
+  };
+  $('projopen').onclick = () => $('projectinput').click();
+  $('projnew').onclick = () => newStaticProject(prompt('Name for the new project:', 'untitled'));
 }
 
 async function switchProject(endpoint, body) {
@@ -555,7 +656,7 @@ window.addEventListener('drop', async (ev) => {
 
 async function bitmapFor(imageId) {
   if (state.bitmaps.has(imageId)) return state.bitmaps.get(imageId);
-  const res = await fetch(`/api/photo?id=${encodeURIComponent(imageId)}`);
+  const res = await fetch(await Backend.photoSrc(imageId, false));
   if (!res.ok) throw new Error(`photo ${imageId} unavailable`);
   const bmp = await createImageBitmap(await res.blob());
   state.bitmaps.set(imageId, bmp);
@@ -1415,10 +1516,15 @@ function buildFilmstrip() {
     const div = document.createElement('div');
     div.className = 'film' + (im.id === state.current ? ' sel' : '') + (im.enabled ? '' : ' off');
     div.innerHTML =
-      `<img loading="lazy" src="/api/thumb?id=${encodeURIComponent(im.id)}" alt="">` +
+      `<img loading="lazy" alt="">` +
       `<button class="rm" title="Remove from this project">&times;</button>` +
       `<div class="meta"><span>${st.text}</span>` +
       `<span class="dot" style="background:${st.color}"></span></div>`;
+    // the thumbnail's source is resolved asynchronously, since in static mode it
+    // is a blob the Python side has to render first
+    Backend.photoSrc(im.id, true)
+      .then((src) => { const img = div.querySelector('img'); if (img) img.src = src; })
+      .catch(() => {});
     div.onclick = () => selectImage(im.id, true);
     div.querySelector('.rm').onclick = (ev) => { ev.stopPropagation(); removeImage(im.id); };
     strip.appendChild(div);
@@ -1432,13 +1538,17 @@ function buildFilmstrip() {
   add.onclick = () => $('fileinput').click();
   strip.appendChild(add);
 
-  const link = document.createElement('button');
-  link.className = 'smallbtn';
-  link.style.cssText = 'width:100%;margin-top:4px';
-  link.textContent = 'link a folder…';
-  link.title = 'Reference photos where they already sit on disk, without copying them in';
-  link.onclick = addFolder;
-  strip.appendChild(link);
+  // referencing photos in place needs a filesystem to reference; in the browser
+  // there is only what has been dropped in
+  if (!Backend.isStatic()) {
+    const link = document.createElement('button');
+    link.className = 'smallbtn';
+    link.style.cssText = 'width:100%;margin-top:4px';
+    link.textContent = 'link a folder…';
+    link.title = 'Reference photos where they already sit on disk, without copying them in';
+    link.onclick = addFolder;
+    strip.appendChild(link);
+  }
 
   const row = document.createElement('div');
   row.id = 'uploadrow';
@@ -2643,19 +2753,68 @@ document.addEventListener('click', (ev) => {
   const menu = $('projmenu');
   if (!menu.hidden && !$('projwrap').contains(ev.target)) menu.hidden = true;
 });
+$('projectinput').onchange = (ev) => {
+  if (ev.target.files.length) openProjectFile(ev.target.files[0]);
+  ev.target.value = '';
+};
+
 window.addEventListener('resize', resizeCanvas);
 window.addEventListener('beforeunload', (ev) => {
-  if (state.dirty) { ev.preventDefault(); ev.returnValue = ''; }
+  // in static mode the photos live in this tab and nowhere else, so anything
+  // marked at all is worth warning about, not only unsaved edits
+  const atRisk = state.dirty
+    || (Backend.isStatic() && state.project && state.project.images.length);
+  if (atRisk) { ev.preventDefault(); ev.returnValue = ''; }
 });
 
-setMode('lines');
-setAxis(0);
-resizeCanvas();
-loadState()
-  .then(() => {
+/** The launch screen, shown only on the static build.
+ *
+ *  Deliberately a button rather than booting on arrival: 20 MB should be the
+ *  visitor's decision, and the pause wants explaining before it happens rather
+ *  than after. */
+function showLauncher() {
+  return new Promise((resolve) => {
+    const el = $('launcher');
+    const btn = $('launchbtn');
+    const prog = $('launchprog');
+    const note = $('launchnote');
+    el.hidden = false;
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await Backend.boot((msg, frac) => {
+          note.textContent = msg;
+          prog.value = Math.max(1, Math.round(frac * 100));
+        });
+        el.hidden = true;
+        resolve();
+      } catch (err) {
+        note.innerHTML = `<span style="color:var(--bad)">${escapeHtml(err.message)}</span>`;
+        prog.value = 0;
+        btn.disabled = false;
+      }
+    };
+  });
+}
+
+async function start() {
+  setMode('lines');
+  setAxis(0);
+  resizeCanvas();
+  if (Backend.isStatic()) await showLauncher();
+  try {
+    await loadState();
     // fit once the grid has actually laid the canvas out, otherwise the first
     // fitView measures a stale (usually too small) rect
     requestAnimationFrame(() => { resizeCanvas(); fitView(); render(); });
-    setStatus('ready');
-  })
-  .catch((err) => setStatus(`could not load project: ${err.message}`, 'bad'));
+    setStatus(
+      Backend.isStatic()
+        ? 'ready — drop photos and a CAD model onto the canvas'
+        : 'ready'
+    );
+  } catch (err) {
+    setStatus(`could not load project: ${err.message}`, 'bad');
+  }
+}
+
+start();

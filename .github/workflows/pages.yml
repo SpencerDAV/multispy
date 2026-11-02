@@ -1,0 +1,60 @@
+name: Deploy to GitHub Pages
+
+# The static build is the same application: web/ plus the multispy package,
+# which Pyodide loads into the browser and runs in-process. Nothing is compiled
+# and no dependencies are installed -- tools/build_static.py only copies and
+# renders, so the job needs plain CPython and nothing else.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# never let two deploys race, but let a running one finish rather than
+# cancelling it half way through replacing the live site
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the static bundle
+        run: python tools/build_static.py --out dist
+
+      - name: Check the bundle has what the browser needs
+        run: |
+          set -e
+          for f in index.html app.js backend.js viewer3d.js config.js .nojekyll \
+                   py/multispy/__init__.py py/multispy/solve.py py/multispy/webapp.py \
+                   docs/readme.html docs/tutorial.html; do
+            test -f "dist/$f" || { echo "missing dist/$f"; exit 1; }
+          done
+          grep -q "pyodide" dist/config.js || { echo "config.js is not the static one"; exit 1; }
+          echo "bundle looks right"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
