@@ -272,10 +272,31 @@ Press **D** for the 3D view and switch to **model**. The anchor points are marke
 on the mesh.
 
 If you were setting up your own model you would pick these yourself, and the rule
-is: **only pick features you can identify in a photograph.** Body corners,
-mount-hole centres, the rim of a lens. The middle of a flat face is unmarkable,
-because nothing in the photo locates it. The viewer offers the mesh's own corner
-vertices, where three or more real edges meet.
+is: **only pick features you can identify in a photograph.** The middle of a flat
+face is unmarkable, because nothing in the picture locates it.
+
+The viewer offers three kinds, drawn differently:
+
+- a **ring** — the centre of a round or symmetric feature: a bored hole, a bolt
+  head, a port. The best kind. It reads the same from every angle, and you place
+  it in the photo at the centre of the visible ellipse.
+- a **cross** — where two straight edges would meet if a fillet had not rounded
+  them off. Mark it by extending the two visible edges by eye. Steadier than the
+  rounded corner itself, whose apparent position moves as you walk around.
+- a **dot** — a genuinely sharp vertex.
+
+The demo part is a plain box, so you only see dots. A real machined part is
+mostly rings and crosses, and the panel tells you the mix before you open the
+viewer.
+
+> **Never mark the rim of a bolt head** — which is why those vertices are not
+> offered. Each one is perfectly sharp and none is identifiable: you cannot tell
+> which of six hex corners you clicked, so in the next photo you will click a
+> different one. The result is a plausible solve whose shape error will not come
+> down however carefully you work. The bolt's *centre* is excellent.
+
+If the point you want is measured rather than offered, **type a position…** takes
+coordinates in the model's own frame.
 
 Press **D** again to return to the photo.
 
@@ -453,6 +474,9 @@ Two failure modes worth recognising before you shoot:
 | A constraint shows **no effect** | It names a tie point that was not solved | Mark that point in a second photo, or delete the constraint |
 | Constraint error large, everything else fine | Two constraints pulling against each other, or against the object geometry | Compare **stated vs object scale**; drop whichever figure you trust less |
 | Solved size not 1.000× | An anchor is on the wrong feature | Check that body's shape error, re-mark it |
+| Shape error high and will not come down | Anchors on features you cannot actually identify — bolt rims are the classic | Use ring (centre) and cross (filleted corner) anchors instead |
+| The corners you want are not offered | They are filleted, so no vertex sits there | Look for the **cross** marks just outside each rounded corner; that is the corner, reconstructed |
+| Nothing useful offered at all | A heavily filleted part with no round features | **type a position…** and enter coordinates from the drawing |
 | Grid skewed or floating | Frame is wrong despite good residuals | Check control-line directions — a mirrored solve |
 | *"hit the iteration limit"* | The solve did not converge | Treat the numbers as provisional; usually a symptom of one of the above |
 

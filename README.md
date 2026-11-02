@@ -380,10 +380,33 @@ guesses silently — get it wrong and the entire layout is scaled by 1000 while
 every residual stays perfect.
 
 **3. Pick anchors.** Press **D** for the 3D view, switch to **model**, and click
-the corners. Only pick features you can actually *identify in a photograph* —
-body corners, mount-hole centres, the rim of a lens. The middle of a flat face is
-unmarkable because nothing in the photo locates it. The viewer offers the mesh's
-own corner vertices, where three or more real edges meet.
+the points it offers. The only test that matters is whether you could find that
+point again *in a photograph* — the middle of a flat face is unmarkable because
+nothing in the picture locates it.
+
+Three kinds are offered, drawn so you can tell them apart, because they are not
+equally good and the difference is invisible in the geometry:
+
+| | | |
+|---|---|---|
+| **ring** | the centre of a round or symmetric feature — a bored hole, a bolt head, a port | **the best kind.** Rotationally symmetric, so it reads identically from every angle, and you place it by eye at the centre of the visible ellipse. Not a vertex at all. |
+| **cross** | where two straight edges would meet, if a fillet had not rounded them off | The sharp corner does not exist in the model, but it is well defined, and it is *steadier* than the rounded corner it replaces — whose apparent position slides with viewpoint and lighting. Mark it in the photo by extending the two visible edges by eye. |
+| **dot** | a genuinely sharp vertex | Fine where they exist. Shell corners, square cut-outs. |
+
+The panel reports the mix before you open the viewer, so a part with everything
+filleted and no round features is obvious early.
+
+**Do not mark the rim of a bolt head**, which is why those vertices are not
+offered. Every one of them is a perfectly sharp corner and none is identifiable:
+you cannot tell which of six hex corners you clicked, and in the next photo you
+will click a different one. That mistake produces a plausible-looking solve whose
+shape error never comes down. Its *centre*, by contrast, is one of the best
+anchors on the part.
+
+If the point you want is one you measured rather than one the model offers, **type
+a position…** takes coordinates in the model's own frame. Worth having: a drawing
+sometimes carries a datum the mesh does not, and a CAD export can round off
+exactly the corner you were counting on.
 
 **4. Add objects.** **+ object** per physical copy. Ten identical cameras are one
 model and ten objects, which is the point: measuring the body once places all

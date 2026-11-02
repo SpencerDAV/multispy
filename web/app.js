@@ -1961,6 +1961,14 @@ function renderObjectsPanel() {
       if (mesh.units_note) {
         html += `<div class="msg">${escapeHtml(mesh.units_note)}</div>`;
       }
+      // what the model actually offers, so it is visible before opening the 3D
+      // view -- a part with no round features and everything filleted is worth
+      // knowing about early
+      const pc = mesh.pick_counts || {};
+      html += `<div class="msg">offers `
+            + `<b style="color:#8ee06a">${pc.centre || 0}</b> round-feature centres, `
+            + `<b style="color:#c89bff">${pc.virtual || 0}</b> filleted corners, `
+            + `<b style="color:#8891a0">${pc.corner || 0}</b> sharp corners</div>`;
     } else {
       html += `<div class="msg">no model file — anchors can still be typed</div>`;
     }
@@ -2000,6 +2008,7 @@ function renderObjectsPanel() {
     }
     html += `<div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap">`
           + `<button class="smallbtn" data-pick="${escapeHtml(tid)}">pick anchors in 3D</button>`
+          + `<button class="smallbtn" data-typed="${escapeHtml(tid)}">type a position…</button>`
           + `<button class="smallbtn" data-optical="${escapeHtml(tid)}">${o ? 'edit' : 'set'} optical</button>`
           + `<button class="smallbtn" data-newobj="${escapeHtml(tid)}">+ object</button>`
           + `<button class="smallbtn" data-deltpl="${escapeHtml(tid)}">remove model</button>`
@@ -2128,6 +2137,13 @@ function wireObjectsPanel(el) {
       ev.stopPropagation();
       state.activeTemplate = btn.dataset.pick;
       openTemplatePicker();
+    };
+  }
+  for (const btn of el.querySelectorAll('[data-typed]')) {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      state.activeTemplate = btn.dataset.typed;
+      addAnchorByCoordinates();
     };
   }
   for (const btn of el.querySelectorAll('[data-optical]')) {
@@ -2668,29 +2684,60 @@ function openTemplatePicker() {
   setStatus('click the model’s corners to add anchors, then mark them in the photos', 'ok');
 }
 
-/** Turn a picked mesh vertex into a named anchor on the active model. */
-function addAnchorFromVertex(index) {
+/** Add an anchor at a point on the model, from whatever offered it. */
+function addAnchor(xyz, label) {
   const t = activeTemplate();
-  const mesh = meshFor(state.activeTemplate);
-  if (!t || !mesh) return;
-  const xyz = mesh.vertices[index];
-  if (!xyz) return;
-
+  if (!t || !xyz) return null;
   const used = new Set((t.anchors || []).map((a) => a.name));
   let i = 1;
   while (used.has(`a${i}`)) i++;
   const name = `a${i}`;
   t.anchors = t.anchors || [];
-  t.anchors.push({ name, xyz: [...xyz] });
+  t.anchors.push({ name, xyz: xyz.map(Number) });
   state.activeAnchor = name;
   markDirty();
   renderObjectsPanel();
   syncViewer();
+  render();
+  const left = 3 - t.anchors.length;
   setStatus(
-    `anchor ${name} at ${xyz.map((v) => v.toFixed(1)).join(', ')} ${t.units}`
-      + ` — ${(t.anchors.length < 3 ? `${3 - t.anchors.length} more needed for a placement` : 'now mark it in the photos')}`,
+    `anchor ${name}${label ? ` (${label})` : ''} at `
+      + `${xyz.map((v) => (+v).toFixed(1)).join(', ')} ${t.units} — `
+      + (left > 0 ? `${left} more needed for a placement` : 'now mark it in the photos'),
     'ok'
   );
+  return name;
+}
+
+/** One of the points the model offered, picked in the 3D view. */
+function addAnchorFromPick(index) {
+  const mesh = meshFor(state.activeTemplate);
+  const pick = mesh && (mesh.picks || [])[index];
+  if (!pick) return;
+  addAnchor(pick.xyz, pick.kind === 'corner' ? null : pick.kind);
+}
+
+/** A point you measured rather than picked.
+ *
+ *  Needed because the best anchor is not always on the mesh: a drawing gives a
+ *  datum the model does not carry, and a CAD export can round off exactly the
+ *  corner you want. */
+function addAnchorByCoordinates() {
+  const t = activeTemplate();
+  if (!t) { setStatus('select a model first', 'warn'); return; }
+  const raw = prompt(
+    `Anchor position on the model, in ${t.units}.\n\n`
+      + `Three numbers "x y z", in the model's own coordinates — the same frame `
+      + `the picked anchors are listed in.`,
+    '0 0 0'
+  );
+  if (raw === null) return;
+  const nums = raw.trim().split(/[\s,]+/).map(Number);
+  if (nums.length !== 3 || nums.some((v) => !Number.isFinite(v))) {
+    setStatus('could not read that as three numbers', 'warn');
+    return;
+  }
+  addAnchor(nums, 'typed');
 }
 
 function escapeHtml(s) {
@@ -2741,7 +2788,7 @@ Viewer3D.attach($('canvas3d'), {
     renderPanels();
     syncViewer();
   },
-  onPickVertex: (index) => addAnchorFromVertex(index),
+  onPickCandidate: (index) => addAnchorFromPick(index),
   onPickAnchor: (name) => {
     state.activeAnchor = name;
     renderObjectsPanel();

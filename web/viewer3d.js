@@ -41,6 +41,8 @@ const Viewer3D = (() => {
     anchor: '#4dd0e1',
     anchorPicked: '#ffd24a',
     corner: '#8891a0',
+    centre: '#8ee06a',
+    virtual: '#c89bff',
   };
 
   const state = {
@@ -351,21 +353,43 @@ const Viewer3D = (() => {
       (tpl.anchors || []).map((a) => a.xyz.map((v) => v.toFixed(4)).join(','))
     );
 
-    // candidate corners: what the mesh offers as identifiable in a photo
-    ctx.fillStyle = COLOR.corner;
-    for (const vi of tpl.mesh.corners || []) {
-      const s = P.project(verts[vi]);
-      if (!s) continue;
-      const key = verts[vi].map((v) => v.toFixed(4)).join(',');
-      if (pickedKeys.has(key)) continue;
-      state.screen.push({ kind: 'vertex', index: vi, x: s.x, y: s.y, z: s.z });
-      const hot =
-        state.hover && state.hover.kind === 'vertex' && state.hover.index === vi;
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, hot ? 5 : 3, 0, Math.PI * 2);
-      ctx.fillStyle = hot ? '#fff' : COLOR.corner;
-      ctx.fill();
-    }
+    /* What the model offers as findable in a photograph, drawn so the three
+     * kinds are told apart at a glance -- because they are not equally good and
+     * the difference is not visible from the geometry alone:
+     *   a dot      a sharp corner, an actual vertex
+     *   a ring     the centre of a round feature; the best kind, and no vertex
+     *   a cross    where two edges would meet but a fillet rounded them off */
+    (tpl.mesh.picks || []).forEach((pick, index) => {
+      const s = P.project(pick.xyz);
+      if (!s) return;
+      if (pickedKeys.has(pick.xyz.map((v) => v.toFixed(4)).join(','))) return;
+      state.screen.push({ kind: 'pick', index, x: s.x, y: s.y, z: s.z });
+      const hot = state.hover && state.hover.kind === 'pick' && state.hover.index === index;
+      const color = hot ? '#fff' : COLOR[pick.kind] || COLOR.corner;
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = hot ? 2 : 1.4;
+
+      if (pick.kind === 'centre') {
+        const r = hot ? 7 : 5;
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, r, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (pick.kind === 'virtual') {
+        const r = hot ? 7 : 5;
+        ctx.beginPath();
+        ctx.moveTo(s.x - r, s.y); ctx.lineTo(s.x + r, s.y);
+        ctx.moveTo(s.x, s.y - r); ctx.lineTo(s.x, s.y + r);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, hot ? 5 : 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    });
 
     for (const a of tpl.anchors || []) {
       const s = P.project(a.xyz);
@@ -404,17 +428,40 @@ const Viewer3D = (() => {
   }
 
   function drawLegend(ctx, P, scene) {
-    const lines =
-      state.mode === 'template'
-        ? [
-            'click a corner to add it as an anchor',
-            'click an anchor to select or rename it',
-          ]
-        : [
-            `${(scene.cameras || []).length} photo camera(s)`,
-            `${(scene.objects || []).filter((o) => o.placed).length} placed object(s)`,
-            'click a camera to jump to that photo',
-          ];
+    if (state.mode === 'template') {
+      const counts = (state.template && state.template.mesh && state.template.mesh.pick_counts) || {};
+      const key = [
+        ['centre', `ring  ${counts.centre || 0} round-feature centres — best`],
+        ['virtual', `cross ${counts.virtual || 0} corners rounded off by a fillet`],
+        ['corner', `dot   ${counts.corner || 0} sharp corners`],
+      ];
+      ctx.font = '11px ui-monospace, monospace';
+      key.forEach(([kind, text], i) => {
+        ctx.fillStyle = COLOR[kind];
+        ctx.fillText(text, 10, P.h - 24 - (key.length - 1 - i) * 14);
+      });
+      ctx.fillStyle = '#8b93a1';
+      ctx.font = '11px sans-serif';
+      ctx.fillText('click one to add it as an anchor', 10, P.h - 8);
+
+      // what is under the cursor, since the kinds are not equally useful and a
+      // size is worth seeing before committing to a point
+      const hovered =
+        state.hover && state.hover.kind === 'pick' && state.template && state.template.mesh
+          ? state.template.mesh.picks[state.hover.index]
+          : null;
+      if (hovered) {
+        const label = hovered.note || hovered.kind;
+        ctx.fillStyle = '#e4e7ec';
+        ctx.fillText(label, state.hover.x + 12, state.hover.y - 10);
+      }
+      return;
+    }
+    const lines = [
+      `${(scene.cameras || []).length} photo camera(s)`,
+      `${(scene.objects || []).filter((o) => o.placed).length} placed object(s)`,
+      'click a camera to jump to that photo',
+    ];
     ctx.font = '11px sans-serif';
     ctx.fillStyle = '#8b93a1';
     lines.forEach((text, i) => ctx.fillText(text, 10, P.h - 10 - (lines.length - 1 - i) * 14));
@@ -460,7 +507,7 @@ const Viewer3D = (() => {
       if (hit) {
         if (hit.kind === 'camera' && state.hooks.onPickCamera) state.hooks.onPickCamera(hit.id);
         else if (hit.kind === 'object' && state.hooks.onPickObject) state.hooks.onPickObject(hit.id);
-        else if (hit.kind === 'vertex' && state.hooks.onPickVertex) state.hooks.onPickVertex(hit.index);
+        else if (hit.kind === 'pick' && state.hooks.onPickCandidate) state.hooks.onPickCandidate(hit.index);
         else if (hit.kind === 'anchor' && state.hooks.onPickAnchor) state.hooks.onPickAnchor(hit.name);
         return;
       }

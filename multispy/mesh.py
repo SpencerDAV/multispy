@@ -54,6 +54,31 @@ actually creases gives the clean CAD-looking wireframe you can pick corners off.
 
 
 @dataclass
+class AnchorCandidate:
+    """A point on a model that a person could pick out in a photograph."""
+
+    xyz: list[float]
+    kind: str
+    """``corner`` (a sharp vertex), ``centre`` (the middle of a round or
+    symmetric outline), or ``virtual`` (where two edges would meet if a fillet
+    had not rounded them off)."""
+    score: float
+    note: str = ""
+    vertex: int | None = None
+    """Index into ``vertices`` for a ``corner``; None for the constructed kinds,
+    which are not vertices of the mesh at all."""
+
+    def to_dict(self) -> dict:
+        return {
+            "xyz": [round(float(v), 6) for v in self.xyz],
+            "kind": self.kind,
+            "score": round(float(self.score), 4),
+            "note": self.note,
+            "vertex": self.vertex,
+        }
+
+
+@dataclass
 class Mesh:
     """A welded triangle soup, plus the derived structure the UI and solver need."""
 
@@ -176,12 +201,216 @@ class Mesh:
         scored.sort(reverse=True)
         return np.array([vi for _s, vi in scored], dtype=np.int64)
 
+    # ------------------------------------------------- planar regions
+
+    def planar_regions(self, angle_deg: float = FEATURE_ANGLE_DEG) -> list[list[int]]:
+        """Faces grouped into flat patches, as lists of face indices.
+
+        Almost everything worth marking on a machined part is a feature of some
+        flat face -- the rim of a bored hole, the outline of a sensor window, the
+        top of a bolt head. Finding those faces first is what lets the two kinds
+        of anchor a vertex scan cannot see fall out of one piece of machinery.
+        """
+        if not self.n_faces:
+            return []
+        normals = self.face_normals()
+        tri = self.vertices[self.faces]
+        offsets = np.einsum("fi,fi->f", normals, tri[:, 0, :])
+
+        shared: dict[tuple[int, int], list[int]] = {}
+        for fi, (a, b, c) in enumerate(self.faces):
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (int(u), int(v)) if u < v else (int(v), int(u))
+                shared.setdefault(key, []).append(fi)
+
+        neighbours: dict[int, list[int]] = {}
+        cos_limit = math.cos(math.radians(angle_deg))
+        tolerance = max(self.diagonal(), 1e-9) * 1e-4
+        for faces in shared.values():
+            if len(faces) != 2:
+                continue
+            f, g = faces
+            if float(normals[f] @ normals[g]) < cos_limit:
+                continue
+            # same plane, not merely parallel: two sides of a thin plate agree on
+            # direction and are a long way from being one surface
+            if abs(float(offsets[f] - offsets[g])) > tolerance:
+                continue
+            neighbours.setdefault(f, []).append(g)
+            neighbours.setdefault(g, []).append(f)
+
+        seen = np.zeros(self.n_faces, dtype=bool)
+        regions: list[list[int]] = []
+        for start in range(self.n_faces):
+            if seen[start]:
+                continue
+            seen[start] = True
+            group, stack = [start], [start]
+            while stack:
+                cur = stack.pop()
+                for nxt in neighbours.get(cur, ()):
+                    if not seen[nxt]:
+                        seen[nxt] = True
+                        group.append(nxt)
+                        stack.append(nxt)
+            regions.append(group)
+        return regions
+
+    def region_loops(self, faces: list[int]) -> list[list[int]]:
+        """Closed vertex loops bounding one flat patch."""
+        used: dict[tuple[int, int], int] = {}
+        for fi in faces:
+            a, b, c = (int(v) for v in self.faces[fi])
+            for u, v in ((a, b), (b, c), (c, a)):
+                key = (u, v) if u < v else (v, u)
+                used[key] = used.get(key, 0) + 1
+        border = [k for k, n in used.items() if n == 1]
+        if not border:
+            return []
+
+        links: dict[int, list[int]] = {}
+        for u, v in border:
+            links.setdefault(u, []).append(v)
+            links.setdefault(v, []).append(u)
+
+        loops: list[list[int]] = []
+        unvisited = set(border)
+        while unvisited:
+            u, v = next(iter(unvisited))
+            unvisited.discard((u, v))
+            loop = [u, v]
+            while True:
+                tail = loop[-1]
+                nxt = None
+                for cand in links.get(tail, ()):
+                    key = (tail, cand) if tail < cand else (cand, tail)
+                    if key in unvisited:
+                        nxt = cand
+                        unvisited.discard(key)
+                        break
+                if nxt is None:
+                    break
+                if nxt == loop[0]:
+                    break  # closed
+                loop.append(nxt)
+            if len(loop) >= 3:
+                loops.append(loop)
+        return loops
+
     def nearest_vertex(self, point: np.ndarray) -> int:
         """Index of the vertex closest to ``point``, for snapping a picked anchor."""
         if not self.n_vertices:
             raise ValueError("mesh has no vertices")
         d = np.linalg.norm(self.vertices - np.asarray(point, dtype=float), axis=1)
         return int(np.argmin(d))
+
+    # ------------------------------------------------- anchor candidates
+
+    def _scored_corners(self, angle_deg: float) -> list[tuple[float, int]]:
+        """Sharp vertices, scored by how markable they actually are.
+
+        Sharpness alone is not enough, and ranking by it is what buries a sensor
+        outline under a handful of fasteners: every vertex of a hex head is a
+        perfectly sharp corner, and none of them is identifiable in a photograph,
+        because you cannot tell which of the six you clicked. So the score is
+        scaled by the length of the shortest edge meeting there -- tessellation
+        detail is short by definition, and real features are not.
+        """
+        edges = self.feature_edges(angle_deg)
+        if not len(edges):
+            return []
+        diag = self.diagonal() or 1.0
+        lengths = np.linalg.norm(self.vertices[edges[:, 0]] - self.vertices[edges[:, 1]], axis=1)
+
+        incident: dict[int, list[tuple[int, float]]] = {}
+        for (a, b), L in zip(edges, lengths):
+            incident.setdefault(int(a), []).append((int(b), float(L)))
+            incident.setdefault(int(b), []).append((int(a), float(L)))
+
+        scored: list[tuple[float, int]] = []
+        for vi, links in incident.items():
+            if len(links) < 3:
+                continue
+            dirs = self.vertices[[n for n, _L in links]] - self.vertices[vi]
+            norms = np.linalg.norm(dirs, axis=1, keepdims=True)
+            dirs = dirs / np.maximum(norms, 1e-18)
+            singular = np.linalg.svd(dirs, compute_uv=False)
+            if len(singular) < 3 or singular[0] <= 1e-18:
+                continue
+            sharpness = float(singular[2] / singular[0])
+            shortest = min(L for _n, L in links)
+            scale = min(1.0, shortest / (0.05 * diag))
+            scored.append((sharpness * scale, vi))
+        scored.sort(reverse=True)
+        return scored
+
+    def anchor_candidates(
+        self, max_candidates: int = 300, angle_deg: float = FEATURE_ANGLE_DEG
+    ) -> list["AnchorCandidate"]:
+        """Points on this model a person could actually find in a photograph.
+
+        Three kinds, because a vertex scan alone misses the two that matter most
+        on a machined part:
+
+        * **centre** -- the middle of a bored hole, a bolt head, a round port.
+          Rotationally symmetric, so it reads the same from every angle, and a
+          person can place it by eye at the centre of the visible ellipse. It is
+          often the single best anchor on a part, and it is not a vertex at all.
+        * **virtual** -- where two straight edges would meet if a fillet had not
+          rounded them off. The sharp corner does not exist in the geometry, but
+          it is well defined, and it is more stable than the rounded corner it
+          replaces, whose apparent position slides with viewpoint and lighting.
+        * **corner** -- a genuinely sharp vertex, scored as above.
+        """
+        diag = self.diagonal() or 1.0
+        out: list[AnchorCandidate] = []
+        covered: set[int] = set()
+
+        for faces in self.planar_regions(angle_deg):
+            for loop in self.region_loops(faces):
+                pts = self.vertices[loop]
+
+                found = _loop_centre(pts)
+                if found is not None:
+                    centre, radius, roundness = found
+                    if radius > diag * 0.004:
+                        # a rim is better described by its centre than by the
+                        # vertices around it, so stop offering those separately
+                        covered.update(int(v) for v in loop)
+                        size = min(1.0, radius / (0.04 * diag))
+                        out.append(
+                            AnchorCandidate(
+                                xyz=centre.tolist(),
+                                kind="centre",
+                                score=1.4 * roundness * (0.4 + 0.6 * size),
+                                note=f"centre of a {2 * radius:.1f}-across feature",
+                            )
+                        )
+
+                for xyz, gap, reach in _virtual_corners(pts, diag):
+                    out.append(
+                        AnchorCandidate(
+                            xyz=xyz.tolist(),
+                            kind="virtual",
+                            score=1.2 * min(1.0, reach / (0.15 * diag)),
+                            note=(
+                                "where two edges would meet; the corner itself is "
+                                f"rounded off by about {gap:.1f}"
+                            ),
+                        )
+                    )
+
+        for score, vi in self._scored_corners(angle_deg):
+            if vi in covered:
+                continue
+            out.append(
+                AnchorCandidate(
+                    xyz=self.vertices[vi].tolist(), kind="corner", score=score, vertex=vi
+                )
+            )
+
+        out.sort(key=lambda c: -c.score)
+        return _dedupe_candidates(out, tolerance=diag * 1e-3)[:max_candidates]
 
     # ----------------------------------------------------------- for the UI
 
@@ -200,12 +429,16 @@ class Mesh:
             lengths = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
             edges = edges[np.argsort(-lengths)[:max_edges]]
 
-        corners = self.corner_vertices()[:max_corners]
+        picks = self.anchor_candidates(max_candidates=max_corners)
         lo, hi = self.bounds()
         return {
             "vertices": self.vertices.round(6).tolist(),
             "edges": edges.tolist(),
-            "corners": corners.tolist(),
+            "picks": [p.to_dict() for p in picks],
+            "pick_counts": {
+                kind: sum(1 for p in picks if p.kind == kind)
+                for kind in ("centre", "virtual", "corner")
+            },
             "bounds": [lo.tolist(), hi.tolist()],
             "size": self.size().tolist(),
             "centroid": self.centroid().round(6).tolist(),
@@ -214,6 +447,176 @@ class Mesh:
             "n_feature_edges": int(len(edges)),
             "source": self.source,
         }
+
+
+# --------------------------------------------------------------------------
+# anchor candidates from a boundary loop
+# --------------------------------------------------------------------------
+
+
+def _loop_centre(pts: np.ndarray) -> tuple[np.ndarray, float, float] | None:
+    """``(centre, mean radius, roundness)`` if this outline has a usable centre.
+
+    Roundness is the loop's area over that of the circle through it: 1.0 for a
+    circle, 0.83 for a hexagon, 0.64 for a square. All three have a centre worth
+    marking -- what the test rejects is a long thin outline, whose centre is
+    poorly defined along its length and not something anyone can point at.
+    """
+    pts = np.asarray(pts, dtype=float)
+    # Five sides minimum. A genuine round feature always has more than that once
+    # tessellated, while a four-sided loop is usually just a flat facet -- the
+    # side wall of a hex head, say -- whose middle is not a feature of anything.
+    # Rectangular outlines lose nothing by this: their corners say far more than
+    # their centre does.
+    if len(pts) < 5:
+        return None
+
+    middle = pts.mean(axis=0)
+    centred = pts - middle
+    _u, _s, vt = np.linalg.svd(centred, full_matrices=False)
+    normal = vt[2]
+    spread = float(np.max(np.linalg.norm(centred, axis=1)))
+    if spread < 1e-12:
+        return None
+    if float(np.max(np.abs(centred @ normal))) > 0.02 * spread:
+        return None  # not flat enough to have a centre in any useful sense
+
+    ex, ey = vt[0], vt[1]
+    xy = np.stack([centred @ ex, centred @ ey], axis=1)
+    x, y = xy[:, 0], xy[:, 1]
+    xn, yn = np.roll(x, -1), np.roll(y, -1)
+    cross = x * yn - xn * y
+    area2 = float(cross.sum())
+    if abs(area2) < 1e-18:
+        return None
+    cx = float(((x + xn) * cross).sum() / (3.0 * area2))
+    cy = float(((y + yn) * cross).sum() / (3.0 * area2))
+
+    centre = middle + cx * ex + cy * ey
+    radii = np.linalg.norm(pts - centre, axis=1)
+    mean_r = float(radii.mean())
+    if mean_r < 1e-12:
+        return None
+    if float(radii.std() / mean_r) > 0.30:
+        return None
+
+    roundness = abs(area2) / 2.0 / (math.pi * mean_r * mean_r)
+    if roundness < 0.55:
+        return None
+    return centre, mean_r, float(min(roundness, 1.0))
+
+
+def _straight_runs(
+    pts: np.ndarray, angle_tol_deg: float = 7.0
+) -> list[tuple[int, int, np.ndarray, float]]:
+    """Maximal straight stretches of a closed loop, as ``(start, end, dir, length)``.
+
+    A fillet arrives as a short burst of many tiny segments between two long
+    straight runs, which is exactly what makes it findable.
+    """
+    pts = np.asarray(pts, dtype=float)
+    n = len(pts)
+    if n < 3:
+        return []
+    segments = []
+    for i in range(n):
+        d = pts[(i + 1) % n] - pts[i]
+        L = float(np.linalg.norm(d))
+        if L > 1e-12:
+            segments.append((i, d / L, L))
+    if not segments:
+        return []
+
+    cos_tol = math.cos(math.radians(angle_tol_deg))
+    runs: list[list] = []
+    first, last, direction, total = segments[0][0], segments[0][0], segments[0][1], segments[0][2]
+    for i, d, L in segments[1:]:
+        if float(d @ direction) >= cos_tol:
+            total += L
+            last = i
+        else:
+            runs.append([first, (last + 1) % n, direction, total])
+            first, last, direction, total = i, i, d, L
+    runs.append([first, (last + 1) % n, direction, total])
+
+    # the loop wraps, so the last run may be the same straight stretch as the first
+    if len(runs) > 1 and float(runs[-1][2] @ runs[0][2]) >= cos_tol:
+        runs[0][0] = runs[-1][0]
+        runs[0][3] += runs[-1][3]
+        runs.pop()
+    return [(a, b, d, L) for a, b, d, L in runs]
+
+
+def _virtual_corners(
+    pts: np.ndarray, diag: float
+) -> list[tuple[np.ndarray, float, float]]:
+    """Where consecutive straight runs would meet, as ``(point, gap, reach)``.
+
+    ``gap`` is how far the meeting point sits past the ends of the runs -- the
+    fillet radius, in effect -- and is what distinguishes a rounded-off corner
+    from two edges that simply happen to point at each other.
+    """
+    pts = np.asarray(pts, dtype=float)
+    runs = [r for r in _straight_runs(pts) if r[3] >= diag * 0.02]
+    if len(runs) < 2:
+        return []
+
+    out: list[tuple[np.ndarray, float, float]] = []
+    pairs = len(runs) if len(runs) > 2 else 1
+    for k in range(pairs):
+        a = runs[k]
+        b = runs[(k + 1) % len(runs)]
+        da, db = a[2], b[2]
+        axis = np.cross(da, db)
+        denom = float(axis @ axis)
+        if denom < 1e-12:
+            continue
+        if math.degrees(math.acos(min(1.0, abs(float(da @ db))))) < 20.0:
+            continue
+
+        pa, pb = pts[a[0]], pts[b[0]]
+        t = float(np.cross(pb - pa, db) @ axis) / denom
+        point = pa + t * da
+
+        gap = max(
+            float(np.linalg.norm(point - pts[a[1]])),
+            float(np.linalg.norm(point - pts[b[0]])),
+        )
+        reach = float(min(a[3], b[3]))
+        if gap > 0.6 * reach:
+            continue
+        # Nothing was rounded off here: the runs already meet at a vertex, and
+        # the vertex scan reports it as the sharp corner it is. Claiming it as a
+        # reconstructed one would be a lie about the geometry.
+        if gap <= 0.02 * reach:
+            continue
+        out.append((point, gap, reach))
+    return out
+
+
+def _dedupe_candidates(
+    candidates: list[AnchorCandidate], tolerance: float
+) -> list[AnchorCandidate]:
+    """Keep the best-scoring candidate in any one spot.
+
+    A corner reached from two adjoining faces, or a centre found from both sides
+    of a through-hole, is one anchor and should be offered once.
+    """
+    grid = max(tolerance, 1e-12)
+    occupied: set[tuple[int, int, int]] = set()
+    kept: list[AnchorCandidate] = []
+    for candidate in candidates:
+        key = tuple(int(v) for v in np.round(np.asarray(candidate.xyz) / grid))
+        if any(
+            (key[0] + dx, key[1] + dy, key[2] + dz) in occupied
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+        ):
+            continue
+        occupied.add(key)  # type: ignore[arg-type]
+        kept.append(candidate)
+    return kept
 
 
 # --------------------------------------------------------------------------
