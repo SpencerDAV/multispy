@@ -656,6 +656,8 @@ function renderStaticProjectMenu(menu) {
     + 'placeholder="name"><button class="smallbtn" id="projdl">download</button></div>'
     + '<div class="msg" style="margin:4px 2px">Downloads a zip with the project and its '
     + 'photos, so you can reopen it later or hand it to someone.</div>'
+    + '<div id="samplesec" hidden><div class="head">Samples</div>'
+    + '<div id="samplelist"></div></div>'
     + '<div class="head">Open</div>'
     + '<div class="newrow"><button class="smallbtn" id="projopen" style="flex:1">'
     + 'choose a .multispy or .zip…</button></div>'
@@ -689,6 +691,102 @@ function renderStaticProjectMenu(menu) {
     if (name === null) return;
     newStaticProject(name);
   };
+  fillSampleList();
+}
+
+/* ---------------------------------------------------------------- samples */
+
+/* Project bundles the build shipped alongside the page. Static mode has no
+ * projects folder to list, so without these a first visit has nothing in it to
+ * look at but an empty canvas. Each is an ordinary `.multispy.zip` -- the same
+ * thing "download" produces -- so opening one goes through `openProjectFile`
+ * exactly like a bundle someone brings themselves, dirty-check included. */
+
+const MB = (bytes) => (bytes / 1e6).toFixed(1);
+
+/** Wait until Python can actually be called.
+ *  `isStatic()` reports which build this is and nothing more -- it answers true
+ *  from a config flag, long before Pyodide has finished downloading and
+ *  unpacking. The menu is open and clickable during those seconds, and a click
+ *  then reached `pyodide.FS` while `pyodide` was still null. `isReady()` is the
+ *  signal that actually means something. */
+async function whenBackendReady(timeoutMs = 180000) {
+  const until = Date.now() + timeoutMs;
+  while (!Backend.isReady()) {
+    if (Date.now() > until) return false;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return true;
+}
+
+/** Fill the Samples section, or leave it hidden if there are none.
+ *  A build served straight out of `web/` has no manifest beside it, and that is
+ *  ordinary rather than an error: the section simply never appears. */
+async function fillSampleList() {
+  const section = $('samplesec');
+  const host = $('samplelist');
+  if (!section || !host) return;
+
+  let items;
+  try {
+    const res = await fetch('samples/index.json', { cache: 'no-cache' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    items = await res.json();
+  } catch {
+    return;
+  }
+  if (!Array.isArray(items) || !items.length) return;
+
+  host.innerHTML = items.map((s, i) =>
+    `<div class="pr" data-sample="${i}"><span>${escapeHtml(s.name)}`
+    + `<div class="sub">${s.images} photo(s), ${s.points} tie point(s)</div></span>`
+    + `<span class="sub">${MB(s.bytes)} MB</span></div>`
+  ).join('');
+  for (const row of host.querySelectorAll('[data-sample]')) {
+    row.onclick = () => openSample(items[+row.dataset.sample]);
+  }
+  section.hidden = false;
+}
+
+/** Fetch one sample and open it.
+ *  These bundles carry their photos, so they run to tens of megabytes and the
+ *  app would otherwise sit silent for a long moment on a click. The body is
+ *  read in chunks purely so the status line can say how far along it is. */
+async function openSample(sample) {
+  try {
+    setStatus(`downloading ${sample.name} — ${MB(sample.bytes)} MB…`);
+    const res = await fetch(`samples/${sample.file}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    let blob;
+    const total = Number(res.headers.get('content-length')) || sample.bytes || 0;
+    if (res.body && total) {
+      const reader = res.body.getReader();
+      const chunks = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.length;
+        setStatus(`downloading ${sample.name} — ${MB(got)} of ${MB(total)} MB`);
+      }
+      blob = new Blob(chunks);
+    } else {
+      blob = await res.blob();
+    }
+
+    // the download and Pyodide's own boot overlap, which is the whole reason
+    // this waits here rather than refusing the click up front
+    if (!Backend.isReady()) {
+      setStatus(`${sample.name} downloaded — waiting for Python to finish loading…`);
+      if (!(await whenBackendReady())) throw new Error('Python did not finish loading');
+    }
+
+    await openProjectFile(new File([blob], sample.file));
+  } catch (err) {
+    setStatus(`could not open ${sample.name}: ${err.message}`, 'bad');
+  }
 }
 
 async function switchProject(endpoint, body) {

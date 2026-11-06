@@ -15,8 +15,10 @@ static path without deploying it.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +27,16 @@ sys.path.insert(0, str(ROOT))
 from multispy.docpage import DOCS, render_page  # noqa: E402
 
 WEB_FILES = ("index.html", "app.js", "viewer3d.js", "backend.js")
+
+SAMPLES_DIR = ROOT / "samples"
+"""Ready-made project bundles to offer on the static build.
+
+The local server lists whatever is in the projects folder, but a page served
+from Pages has no disk and no projects folder, so without these a first visit
+has nothing in it to look at. Each is a `.multispy.zip` exactly as "download"
+produces, which means opening one goes through the same path as a bundle the
+user brings themselves -- there is no second code path to keep working.
+"""
 
 PY_MODULES = (
     "__init__",
@@ -91,11 +103,50 @@ def build(out_dir: Path) -> dict[str, int]:
             page = page.replace(before, after)
         put(f"docs/{route}.html", page)
 
+    put("samples/index.json", json.dumps(copy_samples(put), indent=2))
+
     # Without this, Pages runs the tree through Jekyll, which drops every path
     # beginning with an underscore -- including py/multispy/__init__.py, so the
     # package would simply fail to import.
     put(".nojekyll", "")
     return written
+
+
+def copy_samples(put) -> list[dict]:
+    """Copy every sample bundle into the build and describe it for the menu.
+
+    The description is read out of each zip rather than kept in a list here, so
+    a sample cannot drift from its own manifest: drop a new `.multispy.zip` into
+    `samples/` and it appears, with the right counts, next build. A bundle that
+    will not open is skipped rather than shipped broken -- the menu offering a
+    sample that fails on click is worse than the menu not offering it.
+    """
+    if not SAMPLES_DIR.is_dir():
+        return []
+
+    entries: list[dict] = []
+    for path in sorted(SAMPLES_DIR.glob("*.multispy.zip")):
+        try:
+            with zipfile.ZipFile(path) as zf:
+                project = json.loads(zf.read("project.multispy"))
+                photos = sum(
+                    1 for n in zf.namelist() if n.startswith("photos/") and not n.endswith("/")
+                )
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile) as exc:
+            print(f"  skipping {path.name}: {exc}", file=sys.stderr)
+            continue
+
+        rel = f"samples/{path.name}"
+        put(rel, path.read_bytes())
+        entries.append({
+            "file": path.name,
+            "name": project.get("name") or path.name.split(".")[0],
+            "images": len(project.get("images", [])),
+            "points": len(project.get("points", [])),
+            "photos": photos,
+            "bytes": path.stat().st_size,
+        })
+    return entries
 
 
 def main() -> int:

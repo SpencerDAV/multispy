@@ -39,10 +39,26 @@ jobs:
           set -e
           for f in index.html app.js backend.js viewer3d.js config.js .nojekyll \
                    py/multispy/__init__.py py/multispy/solve.py py/multispy/webapp.py \
-                   docs/readme.html docs/tutorial.html; do
+                   docs/readme.html docs/tutorial.html samples/index.json; do
             test -f "dist/$f" || { echo "missing dist/$f"; exit 1; }
           done
           grep -q "pyodide" dist/config.js || { echo "config.js is not the static one"; exit 1; }
+          # every sample the manifest advertises has to be there to click on,
+          # and a sample that 404s is worse than one the menu never offered
+          python - <<'PY'
+          import json, pathlib, sys
+          manifest = pathlib.Path("dist/samples/index.json")
+          entries = json.loads(manifest.read_text())
+          if not entries:
+              sys.exit("samples/index.json is empty; nothing would appear in the menu")
+          for entry in entries:
+              blob = pathlib.Path("dist/samples") / entry["file"]
+              if not blob.is_file():
+                  sys.exit(f"manifest lists {entry['file']} but it was not copied")
+              if blob.stat().st_size != entry["bytes"]:
+                  sys.exit(f"{entry['file']} is {blob.stat().st_size} bytes, manifest says {entry['bytes']}")
+              print(f"  sample {entry['name']}: {entry['images']} photos, {blob.stat().st_size:,} bytes")
+          PY
           echo "bundle looks right"
 
       - uses: actions/upload-pages-artifact@v3
