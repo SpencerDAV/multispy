@@ -15,6 +15,7 @@ Two flavours:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -108,11 +109,16 @@ def save_with_exif(img: Image.Image, path: Path) -> None:
 
     Only the 35mm equivalent, rounded to a whole millimetre, with no sensor-size
     tags -- which is what most phones and drones actually record. The rounding
-    is deliberate: 3200 px on a 4000 px frame is 28.8 mm, stored as 29, so
-    reading it back gives 3222 px. That ~0.7% is the honest accuracy of the EXIF
+    is deliberate: 3200 px on a 4000x3000 frame is 27.7 mm, stored as 28, so
+    reading it back gives 3236 px. That ~1.1% is the honest accuracy of the EXIF
     route, and the demo should show it rather than hide it.
+
+    Equivalence runs through the diagonal, the same way ``exif.read_focal``
+    inverts it. Writing the tag by the frame width instead would make a camera
+    this scene never had, and the demo would then show a 4.7% EXIF error that
+    is really just the two ends disagreeing about the convention.
     """
-    equivalent_mm = TRUE_FOCAL * 36.0 / WIDTH
+    equivalent_mm = TRUE_FOCAL * math.hypot(36.0, 24.0) / math.hypot(WIDTH, HEIGHT)
     sub = {
         0x920A: round(equivalent_mm, 1),        # FocalLength
         0xA405: int(round(equivalent_mm)),      # FocalLengthIn35mmFilm

@@ -105,7 +105,9 @@ Four rules, in order of how often they are broken:
    edge look like two lines but tell the solver one thing.
 3. **Draw along the positive direction.** The arrowhead shows which way the line
    points; it must run the way the axis increases. Get this wrong and the solve
-   comes out mirrored.
+   comes out mirrored. **Click a drawn line to reverse it** — no need to delete
+   and redraw. Watch for this especially when two axes in one photo are both
+   backwards: that pair cancels into a legal rotation, so nothing warns you.
 4. **Longer is much better.** A 2 px slip on a 1000 px line matters a tenth as
    much as on a 100 px one, and the solver weights it that way.
 
@@ -508,6 +510,7 @@ Two failure modes worth recognising before you shoot:
 | `Ctrl+S` | Save |
 | `?` | Open this tutorial |
 | `Delete`, right-click | Remove what is under the cursor |
+| click a drawn line | Reverse its direction |
 | wheel / space-drag | Zoom / pan |
 
 ### Minimums

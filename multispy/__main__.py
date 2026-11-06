@@ -173,8 +173,8 @@ def main(argv: list[str] | None = None) -> int:
             g = exif_focal.summarise_group(project, gid)
             print(f"camera group {gid}: {g.n_with_focal}/{g.n_images} image(s) carry a usable focal length")
             if g.focal_px:
-                width = next(im.width for im in images if im.group == gid)
-                eq = exif_focal.focal_px_to_35mm(g.focal_px, width)
+                shape = next((im.width, im.height) for im in images if im.group == gid)
+                eq = exif_focal.focal_px_to_35mm(g.focal_px, *shape)
                 print(f"  {g.focal_px:.1f} px  (~{eq:.0f} mm equivalent)  "
                       f"via {g.source}  [{g.confidence}]")
             if g.note:

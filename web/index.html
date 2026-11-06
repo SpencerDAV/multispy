@@ -199,6 +199,31 @@
   #projmenu .path { color: var(--text-dim); font-size: 10px; word-break: break-all;
     padding: 4px 2px 0; border-top: 1px solid var(--border); margin-top: 7px; }
 
+  /* --------------------------------------------------------------- dialog */
+  /* Stands in for window.confirm and window.prompt, which an embedded webview
+     may decline to show at all. See the dialog section in app.js. */
+  #dialog {
+    position: fixed; inset: 0; z-index: 90; display: flex;
+    align-items: center; justify-content: center; background: #0d0f12c0;
+  }
+  #dialog[hidden] { display: none; }
+  #dialog .box {
+    width: min(420px, calc(100vw - 40px));
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px 18px; box-shadow: 0 18px 50px #000a;
+  }
+  #dialog .msg p { margin: 0 0 9px; white-space: pre-wrap; }
+  #dialog .msg p:first-child { font-weight: 600; }
+  #dialog .msg p + p { color: var(--text-dim); font-size: 12px; }
+  #dialog .val {
+    width: 100%; margin: 4px 0 2px; padding: 6px 8px; border-radius: 5px;
+    background: var(--bg); border: 1px solid var(--border);
+  }
+  #dialog .val:focus { outline: none; border-color: var(--accent); }
+  #dialog .val[hidden] { display: none; }
+  #dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  #dialog .ok.danger { background: var(--bad); border-color: var(--bad); color: #190c0a; }
+
   /* ----------------------------------------------------------- dropzone */
   #dropzone {
     position: absolute; inset: 0; z-index: 30; display: none;

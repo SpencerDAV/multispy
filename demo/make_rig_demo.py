@@ -149,8 +149,13 @@ def render_view(R: np.ndarray, t: np.ndarray, cam: Intrinsics) -> Image.Image:
 
 def save_with_exif(img: Image.Image, path: Path) -> None:
     """Write the photo with a 35mm-equivalent focal length, rounded the way a
-    real camera records it."""
-    equivalent_mm = TRUE_FOCAL * 36.0 / WIDTH
+    real camera records it.
+
+    Through the diagonal, matching the inverse in ``exif.read_focal``: 35mm
+    equivalence is a diagonal field of view, and the frame width only gives the
+    same answer on a 3:2 frame.
+    """
+    equivalent_mm = TRUE_FOCAL * math.hypot(36.0, 24.0) / math.hypot(WIDTH, HEIGHT)
     data = Image.Exif()
     data[0x010F] = "MultiSpy"
     data[0x0110] = "Synthetic Camera"

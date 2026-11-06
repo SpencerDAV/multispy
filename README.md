@@ -184,6 +184,7 @@ choose which world axis you are tracing: X, Y, Z.
   i.e. along the **positive** axis. The arrowhead shows which way the line
   points. This is what resolves the sign ambiguity — the same vanishing point
   serves both `+d` and `−d`, so only the direction you drew can tell them apart.
+  Drew one the wrong way? **Left-click it** to reverse it in place.
 - **Longer is better and is weighted accordingly.** A 2 px slip on a 100 px
   segment says far less about a direction than the same slip on a 1000 px one,
   and the solver weights by segment length to match.
@@ -237,22 +238,31 @@ group, three ways:
   *focal plane resolution* (`FocalLength` in mm plus the sensor-size tags) is
   exact and marked **good**; *35mm equivalent* is marked **approximate**,
   because cameras round it to a whole millimetre. On the demo set that rounding
-  alone costs 0.7% — 28.8 mm stored as 29, read back as 3222 px instead of 3200.
+  alone costs 1.1% — 27.7 mm stored as 28, read back as 3236 px instead of 3200.
 - **Typed** — a number plus a unit, either raw **px** or **mm eq** (35mm
-  equivalent, converted with the image width).
+  equivalent, converted through the image **diagonal** — see below).
 - **From a solve** — solve once with it free, then tick **lock focal length**
   to pin what came out, before refining anything else.
 
 **Use EXIF as a fallback, not a default.** On a photo set where the Focal check
 says *good*, the solve beats EXIF by a wide margin — on the demo it lands at
-3201.6 px against a true 3200 (0.05%), where EXIF gives 3222 (0.7%), 14x worse.
+3201.6 px against a true 3200 (0.05%), where EXIF gives 3236 (1.1%), 22x worse.
 EXIF earns its place exactly when the Focal check says *poor*.
+
+**Why the diagonal.** 35mm equivalence is a *diagonal* field of view, so it
+converts as `f_px = f35 × hypot(W, H) / hypot(36, 24)`. Dividing by the 36 mm
+film width instead only agrees when the frame is 3:2 like the film itself: a 4:3
+photo comes out 3.8% low and a 16:9 frame 4.8% high. The diagonal is also the
+same after a quarter turn, which matters more than it sounds — a portrait photo
+arrives with its width and height already swapped, and the width rule reads the
+very same file 28% low purely for having been held upright.
 
 Two readings are refused rather than offered:
 
 - **Cropped images.** If the aspect ratio disagrees with the EXIF dimensions,
   the pixels no longer span the whole sensor and the conversion is void.
-  Resizing is fine and handled; cropping is not.
+  Resizing is fine and handled; so is a quarter turn, which is reported as a
+  rotation rather than refused as a crop. Cropping is not.
 - **A zoomed lens.** If the EXIF focal lengths across a group disagree by more
   than 2%, one shared focal is the wrong model and you are told to split the
   group rather than handed an average.
@@ -545,6 +555,7 @@ registered images, 17 points, 70 observations, 0.487 px mean reprojection error.
 | wheel | Zoom at cursor |
 | space-drag, middle-drag, alt-drag | Pan |
 | right-click | Delete a marker or line |
+| left-click a drawn line | Reverse its direction — the sign of that axis |
 
 ---
 

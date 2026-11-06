@@ -9,6 +9,10 @@
 const AXIS_COLOR = ['#ff5a5a', '#4ddb7f', '#5a9cff'];
 const AXIS_NAME = ['X', 'Y', 'Z'];
 const RESIDUAL_GAIN = 10; // sub-pixel errors are invisible at 1:1
+/* Screen pixels a press may wander and still count as a click rather than a
+ * drag. A press on a control line is ambiguous -- it could mean "flip this"
+ * or "start dragging" -- and only the release tells you which. */
+const CLICK_SLOP_PX = 3;
 
 const state = {
   project: null,
@@ -132,6 +136,96 @@ function setStatus(text, cls) {
   const el = $('status');
   el.textContent = text;
   el.className = cls || '';
+}
+
+/* ---------------------------------------------------------------- dialogs */
+
+/* `window.confirm` and `window.prompt` are not dependable here. An embedded
+ * webview may suppress them outright -- the Claude desktop browser pane does,
+ * and `confirm` then returns false the instant it is called, with no dialog
+ * and no error to notice. Every guarded action silently became a no-op: no
+ * photo, object or model could be removed, and a project with unsaved changes
+ * could not be closed. So the app asks its own questions, in the page, where
+ * nothing can switch them off.
+ *
+ * Both helpers return a promise. `askConfirm` resolves true or false;
+ * `askText` resolves the string, or null if the user backed out -- the same
+ * contract the native calls had, so the call sites only had to learn to wait.
+ */
+
+function dialogHost() {
+  let host = $('dialog');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'dialog';
+  host.hidden = true;
+  host.innerHTML =
+    '<div class="box"><div class="msg"></div>'
+    + '<input class="val" type="text" hidden>'
+    + '<div class="row"><button class="smallbtn cancel">Cancel</button>'
+    + '<button class="action primary ok">OK</button></div></div>';
+  document.body.appendChild(host);
+  return host;
+}
+
+/** Ask one question in the page. Blank lines split `text` into paragraphs:
+ *  the first is the question, the rest are the consequences. Passing a string
+ *  for `value` makes it a text entry instead of a yes/no. */
+function askDialog(text, { value = null, ok = 'OK', danger = false } = {}) {
+  const host = dialogHost();
+  const box = host.querySelector('.box');
+  const msg = host.querySelector('.msg');
+  const input = host.querySelector('.val');
+  const okBtn = host.querySelector('.ok');
+  const cancelBtn = host.querySelector('.cancel');
+  const asking = value !== null;
+
+  msg.innerHTML = '';
+  for (const para of String(text).split(/\n{2,}/)) {
+    const p = document.createElement('p');
+    p.textContent = para;
+    msg.appendChild(p);
+  }
+  okBtn.textContent = ok;
+  okBtn.classList.toggle('danger', !!danger);
+  input.hidden = !asking;
+  input.value = asking ? String(value) : '';
+  host.hidden = false;
+  if (asking) { input.focus(); input.select(); } else { okBtn.focus(); }
+
+  return new Promise((resolve) => {
+    const done = (answer) => {
+      host.hidden = true;
+      document.removeEventListener('keydown', onKey, true);
+      resolve(answer);
+    };
+    const accept = () => done(asking ? input.value : true);
+    const cancel = () => done(asking ? null : false);
+    function onKey(ev) {
+      // capture, so the canvas shortcuts -- Enter solves, Escape leaves the
+      // 3D view -- never fire underneath an open question
+      if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); cancel(); }
+      else if (ev.key === 'Enter') { ev.preventDefault(); ev.stopPropagation(); accept(); }
+    }
+    okBtn.onclick = accept;
+    cancelBtn.onclick = cancel;
+    host.onmousedown = (ev) => { if (ev.target === host) cancel(); };
+    box.onmousedown = (ev) => ev.stopPropagation();
+    document.addEventListener('keydown', onKey, true);
+  });
+}
+
+/** Yes or no. Resolves true only if the user says yes. */
+const askConfirm = (text, opts) => askDialog(text, { ...(opts || {}), value: null });
+
+/** Ask for a line of text. Resolves null if the user backs out. */
+const askText = (text, value = '') =>
+  askDialog(text, { value: value == null ? '' : String(value) });
+
+/** Is a question on screen? The canvas shortcuts stand down while one is. */
+function dialogOpen() {
+  const host = $('dialog');
+  return !!host && !host.hidden;
 }
 
 function markDirty() {
@@ -295,7 +389,9 @@ async function saveNow() {
 
 /** Open a .multispy, or a zip of one with its photos. Static mode only. */
 async function openProjectFile(file) {
-  if (state.dirty && !confirm('This project has unsaved changes. Open anyway?')) return;
+  if (state.dirty && !(await askConfirm(
+    'This project has unsaved changes.\n\nOpen anyway? The unsaved changes here are lost.',
+    { ok: 'Open anyway', danger: true }))) return;
   try {
     setStatus(`opening ${file.name}…`);
     const data = await Backend.openFile(file);
@@ -331,7 +427,9 @@ async function openProjectFile(file) {
 }
 
 async function newStaticProject(name) {
-  if (state.dirty && !confirm('This project has unsaved changes. Start a new one anyway?')) return;
+  if (state.dirty && !(await askConfirm(
+    'This project has unsaved changes.\n\nStart a new one anyway? The unsaved changes here are lost.',
+    { ok: 'Start new', danger: true }))) return;
   await Backend.resetProject(name);
   for (const bmp of state.bitmaps.values()) bmp.close?.();
   state.bitmaps.clear();
@@ -396,7 +494,7 @@ async function exportNow() {
 }
 
 async function addFolder() {
-  const folder = prompt('Folder of photos to add:');
+  const folder = await askText('Folder of photos to add:', '');
   if (!folder) return;
   try {
     setStatus('adding photos…');
@@ -475,15 +573,16 @@ async function removeImage(imageId) {
 
   let question = `Remove ${meta.name || im.id} from this project?`;
   if (marks) question += `\n\nIt carries ${marks} mark(s), which will be lost.`;
-  if (!confirm(question)) return;
+  if (!(await askConfirm(question, { ok: 'Remove', danger: true }))) return;
 
   // deleting the file is a separate, explicit decision, and only ever offered
   // for photos this project copied in itself
   let deleteFile = false;
   if (owned) {
-    deleteFile = confirm(
+    deleteFile = await askConfirm(
       `Also delete the file from disk?\n\n${meta.absolute || im.path}\n\n`
-      + `Cancel keeps the file and only unlinks it from the set.`
+      + `Cancel keeps the file and only unlinks it from the set.`,
+      { ok: 'Delete the file', danger: true }
     );
   }
 
@@ -585,11 +684,17 @@ function renderStaticProjectMenu(menu) {
     }
   };
   $('projopen').onclick = () => $('projectinput').click();
-  $('projnew').onclick = () => newStaticProject(prompt('Name for the new project:', 'untitled'));
+  $('projnew').onclick = async () => {
+    const name = await askText('Name for the new project:', 'untitled');
+    if (name === null) return;
+    newStaticProject(name);
+  };
 }
 
 async function switchProject(endpoint, body) {
-  if (state.dirty && !confirm('This project has unsaved changes. Switch anyway?')) return;
+  if (state.dirty && !(await askConfirm(
+    'This project has unsaved changes.\n\nSwitch anyway? The unsaved changes here are lost.',
+    { ok: 'Switch anyway', danger: true }))) return;
   try {
     const data = await api(endpoint, body);
     for (const bmp of state.bitmaps.values()) bmp.close?.();
@@ -1110,6 +1215,24 @@ function hitTest(p) {
   return null;
 }
 
+/** Reverse a control line, so p0 -> p1 points the other way.
+ *
+ *  A line carries no arrowhead in the world, only on screen: the direction it
+ *  was dragged in is what fixes the sign of its axis. Draw one backwards and
+ *  the solver silently gets a mirrored frame -- flip TWO axes in a photo and
+ *  the determinant is back to +1, a legal rotation 180 degrees about the
+ *  third, with nothing to complain about. Correcting that by hand meant
+ *  deleting the line and redrawing it; this is the one-click version. */
+function flipLine(im, index) {
+  const ln = im.axis_lines[index];
+  if (!ln) return;
+  [ln.p0, ln.p1] = [ln.p1, ln.p0];
+  markDirty();
+  setStatus(`${AXIS_NAME[ln.axis]} line ${index} reversed — the arrow now points the other way`, 'ok');
+  renderPanels();
+  render();
+}
+
 /* ------------------------------------------------------------- tie points */
 
 function newPoint(label) {
@@ -1284,12 +1407,24 @@ canvas.addEventListener('mousedown', (ev) => {
     render();
     return;
   }
+  // A press on a line, or on one of its endpoint handles, means reverse it --
+  // and the arrowhead you naturally aim at IS a handle, so both must flip. It
+  // only becomes a drag once the pointer passes the slop, and mouseup decides
+  // between the two. In lines mode the drag is a new line, so drawing one that
+  // starts on top of an existing line still works. Only in the two modes that
+  // are about lines: while marking points or anchors, a press near a line is
+  // not about the line, and a silent sign change there would be invisible.
+  const flipMode = state.mode === 'select' || state.mode === 'lines';
+
   if (hit && hit.kind === 'handle') {
     state.drag = { kind: 'movehandle', index: hit.index, which: hit.which };
+    if (flipMode) Object.assign(state.drag, { flip: hit.index, down: p, moved: false });
     return;
   }
-  if (hit && hit.kind === 'line' && state.mode === 'select') {
-    state.drag = { kind: 'moveline', index: hit.index, last: p };
+  if (hit && hit.kind === 'line' && flipMode) {
+    state.drag = state.mode === 'select'
+      ? { kind: 'moveline', index: hit.index, last: p, down: p, moved: false, flip: hit.index }
+      : { kind: 'newline', from: p, to: p, down: p, moved: false, flip: hit.index };
     return;
   }
 
@@ -1323,6 +1458,11 @@ window.addEventListener('mousemove', (ev) => {
     return;
   }
 
+  if (d.down && !d.moved
+      && Math.hypot(p.x - d.down.x, p.y - d.down.y) * state.view.zoom > CLICK_SLOP_PX) {
+    d.moved = true;
+  }
+
   if (d.kind === 'pan') {
     state.view.panX = d.px - (ev.clientX - d.sx) / state.view.zoom;
     state.view.panY = d.py - (ev.clientY - d.sy) / state.view.zoom;
@@ -1334,10 +1474,12 @@ window.addEventListener('mousemove', (ev) => {
     im.anchor_obs[d.key] = [p.x, p.y];
   } else if (d.kind === 'movehandle') {
     const ln = im.axis_lines[d.index];
-    if (ln) (d.which === 0 ? ln.p0 : ln.p1).splice(0, 2, p.x, p.y);
+    if (ln && (d.flip === undefined || d.moved)) {
+      (d.which === 0 ? ln.p0 : ln.p1).splice(0, 2, p.x, p.y);
+    }
   } else if (d.kind === 'moveline') {
     const ln = im.axis_lines[d.index];
-    if (ln) {
+    if (ln && d.moved) {
       const dx = p.x - d.last.x, dy = p.y - d.last.y;
       ln.p0 = [ln.p0[0] + dx, ln.p0[1] + dy];
       ln.p1 = [ln.p1[0] + dx, ln.p1[1] + dy];
@@ -1359,7 +1501,13 @@ window.addEventListener('mouseup', () => {
       im.axis_lines.push({ axis: state.axis, p0: [d.from.x, d.from.y], p1: [d.to.x, d.to.y] });
       markDirty();
       renderPanels();
+    } else if (d.flip !== undefined) {
+      flipLine(im, d.flip);
+      return;
     }
+  } else if (d.flip !== undefined && !d.moved) {
+    flipLine(im, d.flip);
+    return;
   } else if (d.kind !== 'pan') {
     markDirty();
     renderPanels();
@@ -1382,6 +1530,7 @@ canvas.addEventListener('wheel', (ev) => {
 
 window.addEventListener('keydown', (ev) => {
   if (ev.target.matches('input, select, textarea')) return;
+  if (dialogOpen()) return;
   const k = ev.key.toLowerCase();
 
   if (k === ' ') { state.spaceDown = true; canvas.style.cursor = 'grab'; ev.preventDefault(); return; }
@@ -1478,12 +1627,14 @@ function updateHint() {
   const hints = {
     lines: `Drag along an edge parallel to the <b>${AXIS_NAME[state.axis]}</b> axis. `
          + `Draw in the <b>+${AXIS_NAME[state.axis]}</b> direction — the arrow shows which way. `
+         + `Click a drawn line to reverse it, right-click to delete. `
          + `Two per axis minimum, three is better. Keys 1/2/3 switch axis.`,
     points: `Click the same physical feature in each photo it appears in. `
           + `<b>N</b> starts a new point, <b>Tab</b> jumps to the next photo missing it. `
           + `Two shared points per image pair is the minimum.`,
     objects: objectHint,
-    select: `Drag markers or whole control lines. Right-click or Delete removes one.`,
+    select: `Drag markers or whole control lines; click a line to reverse it. `
+          + `Right-click or Delete removes one.`,
   };
   $('hint').innerHTML = hints[state.mode]
     + ` &nbsp;·&nbsp; wheel zoom, space-drag pan, <b>F</b> fit`
@@ -1516,7 +1667,9 @@ function buildFilmstrip() {
     const div = document.createElement('div');
     div.className = 'film' + (im.id === state.current ? ' sel' : '') + (im.enabled ? '' : ' off');
     div.innerHTML =
-      `<img loading="lazy" alt="">` +
+      // not draggable: dragging a tile hands the browser the thumbnail as a
+      // file, which the window drop handler then uploads as a new 220px photo
+      `<img loading="lazy" alt="" draggable="false">` +
       `<button class="rm" title="Remove from this project">&times;</button>` +
       `<div class="meta"><span>${st.text}</span>` +
       `<span class="dot" style="background:${st.color}"></span></div>`;
@@ -1640,7 +1793,7 @@ function renderImagePanel() {
         + `${g.lock_k1 ? ' checked' : ''}> lock distortion (k1)</label>`;
 
   // focal length: show it, let it be typed or taken from EXIF, and lock it
-  const mmEq = g.f ? (g.f * 36 / im.width) : null;
+  const mmEq = g.f ? pxTo35mm(g.f, im) : null;
   html += `<div class="focalbox">`
         + `<div class="row"><span class="k">focal length</span>`
         + `<span class="focalnow">`
@@ -1684,7 +1837,7 @@ function renderImagePanel() {
   $('focalset').onclick = () => {
     const raw = parseFloat($('focalval').value);
     if (!(raw > 0)) { setStatus('enter a positive focal length', 'warn'); return; }
-    const px = $('focalunit').value === 'mm35' ? raw * im.width / 36 : raw;
+    const px = $('focalunit').value === 'mm35' ? pxFrom35mm(raw, im) : raw;
     applyFocal(px, $('focalunit').value === 'mm35' ? `${raw} mm equivalent` : 'a typed value');
   };
   const clearBtn = $('focalclear');
@@ -1701,6 +1854,15 @@ function renderImagePanel() {
 }
 
 /* ------------------------------------------------------- focal from EXIF */
+
+/* 35mm equivalence is a diagonal field of view, so it converts through the
+ * diagonal. Dividing by the 36 mm film width instead only agrees when the image
+ * is 3:2 like the film frame -- a 4:3 photo reads 3.8% low and a 16:9 frame
+ * 4.8% high. Mirrors focal_px_from_35mm / focal_px_to_35mm in exif.py. */
+const FULL_FRAME_DIAGONAL_MM = Math.hypot(36, 24);
+const diagPx = (im) => Math.hypot(im.width, im.height);
+const pxFrom35mm = (mm, im) => mm * diagPx(im) / FULL_FRAME_DIAGONAL_MM;
+const pxTo35mm = (px, im) => px * FULL_FRAME_DIAGONAL_MM / diagPx(im);
 
 let exifCache = null;
 let exifKey = null;
@@ -1749,7 +1911,7 @@ function renderExifRow() {
     el.textContent = `EXIF: ${g.note || 'no focal length recorded'}`;
     return;
   }
-  const mm = g.focal_px * 36 / im.width;
+  const mm = pxTo35mm(g.focal_px, im);
   const trusted = g.confidence !== 'none';
   el.className = 'msg';
   el.innerHTML =
@@ -2118,14 +2280,16 @@ function wireObjectsPanel(el) {
     };
   }
   for (const btn of el.querySelectorAll('[data-delanchor]')) {
-    btn.onclick = (ev) => {
+    btn.onclick = async (ev) => {
       ev.stopPropagation();
       const t = templates()[btn.dataset.tpl];
       const name = btn.dataset.delanchor;
       const marks = instanceList()
         .filter((o) => o.template === t.id)
         .reduce((sum, o) => sum + anchorMarkCount(anchorKey(o.id, name)), 0);
-      if (marks && !confirm(`Remove anchor "${name}"?\n\nIt is marked in ${marks} photo(s), and those marks go with it.`)) return;
+      if (marks && !(await askConfirm(
+        `Remove anchor "${name}"?\n\nIt is marked in ${marks} photo(s), and those marks go with it.`,
+        { ok: 'Remove', danger: true }))) return;
       deleteAnchorFromTemplate(t, name);
       renderPanels();
       syncViewer();
@@ -2210,14 +2374,14 @@ function wireObjectsPanel(el) {
     render();
   };
   const del = $('objdel');
-  if (del) del.onclick = () => {
+  if (del) del.onclick = async () => {
     const inst = activeInstance();
     if (!inst) return;
     const marks = state.project.images.reduce(
       (sum, im) => sum + Object.keys(im.anchor_obs || {}).filter((k) => splitAnchorKey(k)[0] === inst.id).length, 0);
     let question = `Delete ${inst.label || inst.id}?`;
     if (marks) question += `\n\nIt carries ${marks} anchor mark(s), which will be lost.`;
-    if (!confirm(question)) return;
+    if (!(await askConfirm(question, { ok: 'Delete', danger: true }))) return;
     deleteInstance(inst.id);
     renderPanels();
     syncViewer();
@@ -2294,11 +2458,11 @@ function addInstance(templateId) {
   );
 }
 
-function removeTemplate(templateId) {
+async function removeTemplate(templateId) {
   const used = instanceList().filter((o) => o.template === templateId);
   let question = `Remove this model?`;
   if (used.length) question += `\n\n${used.length} object(s) use it, and they go too, with their marks.`;
-  if (!confirm(question)) return;
+  if (!(await askConfirm(question, { ok: 'Remove', danger: true }))) return;
   for (const inst of used) deleteInstance(inst.id);
   delete templates()[templateId];
   state.meshes.delete(templateId);
@@ -2317,13 +2481,13 @@ function removeTemplate(templateId) {
  *  Offered as axis choices because a CAD model of a camera almost always has its
  *  optical axis along a model axis; a lens pointing somewhere odd needs the
  *  numbers typed, and the prompt says so. */
-function editOptical(templateId) {
+async function editOptical(templateId) {
   const t = templates()[templateId];
   if (!t) return;
   const current = t.optical;
   const anchorNames = (t.anchors || []).map((a) => a.name);
 
-  const centreRaw = prompt(
+  const centreRaw = await askText(
     `Lens centre on the model, in ${t.units}.\n\n`
     + `Type three numbers "x y z", or the name of an anchor to use its position`
     + (anchorNames.length ? ` (${anchorNames.slice(0, 6).join(', ')}${anchorNames.length > 6 ? '…' : ''})` : '')
@@ -2357,7 +2521,7 @@ function editOptical(templateId) {
     center = nums;
   }
 
-  const fwdRaw = prompt(
+  const fwdRaw = await askText(
     `Which model axis does the lens look along?\n\n`
     + `One of ${AXIS_CHOICES.map(([n]) => n).join(', ')}, or three numbers for a direction.`,
     current ? axisLabel(current.forward) : '+Z'
@@ -2366,7 +2530,7 @@ function editOptical(templateId) {
   const forward = parseDirection(fwdRaw);
   if (!forward) { setStatus('could not read that direction', 'warn'); return; }
 
-  const upRaw = prompt(
+  const upRaw = await askText(
     `Which model axis is the camera's up?\n\n`
     + `One of ${AXIS_CHOICES.map(([n]) => n).join(', ')}, or three numbers.\n`
     + `Only affects roll, and only in what gets drawn and exported.`,
@@ -2376,7 +2540,7 @@ function editOptical(templateId) {
   const up = parseDirection(upRaw);
   if (!up) { setStatus('could not read that direction', 'warn'); return; }
 
-  const fovRaw = prompt(
+  const fovRaw = await askText(
     `Horizontal field of view in degrees, if you know it.\n\n`
     + `Only sizes the frustum that gets drawn — nothing in the solve uses it, since `
     + `marking this body's shell can never reveal its lens. Leave empty to skip.`,
@@ -2722,10 +2886,10 @@ function addAnchorFromPick(index) {
  *  Needed because the best anchor is not always on the mesh: a drawing gives a
  *  datum the model does not carry, and a CAD export can round off exactly the
  *  corner you want. */
-function addAnchorByCoordinates() {
+async function addAnchorByCoordinates() {
   const t = activeTemplate();
   if (!t) { setStatus('select a model first', 'warn'); return; }
-  const raw = prompt(
+  const raw = await askText(
     `Anchor position on the model, in ${t.units}.\n\n`
       + `Three numbers "x y z", in the model's own coordinates — the same frame `
       + `the picked anchors are listed in.`,
