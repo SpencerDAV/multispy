@@ -14,6 +14,8 @@ from typing import Any
 
 import numpy as np
 
+from .mesh import FEATURE_ANGLE_DEG
+
 FORMAT_VERSION = 2
 """Version 2 adds object templates and instances. Version 1 files load unchanged
 -- they simply have none."""
@@ -172,6 +174,14 @@ class ObjectTemplate:
     unit_scale: float = 0.001
     """World units per model unit. Kept explicitly alongside ``units`` so an
     unusual scale factor survives a round trip."""
+    crease_angle: float = FEATURE_ANGLE_DEG
+    """Facet-to-facet angle below which an edge is not drawn, in degrees.
+
+    A property of the part rather than of the file: a heavily filleted body, or
+    one tessellated finely enough that no two neighbouring facets differ by much,
+    loses its curves from the wireframe entirely at the default. Stored per
+    template because one project can hold both a machined bracket and a turned
+    shaft, which want different answers."""
     anchors: list[ObjectAnchor] = field(default_factory=list)
     optical: OpticalFrame | None = None
 
@@ -470,6 +480,7 @@ class Project:
                     "mesh_path": t.mesh_path,
                     "units": t.units,
                     "unit_scale": t.unit_scale,
+                    "crease_angle": t.crease_angle,
                     "anchors": [asdict(a) for a in t.anchors],
                     "optical": asdict(t.optical) if t.optical is not None else None,
                 }
@@ -563,6 +574,7 @@ class Project:
                 mesh_path=raw.get("mesh_path"),
                 units=raw.get("units", "mm"),
                 unit_scale=float(raw.get("unit_scale", 0.001)),
+                crease_angle=float(raw.get("crease_angle", FEATURE_ANGLE_DEG)),
                 anchors=[
                     ObjectAnchor(name=clean_anchor_name(a["name"]), xyz=[float(v) for v in a["xyz"]])
                     for a in raw.get("anchors", [])

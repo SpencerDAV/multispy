@@ -414,7 +414,23 @@ class Mesh:
 
     # ----------------------------------------------------------- for the UI
 
-    def display_payload(self, max_edges: int = 6000, max_corners: int = 400) -> dict:
+    def all_edges(self) -> int:
+        """How many undirected edges the mesh has in total -- what a modelling
+        package draws as its wireframe.
+
+        Only a count, and it exists to be reported: the crease filter below
+        routinely hides more than half the model, and without a number beside it
+        there is no way to tell a part that is genuinely simple from one whose
+        curves have been filtered away.
+        """
+        seen: set[tuple[int, int]] = set()
+        for a, b, c in self.faces:
+            for u, v in ((a, b), (b, c), (c, a)):
+                seen.add((int(u), int(v)) if u < v else (int(v), int(u)))
+        return len(seen)
+
+    def display_payload(self, max_edges: int = 6000, max_corners: int = 400,
+                        angle_deg: float = FEATURE_ANGLE_DEG) -> dict:
         """Wireframe and pickable corners, trimmed to something a browser can
         orbit at 60 fps.
 
@@ -422,8 +438,16 @@ class Mesh:
         is both unsendable and unreadable. Feature edges already cut that by one
         or two orders of magnitude; what survives is thinned longest-first, since
         the long edges are the ones that carry the shape.
+
+        ``angle_deg`` belongs to the caller because the right value is a property
+        of the part, not of the format. The filter drops every facet-to-facet
+        transition gentler than it, so a fillet or a finely tessellated cylinder
+        vanishes completely while a coarse one survives -- which means a model
+        exported at finer tolerance draws FEWER lines, the opposite of what
+        anyone expects. A part whose shape lives in its curves needs a lower
+        angle, and the only way to settle on one is to look at the result.
         """
-        edges = self.feature_edges()
+        edges = self.feature_edges(angle_deg)
         if len(edges) > max_edges:
             v = self.vertices
             lengths = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
@@ -445,6 +469,8 @@ class Mesh:
             "n_vertices": self.n_vertices,
             "n_faces": self.n_faces,
             "n_feature_edges": int(len(edges)),
+            "n_all_edges": self.all_edges(),
+            "crease_angle": float(angle_deg),
             "source": self.source,
         }
 

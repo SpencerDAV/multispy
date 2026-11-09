@@ -25,7 +25,7 @@ from PIL import Image, ImageOps
 
 from . import exif, export
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
-from .mesh import MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
+from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
 from .project import CameraGroup, ImageView, ObjectTemplate, Project
 from .solve import solve
 
@@ -287,14 +287,21 @@ def observability_payload(body: dict) -> dict:
     }
 
 
-def mesh_payload(path: Path, cache: dict | None = None) -> dict:
-    """Wireframe and pickable corners for one model, memoised by mtime."""
-    key = (str(path), path.stat().st_mtime)
+def mesh_payload(path: Path, cache: dict | None = None,
+                 angle_deg: float = FEATURE_ANGLE_DEG) -> dict:
+    """Wireframe and pickable corners for one model, memoised by mtime.
+
+    The crease angle is part of the key. The same file at two angles is two
+    different wireframes, and handing back the cached one would quietly ignore
+    the setting that was just changed -- which looks exactly like the setting
+    not working.
+    """
+    key = (str(path), path.stat().st_mtime, float(angle_deg))
     if cache is not None and key in cache:
         return cache[key]
     mesh = load_mesh(path)
     units, why = suggest_units(mesh)
-    payload = mesh.display_payload()
+    payload = mesh.display_payload(angle_deg=angle_deg)
     payload["suggested_units"] = units
     payload["units_note"] = why
     if cache is not None:
@@ -509,7 +516,10 @@ class Workspace:
                 raise ValueError("this object has no model file")
             if not path.exists():
                 raise FileNotFoundError(f"model file is missing: {path}")
-            return {"template": template.id, "mesh": mesh_payload(path, self.mesh_cache)}
+            return {
+                "template": template.id,
+                "mesh": mesh_payload(path, self.mesh_cache, template.crease_angle),
+            }
 
         if route == "/api/rig":
             project = Project.from_dict(body["project"], path=self.project.path)

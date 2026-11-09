@@ -34,7 +34,7 @@ const state = {
   hover: null,
   drag: null,
   spaceDown: false,
-  scaleDown: false,
+  depthDown: false,   // S held: the depth handle, see nudgeDepth
   axisKey: null,   // 'x' | 'y' | 'z' while held, to turn about that world axis
   showVP: true,
   showResid: true,
@@ -322,46 +322,27 @@ function nudgeInPlane(inst, im, dxPx, dyPx) {
 }
 
 /** Move the body along the view ray. Multiplicative, because "a bit closer" is
- *  a fraction of the current distance rather than a fixed number of metres. */
+ *  a fraction of the current distance rather than a fixed number of metres.
+ *
+ *  This is the handle S drives, and it is deliberately depth rather than size.
+ *  The two are indistinguishable in a single photograph -- a body 1.25x larger
+ *  and 1.25x further away projects to identical pixels -- so the choice is not
+ *  about what the eye can see, it is about which quantity the gesture should
+ *  write. Depth belongs to THIS placement; size belongs to the MODEL, shared by
+ *  every photo and every copy of it. Setting a shared property by eye from one
+ *  view is much the more damaging of the two, and the eye-fit is only
+ *  scaffolding for the anchor marks anyway: the solve refines placements, so a
+ *  depth set by hand is a starting guess it is expected to improve on, where a
+ *  unit_scale set by hand quietly rescales work already finished elsewhere.
+ *
+ *  Size stays settable, from the units dropdown on the model card, where it is
+ *  a number that gets typed rather than one that gets dragged. */
 function nudgeDepth(inst, im, factor) {
   const depth = bodyDepth(inst, im);
   if (depth === null) return;
   const ax = cameraAxes(im);
   const want = clamp(depth * factor, 0.05, 1e4);
   for (let k = 0; k < 3; k++) inst.t[k] += ax.forward[k] * (want - depth);
-}
-
-/** Resize the model itself, about its own centre.
- *
- *  Size and depth are indistinguishable in a single photograph -- a body 1.25x
- *  larger and 1.25x further away projects to identical pixels -- so this looks
- *  the same on screen as pushing the body away, and the header above explains
- *  why depth is not offered as a size slider. What earns size its own handle is
- *  that it is a property of the MODEL where depth is a property of one
- *  placement: change it and every photo and every copy of that model changes
- *  with it. That is what is wanted when the CAD arrives in units nobody
- *  recorded, or when the part on the line is a longer-standoff variant of the
- *  one the CAD was drawn for.
- *
- *  The consequence of the degeneracy is worth stating plainly rather than
- *  designing around: a size set by eye in one photo is a guess until a second
- *  view contradicts it. Depth is deliberately held fixed here so the body grows
- *  where it stands instead of walking toward the camera, which is what keeps
- *  the two handles separable by eye at all. */
-function scaleModel(inst, factor) {
-  const template = templateOf(inst);
-  if (!template) return;
-  const s = template.unit_scale;
-  const want = clamp(s * factor, 1e-7, 1e3);
-  if (want === s) return;
-  // A mesh scales about its CAD origin, which is usually a mount face or a
-  // corner rather than the middle of the part, so without this correction the
-  // body slides across the frame every time it is resized.
-  const c = modelCentreLocal(template);
-  const shift = mat3.apply(inst.R, c.map((v) => v * (s - want)));
-  for (let k = 0; k < 3; k++) inst.t[k] += shift[k];
-  template.unit_scale = want;
-  template.units = 'custom';
 }
 
 /** Centre of the model in its own units, from the mesh if there is one and the
@@ -600,6 +581,20 @@ async function ensureMeshes() {
     render();
   }
 }
+
+/** Crease angles worth offering, coarsest first. Below about 5 degrees the
+ *  triangulation itself starts showing through, which is noise rather than
+ *  shape, so the range stops there. */
+const CREASE_ANGLES = [
+  [30, 'sharp only'],
+  [18, 'standard'],
+  [12, 'more'],
+  [8, 'fine'],
+  [5, 'everything'],
+];
+
+/** A template's crease angle, defaulting to the server's own. */
+const creaseOf = (t) => (t && typeof t.crease_angle === 'number' ? t.crease_angle : 18);
 
 const meshFor = (tid) => {
   const m = state.meshes.get(tid);
@@ -1339,8 +1334,8 @@ function drawFilmstripOverlays() {
       // a thumbnail cannot show more than an outline, so spend the edges on
       // being drawn at all rather than on being complete
       const budget = 240;
-      const stride = mesh.edges.length > budget
-        ? Math.ceil(mesh.edges.length / budget) : 1;
+      const order = edgesByLength(mesh);
+      const shown = Math.min(order.length, budget);
       // project only the vertices those edges actually use. This runs for
       // every photo on every frame of a drag, and a real machined part brings
       // tens of thousands of vertices -- projecting all of them seven times a
@@ -1356,8 +1351,9 @@ function drawFilmstripOverlays() {
         return p;
       };
       c.beginPath();
-      for (let e = 0; e < mesh.edges.length; e += stride) {
-        const a = at(mesh.edges[e][0]), b = at(mesh.edges[e][1]);
+      for (let k = 0; k < shown; k++) {
+        const e = mesh.edges[order[k]];
+        const a = at(e[0]), b = at(e[1]);
         if (!a || !b) continue;              // the edge passes behind the camera
         c.moveTo(a.x * s, a.y * s);
         c.lineTo(b.x * s, b.y * s);
@@ -1475,6 +1471,38 @@ function drawObservations(im, z) {
   }
 }
 
+/** Edge indices for one mesh, longest first.
+ *
+ *  There is never room to draw every edge of a real part, so the question is
+ *  which ones to drop. Taking every Nth -- what this used to do -- is the one
+ *  answer that is certainly wrong: it keeps edges by their position in an
+ *  array, which has nothing to do with the model, so a part arrives as a
+ *  scatter of disconnected segments with half of its outline missing. That is
+ *  unmatchable against a photograph, which is the entire job of this overlay.
+ *
+ *  Length is the proxy that works, and ``display_payload`` already thins the
+ *  same way on its way out of the server; this is that rule applied again at
+ *  the smaller budget a canvas has. Measured in model space, not on screen:
+ *  screen length would be marginally better per frame and would have to be
+ *  re-sorted on every one of them, and a drag cannot afford that on a part with
+ *  tens of thousands of edges. So it is computed once and kept on the mesh. */
+function edgesByLength(mesh) {
+  if (mesh._byLength) return mesh._byLength;
+  const v = mesh.vertices, e = mesh.edges;
+  const len2 = new Float64Array(e.length);
+  for (let i = 0; i < e.length; i++) {
+    const a = v[e[i][0]], b = v[e[i][1]];
+    if (!a || !b) continue;
+    const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    len2[i] = dx * dx + dy * dy + dz * dz;   // squared: same order, no sqrt
+  }
+  const order = new Array(e.length);
+  for (let i = 0; i < e.length; i++) order[i] = i;
+  order.sort((p, q) => len2[q] - len2[p]);
+  mesh._byLength = order;
+  return order;
+}
+
 /* Each placed object's model, projected through this camera.
  *
  * This is the check that makes a known-object solve trustworthy in a way no
@@ -1494,12 +1522,14 @@ function drawObjectModels(im, z) {
 
     const world = mesh.vertices.map((v) => objectToWorld(inst, template, v));
     const screen = world.map((X) => projectWorld(im, X));
-    const stride = mesh.edges.length > budget ? Math.ceil(mesh.edges.length / budget) : 1;
+    const order = edgesByLength(mesh);
+    const shown = Math.min(order.length, budget);
 
     ctx.beginPath();
-    for (let i = 0; i < mesh.edges.length; i += stride) {
-      const a = screen[mesh.edges[i][0]];
-      const b = screen[mesh.edges[i][1]];
+    for (let k = 0; k < shown; k++) {
+      const e = mesh.edges[order[k]];
+      const a = screen[e[0]];
+      const b = screen[e[1]];
       if (!a || !b) continue; // the edge crosses behind the camera
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
@@ -2061,8 +2091,7 @@ canvas.addEventListener('mousedown', (ev) => {
         kind: 'pose',
         inst: inst.id,
         last: p,
-        scale: ev.button === 0 && state.scaleDown,
-        depth: ev.button === 0 && ev.shiftKey && !state.scaleDown,
+        depth: ev.button === 0 && state.depthDown,
         rotate: ev.button === 2 || ev.ctrlKey || ev.metaKey,
         axisKey: state.axisKey,
       };
@@ -2172,21 +2201,21 @@ window.addEventListener('mousemove', (ev) => {
       // Moving the body in the image plane is the exception and stays in image
       // units, because there it has to stay under the pointer.
       const sdx = dx * state.view.zoom, sdy = dy * state.view.zoom;
-      if (d.scale) {
-        // one axis only: sizing a model against a photograph is a
+      if (d.depth) {
+        // one axis only: placing a body along the view ray is a
         // one-dimensional judgement, and a handle that also responded to
         // vertical movement would change the answer every time the hand
         // wandered off the line
-        scaleModel(inst, Math.exp(sdx * 0.004));   // doubles in ~170 px
-        // the size in metres, live, because that is the number being set --
-        // the silhouette on screen cannot distinguish it from depth, and the
-        // model card only catches up when the drag ends
-        const tpl = templateOf(inst);
-        const mesh = tpl && meshFor(tpl.id);
-        if (mesh && mesh.size) {
-          setStatus(`${tpl.name || tpl.id}: `
-            + mesh.size.map((v) => (v * tpl.unit_scale).toFixed(3)).join(' × ') + ' m', 'ok');
-        }
+        //
+        // right brings it closer, which grows its silhouette -- the same thing
+        // this gesture did to the screen when it resized the model, so the hand
+        // keeps the habit it already has while the number underneath it becomes
+        // the one that belongs to this placement
+        nudgeDepth(inst, im, Math.exp(-sdx * 0.004));   // halves in ~170 px
+        // the distance in metres, live, because that is the number being set --
+        // the silhouette on screen cannot distinguish it from size
+        setStatus(`${inst.label || inst.id} at `
+          + `${bodyDepth(inst, im).toFixed(2)} m`, 'ok');
       } else if (d.rotate && d.axisKey) {
         // One axis at a time, chosen by the key held down. Free rotation is
         // quick to get close with and hopeless to finish with: every drag
@@ -2204,10 +2233,6 @@ window.addEventListener('mousemove', (ev) => {
         // comfortable two drags rather than a flick
         if (Math.abs(sdx) > 0) rotateInPlace(inst, [0, 0, 1], sdx * 0.006);
         if (Math.abs(sdy) > 0) rotateInPlace(inst, ax.right, sdy * 0.006);
-      } else if (d.depth) {
-        // dragging down pushes the body away, matching the way its silhouette
-        // shrinks as it goes
-        nudgeDepth(inst, im, Math.exp(sdy * 0.004));
       } else {
         nudgeInPlane(inst, im, dx, dy);
       }
@@ -2304,10 +2329,10 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'l') { setMode('lines'); return; }
   if (k === 'p') { setMode('points'); return; }
   if (k === 'o') { setMode('objects'); return; }
-  // S is the size handle while posing, so it must not also leave pose mode.
+  // S is the depth handle while posing, so it must not also leave pose mode.
   // Held rather than tapped, to match the two drags it sits beside.
   if (k === 's' && state.mode === 'pose') {
-    if (!state.scaleDown) { state.scaleDown = true; updateHint(); }
+    if (!state.depthDown) { state.depthDown = true; updateHint(); }
     return;
   }
   // H recalls a body that has drifted out of this photo's frame.
@@ -2391,7 +2416,7 @@ window.addEventListener('keydown', (ev) => {
 window.addEventListener('keyup', (ev) => {
   if (ev.key === ' ') { state.spaceDown = false; canvas.style.cursor = 'crosshair'; }
   const ku = ev.key.toLowerCase();
-  if (ku === 's' && state.scaleDown) { state.scaleDown = false; updateHint(); }
+  if (ku === 's' && state.depthDown) { state.depthDown = false; updateHint(); }
   if (state.axisKey === ku) { state.axisKey = null; updateHint(); render(); }
 });
 
@@ -2413,7 +2438,7 @@ function setMode(mode) {
   if (mode === 'pose' && !state.showModels) $('showmodels').click();
   // S and the axis keys mean something only while posing; leaving must not
   // strand either of them held down
-  if (mode !== 'pose') { state.scaleDown = false; state.axisKey = null; }
+  if (mode !== 'pose') { state.depthDown = false; state.axisKey = null; }
   updateHint();
   render();
 }
@@ -2444,25 +2469,26 @@ function updateHint() {
         + `<b>${state.axisKey.toUpperCase()}</b> and nothing else. `
         + `<b>←</b>/<b>→</b> turn exactly 15°, with <b>Shift</b> exactly 90°. `
         + `Release ${state.axisKey.toUpperCase()} for free rotation.`
-      : state.scaleDown
-      ? `<b>Size:</b> drag right to grow, left to shrink. The model card shows the `
-        + `real size in metres as you go. This changes the <i>model</i>, so every photo `
-        + `and every copy of it changes too — and in this one photo it is `
-        + `indistinguishable from depth, so settle it against a photo 60–120° away.`
+      : state.depthDown
+      ? `<b>Distance:</b> drag right to bring it closer, left to push it away. The `
+        + `status line shows the distance in metres as you go. This moves <i>this body</i> `
+        + `and leaves the model's size alone — but in this one photo the two look the `
+        + `same, so settle it against a photo 60–120° away. The model's own size is `
+        + `the <b>units</b> dropdown in Known objects.`
       : isPlaced(inst) && currentImage() && bodyVisibility(inst, currentImage()) === 0
       ? `<b>${escapeHtml(inst.label || inst.id)} is outside this photo.</b> That is normal `
         + `on the second view — these were taken metres apart, so a body a little off in `
         + `one is off the edge in another. Press <b>H</b> to bring it onto this view at `
         + `the same distance; its turn and size are kept.`
       : !((templateOf(inst) || {}).anchors || []).length
-      ? `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> to resize, `
-        + `<b>hold X/Y/Z</b> to turn about one axis. But this model has no anchors yet, `
+      ? `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> for its `
+        + `distance, <b>hold X/Y/Z</b> to turn about one axis. But this model has no anchors yet, `
         + `so the fit stays an eye-fit and nothing can refine it — press `
         + `<b>use model features</b> in Known objects to take the ones the model already `
         + `offers.`
-      : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> to resize, `
-        + `<b>hold X/Y/Z</b> to turn about one world axis only. <b>Shift-drag</b> down `
-        + `pushes it away. Watch the filmstrip: the body has one pose, so every photo `
+      : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> for its `
+        + `distance, <b>hold X/Y/Z</b> to turn about one world axis only. `
+        + `Watch the filmstrip: the body has one pose, so every photo `
         + `updates as you drag. When it looks right here, <b>snap anchors</b>, then do `
         + `the next photo and snap again — <b>Enter</b> then reconciles all of them into `
         + `one measured pose, and moves the cameras to match.`;
@@ -2963,7 +2989,21 @@ function renderObjectsPanel() {
       html += `<div class="note bad">${escapeHtml(mesh.error)}</div>`;
     } else if (mesh) {
       const real = mesh.size.map((v) => (v * t.unit_scale).toFixed(3));
-      html += `<div class="msg">${mesh.n_faces} faces, ${mesh.n_feature_edges} edges</div>`
+      html += `<div class="msg">${mesh.n_faces} faces, ${mesh.n_feature_edges} of `
+            +   `${mesh.n_all_edges || mesh.n_feature_edges} edges drawn</div>`
+            // the angle that decides which edges those are. A filleted or finely
+            // tessellated part loses its curves at the default, and nothing on
+            // screen says so -- the count above is the only clue, and this is
+            // the control that acts on it.
+            + `<div class="unitrow">`
+            +   `<span class="k">detail</span>`
+            +   `<select class="tplcrease" data-tpl="${escapeHtml(tid)}">`
+            +     CREASE_ANGLES.map(([deg, label]) =>
+                    `<option value="${deg}"${Math.abs(deg - creaseOf(t)) < 0.01
+                      ? ' selected' : ''}>${label}</option>`).join('')
+            +   `</select>`
+            +   `<span class="est">edges sharper than ${creaseOf(t)}\u00b0</span>`
+            + `</div>`
             + `<div class="unitrow">`
             +   `<span class="k">units</span>`
             +   `<select class="tplunit" data-tpl="${escapeHtml(tid)}">`
@@ -3126,6 +3166,20 @@ function wireObjectsPanel(el) {
       state.activeTemplate = card.dataset.tpl;
       renderObjectsPanel();
       syncViewer();
+    };
+  }
+  for (const sel of el.querySelectorAll('select.tplcrease')) {
+    sel.onchange = (e) => {
+      const t = templates()[sel.dataset.tpl];
+      if (!t) return;
+      t.crease_angle = parseFloat(e.target.value);
+      markDirty();
+      // the wireframe is built server-side at a fixed angle, so the cached one
+      // is now the wrong picture; dropping it is what makes ensureMeshes refetch
+      state.meshes.delete(sel.dataset.tpl);
+      renderObjectsPanel();
+      render();
+      ensureMeshes();
     };
   }
   for (const sel of el.querySelectorAll('select.tplunit')) {
