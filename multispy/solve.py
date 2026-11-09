@@ -127,6 +127,12 @@ class InstanceReport:
     template: str = ""
     label: str = ""
     placed: bool = False
+    """A pose was measured from anchors. Deliberately false for a hand-placed
+    body: ``shape_rms`` defaults to 0 and ``implied_scale`` to 1, so claiming a
+    manual pose was "placed" would report a flawless fit for something nothing
+    ever checked."""
+    manual: bool = False
+    """This body carries a pose someone set by hand, with no anchors behind it."""
     n_anchors_marked: int = 0
     n_anchors_used: int = 0
     """Anchors seen in 2+ photos. Three is the floor for a determined pose: two
@@ -589,6 +595,19 @@ def _transform_scene(
     for key in positions:
         positions[key] = scale * (Rg @ positions[key]) + tg
 
+    # Hand-placed bodies are carried along too. Every other pose here is
+    # recomputed from `positions` after this runs, so it needs no help; a manual
+    # pose is the one thing in the scene that nothing downstream reconstructs,
+    # and leaving it behind would silently detach it from the photographs it was
+    # aligned against. The rotation takes no scale factor: the body's own size is
+    # CAD truth, and this call is re-expressing the scene *into* those units, not
+    # resizing the object.
+    for inst in project.instances:
+        if not inst.manual or inst.R is None or inst.t is None:
+            continue
+        inst.R = Rg @ inst.R
+        inst.t = scale * (Rg @ inst.t) + tg
+
 
 def fit_instances(
     project: Project,
@@ -637,6 +656,7 @@ def fit_instances(
             rep.notes.append(f"template {inst.template!r} is missing from this project")
             continue
         rep.n_anchors_marked = len(marked_count.get(inst.id, ()))
+        rep.manual = bool(inst.manual and inst.R is not None and inst.t is not None)
         entries = sorted(by_instance.get(inst.id, []))
         rep.n_anchors_used = len(entries)
         if len(entries) < 2:
@@ -645,6 +665,14 @@ def fit_instances(
                 "photos; a placement needs 3 (2 leaves the body free to spin about the line "
                 "joining them)"
             )
+            if rep.manual:
+                rep.notes.append(
+                    "this pose was set by hand and is kept as it is. Nothing has refined it and "
+                    "nothing has checked it: snap its anchors from the model, nudge them onto the "
+                    "real features, and it becomes a measurement with an error to read"
+                )
+                center = project.instance_center(inst)
+                rep.center = None if center is None else center.tolist()
             continue
         fit = similarity_fit(
             np.array([e[1] for e in entries]), np.array([e[2] for e in entries])
@@ -748,7 +776,10 @@ def fit_instances(
     for inst in project.instances:
         rep = report.instances.get(inst.id)
         if inst.id not in scaled:
-            if not inst.locked:
+            # Clearing the pose is right for a fit that no longer has the
+            # anchors behind it, and wrong for a placement someone made by eye:
+            # that pose IS the user's work, and no later stage recreates it.
+            if not inst.locked and not inst.manual:
                 inst.R, inst.t = None, None
             continue
         _old_fit, entries = scaled[inst.id]
@@ -757,8 +788,10 @@ def fit_instances(
         rigid = similarity_fit(source, target, allow_scale=False)
         check = similarity_fit(source, target, allow_scale=True)
         inst.R, inst.t = rigid.R, rigid.t
+        inst.manual = False
         if rep is not None:
             rep.placed = True
+            rep.manual = False
             rep.shape_rms = rigid.rms
             rep.implied_scale = check.scale
             center = project.instance_center(inst)
@@ -1682,6 +1715,15 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
                 f"stated distances and known object geometry agree on scale to "
                 f"{off * 100:.2f}% -- two independent measurements, so this is a real check."
             )
+
+    hand = [inst for inst in project.instances if inst.manual and inst.R is not None]
+    if hand and not report.scale_is_metric:
+        report.warnings.append(
+            f"{len(hand)} object(s) are placed by hand in a scene with no real units. A CAD model "
+            "is in millimetres and this scene is in nothing in particular, so the model cannot be "
+            "made to fit whatever its pose is. Set the scale first -- one distance between two tie "
+            "points is enough -- then place by eye."
+        )
 
     over = [c for c in report.constraints if c.applied and c.sigmas_off > 3.0]
     if over:

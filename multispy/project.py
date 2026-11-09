@@ -202,6 +202,17 @@ class ObjectInstance:
     locked: bool = False
     """Hold this placement fixed during the bundle adjustment. Useful once one
     body is trusted and you want it to define the frame for the rest."""
+    manual: bool = False
+    """This pose was set by hand, by dragging the model over a photograph, and
+    is not to be thrown away.
+
+    A solve normally clears the pose of any body it cannot place from anchors,
+    which is right for a stale fit but wrong for a placement someone has just
+    made by eye. ``locked`` would also preserve it, but ``locked`` means
+    something else -- that this body defines the world frame -- so a hand-placed
+    body needs a flag of its own. The pose still moves with the scene when the
+    coordinates are re-expressed, and anchors still override it: three anchors
+    in two photos measure the pose far better than an eye can judge it."""
 
 
 @dataclass
@@ -470,6 +481,7 @@ class Project:
                     "template": o.template,
                     "label": o.label,
                     "locked": o.locked,
+                    "manual": o.manual,
                     "R": o.R.tolist() if o.R is not None else None,
                     "t": o.t.tolist() if o.t is not None else None,
                 }
@@ -574,6 +586,7 @@ class Project:
                 template=raw["template"],
                 label=raw.get("label", ""),
                 locked=bool(raw.get("locked", False)),
+                manual=bool(raw.get("manual", False)),
             )
             if raw.get("R") is not None:
                 inst.R = np.array(raw["R"], dtype=float)

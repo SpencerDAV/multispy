@@ -34,6 +34,7 @@ const state = {
   hover: null,
   drag: null,
   spaceDown: false,
+  scaleDown: false,
   showVP: true,
   showResid: true,
   showGrid: false,
@@ -100,6 +101,20 @@ function anchorMarkCount(key) {
   return state.project.images.filter((im) => im.anchor_obs && key in im.anchor_obs).length;
 }
 
+/** Anchors of this object that reach two or more photos.
+ *
+ *  The number that decides whether a solve can do anything with the body, and
+ *  the one worth putting in front of someone who has just finished marking:
+ *  anchors marked in a single photo cannot be triangulated, so a body can look
+ *  thoroughly marked and still be unplaceable. Three is the floor -- two leave
+ *  it free to spin about the line joining them. */
+function placeableAnchors(inst) {
+  const template = templateOf(inst);
+  if (!template) return 0;
+  return (template.anchors || [])
+    .filter((a) => anchorMarkCount(anchorKey(inst.id, a.name)) >= 2).length;
+}
+
 function nextInstanceId() {
   const used = new Set(instanceList().map((o) => o.id));
   let i = 0;
@@ -121,6 +136,231 @@ function objectToWorld(inst, template, local) {
 }
 
 const isPlaced = (inst) => !!(inst && inst.R && inst.t);
+
+/* -------------------------------------------------------------- pose by hand
+
+ * Dragging a CAD model over a photograph until it fits. The cameras are already
+ * solved, so a body's 6-DoF pose in the world fixes its silhouette in every
+ * photo at once -- which is what makes this worth doing by eye: an alignment
+ * made in one photo is immediately checkable in all the others.
+ *
+ * Scale is deliberately NOT a handle. Scaling a body about the camera centre is
+ * an exact invariance of a single image -- a body 1.25x larger and 1.25x
+ * further away projects to identical pixels, to 0.00 px, measured on these very
+ * cameras -- so a scale slider would be the depth handle wearing a different
+ * label, and it would throw away the one thing a known object is for. The model
+ * keeps its CAD size; depth comes from the other photographs.
+ */
+
+const mat3 = {
+  I: () => [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+  mul: (A, B) => A.map((row) =>
+    [0, 1, 2].map((j) => row[0] * B[0][j] + row[1] * B[1][j] + row[2] * B[2][j])),
+  apply: (A, v) => [
+    A[0][0] * v[0] + A[0][1] * v[1] + A[0][2] * v[2],
+    A[1][0] * v[0] + A[1][1] * v[1] + A[1][2] * v[2],
+    A[2][0] * v[0] + A[2][1] * v[1] + A[2][2] * v[2],
+  ],
+  /** Rotation of `ang` radians about a unit axis (Rodrigues). */
+  axisAngle: (axis, ang) => {
+    const n = Math.hypot(axis[0], axis[1], axis[2]) || 1;
+    const x = axis[0] / n, y = axis[1] / n, z = axis[2] / n;
+    const c = Math.cos(ang), s = Math.sin(ang), k = 1 - c;
+    return [
+      [c + x * x * k, x * y * k - z * s, x * z * k + y * s],
+      [y * x * k + z * s, c + y * y * k, y * z * k - x * s],
+      [z * x * k - y * s, z * y * k + x * s, c + z * z * k],
+    ];
+  },
+  /** Re-orthonormalise, so a long run of incremental drags cannot drift into
+   *  something that is no longer a rotation. Gram-Schmidt is enough here. */
+  renorm: (A) => {
+    const col = (j) => [A[0][j], A[1][j], A[2][j]];
+    const unit = (v) => { const n = Math.hypot(v[0], v[1], v[2]) || 1; return v.map((c) => c / n); };
+    const dot = (v, w) => v[0] * w[0] + v[1] * w[1] + v[2] * w[2];
+    const x = unit(col(0));
+    const c1 = col(1);
+    const d = dot(c1, x);
+    const y = unit(c1.map((c, i) => c - d * x[i]));
+    const z = [x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]];
+    return [[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]];
+  },
+};
+
+/** Camera centre of a solved image, in world coordinates: C = -R^T t. */
+function cameraCentre(im) {
+  if (!im.R || !im.t) return null;
+  const R = im.R, t = im.t;
+  return [
+    -(R[0][0] * t[0] + R[1][0] * t[1] + R[2][0] * t[2]),
+    -(R[0][1] * t[0] + R[1][1] * t[1] + R[2][1] * t[2]),
+    -(R[0][2] * t[0] + R[1][2] * t[1] + R[2][2] * t[2]),
+  ];
+}
+
+/** The camera axes in world coordinates: right, down, forward. These are
+ *  exactly the rows of the world-to-camera R. */
+const cameraAxes = (im) => ({ right: im.R[0], down: im.R[1], forward: im.R[2] });
+
+/** Where the solved tie points sit, as a centre and a radius. The only thing
+ *  available to aim a first guess at: a body dropped at the world origin is
+ *  usually nowhere near the subject, and may be behind the camera. */
+function sceneExtent() {
+  const pts = (state.project.points || []).filter((p) => p.xyz);
+  if (!pts.length) return null;
+  const c = [0, 1, 2].map((k) => pts.reduce((s, p) => s + p.xyz[k], 0) / pts.length);
+  const r = Math.max(...pts.map(
+    (p) => Math.hypot(p.xyz[0] - c[0], p.xyz[1] - c[1], p.xyz[2] - c[2])));
+  return { centre: c, radius: r || 1 };
+}
+
+/** A first pose for a body that has none: world-axis aligned, on this camera's
+ *  view ray at the depth of the reconstruction, so it lands in frame at a
+ *  sensible size instead of somewhere off-camera. */
+function defaultPose(im) {
+  const C = cameraCentre(im);
+  if (!C) return null;
+  const fwd = cameraAxes(im).forward;
+  const ext = sceneExtent();
+  let depth;
+  if (ext) {
+    const toCentre = [0, 1, 2].map((k) => ext.centre[k] - C[k]);
+    depth = toCentre[0] * fwd[0] + toCentre[1] * fwd[1] + toCentre[2] * fwd[2];
+  } else {
+    // A project solved from control lines alone has no tie points to aim at,
+    // and fitting a CAD model by eye is a reason not to mark any -- so falling
+    // back is not a corner case, it is the common path for this mode. The
+    // other cameras are the only measurement of scene size left: whoever took
+    // the photographs stood about as far from the subject as from each other.
+    const others = state.project.images
+      .filter((o) => o !== im && o.R && o.t)
+      .map((o) => cameraCentre(o))
+      .map((c) => Math.hypot(c[0] - C[0], c[1] - C[1], c[2] - C[2]))
+      .filter((d) => d > 1e-6)
+      .sort((a, b) => a - b);
+    depth = others.length ? others[Math.floor(others.length / 2)] : 2.0;
+  }
+  depth = clamp(depth, 0.2, 50);
+  return { R: mat3.I(), t: [0, 1, 2].map((k) => C[k] + fwd[k] * depth) };
+}
+
+/** Give this body a pose if it has none, and flag it as hand-set so a solve
+ *  will not discard it. False when this camera is not solved yet. */
+function ensurePose(inst, im) {
+  if (isPlaced(inst)) return true;
+  const pose = defaultPose(im);
+  if (!pose) return false;
+  inst.R = pose.R;
+  inst.t = pose.t;
+  inst.manual = true;
+  return true;
+}
+
+/** Depth of a body along this camera's view ray. */
+function bodyDepth(inst, im) {
+  const C = cameraCentre(im);
+  const fwd = cameraAxes(im).forward;
+  if (!C) return null;
+  const d = [0, 1, 2].map((k) => inst.t[k] - C[k]);
+  return d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+}
+
+/** Translate parallel to the image plane by a pixel delta.
+ *
+ *  Scaled through the body's own depth so the drag tracks the pointer at any
+ *  distance: a pixel at 6 m is four times the world distance it is at 1.5 m. */
+function nudgeInPlane(inst, im, dxPx, dyPx) {
+  const g = groupOf(im);
+  const depth = bodyDepth(inst, im);
+  if (!g.f || depth === null) return;
+  const ax = cameraAxes(im);
+  const sx = (dxPx * depth) / g.f, sy = (dyPx * depth) / g.f;
+  for (let k = 0; k < 3; k++) inst.t[k] += ax.right[k] * sx + ax.down[k] * sy;
+}
+
+/** Move the body along the view ray. Multiplicative, because "a bit closer" is
+ *  a fraction of the current distance rather than a fixed number of metres. */
+function nudgeDepth(inst, im, factor) {
+  const depth = bodyDepth(inst, im);
+  if (depth === null) return;
+  const ax = cameraAxes(im);
+  const want = clamp(depth * factor, 0.05, 1e4);
+  for (let k = 0; k < 3; k++) inst.t[k] += ax.forward[k] * (want - depth);
+}
+
+/** Resize the model itself, about its own centre.
+ *
+ *  Size and depth are indistinguishable in a single photograph -- a body 1.25x
+ *  larger and 1.25x further away projects to identical pixels -- so this looks
+ *  the same on screen as pushing the body away, and the header above explains
+ *  why depth is not offered as a size slider. What earns size its own handle is
+ *  that it is a property of the MODEL where depth is a property of one
+ *  placement: change it and every photo and every copy of that model changes
+ *  with it. That is what is wanted when the CAD arrives in units nobody
+ *  recorded, or when the part on the line is a longer-standoff variant of the
+ *  one the CAD was drawn for.
+ *
+ *  The consequence of the degeneracy is worth stating plainly rather than
+ *  designing around: a size set by eye in one photo is a guess until a second
+ *  view contradicts it. Depth is deliberately held fixed here so the body grows
+ *  where it stands instead of walking toward the camera, which is what keeps
+ *  the two handles separable by eye at all. */
+function scaleModel(inst, factor) {
+  const template = templateOf(inst);
+  if (!template) return;
+  const s = template.unit_scale;
+  const want = clamp(s * factor, 1e-7, 1e3);
+  if (want === s) return;
+  // A mesh scales about its CAD origin, which is usually a mount face or a
+  // corner rather than the middle of the part, so without this correction the
+  // body slides across the frame every time it is resized.
+  const c = modelCentreLocal(template);
+  const shift = mat3.apply(inst.R, c.map((v) => v * (s - want)));
+  for (let k = 0; k < 3; k++) inst.t[k] += shift[k];
+  template.unit_scale = want;
+  template.units = 'custom';
+}
+
+/** Centre of the model in its own units, from the mesh if there is one and the
+ *  anchors otherwise. Only ever a pivot, so the bounding-box centre is the
+ *  right answer rather than a centroid weighted by vertex density. */
+function modelCentreLocal(template) {
+  const mesh = meshFor(template.id);
+  if (mesh && mesh.vertices && mesh.vertices.length) {
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (const v of mesh.vertices) {
+      for (let k = 0; k < 3; k++) {
+        lo[k] = Math.min(lo[k], v[k]);
+        hi[k] = Math.max(hi[k], v[k]);
+      }
+    }
+    return [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2);
+  }
+  const anchors = template.anchors || [];
+  if (!anchors.length) return [0, 0, 0];
+  return [0, 1, 2].map(
+    (k) => anchors.reduce((s, a) => s + a.xyz[k], 0) / anchors.length);
+}
+
+/** World position the body spins about: the centre of its own model, not its
+ *  origin. A CAD origin is often a corner or a mount face, and rotating about
+ *  that throws the body across the frame on every turn. */
+function pivotWorld(inst) {
+  const template = templateOf(inst);
+  return template
+    ? objectToWorld(inst, template, modelCentreLocal(template))
+    : inst.t.slice();
+}
+
+/** Rotate about a world-space axis through the body's own centre. */
+function rotateInPlace(inst, axis, ang) {
+  const pivot = pivotWorld(inst);
+  const Rg = mat3.axisAngle(axis, ang);
+  inst.R = mat3.renorm(mat3.mul(Rg, inst.R));
+  const d = [0, 1, 2].map((k) => inst.t[k] - pivot[k]);
+  const moved = mat3.apply(Rg, d);
+  for (let k = 0; k < 3; k++) inst.t[k] = pivot[k] + moved[k];
+}
 
 /** Anchors of the active instance that this photo does not have yet, in order,
  *  so marking can walk through them without the user choosing each time. */
@@ -1143,6 +1383,64 @@ function drawObjectModels(im, z) {
       ctx.font = `${12 / z}px sans-serif`;
       ctx.fillText(inst.label || inst.id, center.x + 6 / z, center.y - 6 / z);
     }
+    if (selected && state.mode === 'pose') drawPoseGizmo(inst, im, z);
+  }
+}
+
+/** The handles on the body being posed: its pivot, and its three model axes.
+ *
+ *  The axes are not decoration. The one thing an eye cannot judge from a
+ *  wireframe is which way round a symmetric body is, and a model 180 degrees
+ *  out fits its own silhouette perfectly -- the same failure that put photo 3's
+ *  rotation half a turn from the truth behind a respectable residual. Drawn
+ *  axes make the orientation something you can read rather than infer. */
+function drawPoseGizmo(inst, im, z) {
+  const template = templateOf(inst);
+  if (!template) return;
+  const pivot = pivotWorld(inst);
+  const o = projectWorld(im, pivot);
+  if (!o) return;
+
+  // an arm a quarter of the body across, so the gizmo scales with the object
+  // rather than swamping a small one or vanishing on a large one
+  const mesh = meshFor(template.id);
+  let span = 0;
+  if (mesh && mesh.size) span = Math.max(...mesh.size) * template.unit_scale;
+  if (!span) {
+    const pts = Object.values(anchorPoints(template));
+    for (const a of pts) {
+      for (const b of pts) span = Math.max(span, Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]));
+    }
+  }
+  const arm = (span || 0.2) * 0.35;
+
+  for (let k = 0; k < 3; k++) {
+    const tip = [0, 1, 2].map((j) => pivot[j] + inst.R[j][k] * arm);
+    const q = projectWorld(im, tip);
+    if (!q) continue;
+    ctx.strokeStyle = AXIS_COLOR[k];
+    ctx.lineWidth = 2.2 / z;
+    ctx.beginPath();
+    ctx.moveTo(o.x, o.y);
+    ctx.lineTo(q.x, q.y);
+    ctx.stroke();
+    ctx.fillStyle = AXIS_COLOR[k];
+    ctx.beginPath();
+    ctx.arc(q.x, q.y, 3.5 / z, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.strokeStyle = '#ffd24a';
+  ctx.lineWidth = 1.6 / z;
+  ctx.beginPath();
+  ctx.arc(o.x, o.y, 7 / z, 0, Math.PI * 2);
+  ctx.stroke();
+
+  const depth = bodyDepth(inst, im);
+  if (depth !== null && z > 0.1) {
+    ctx.fillStyle = '#ffd24a';
+    ctx.font = `${11 / z}px sans-serif`;
+    ctx.fillText(`${depth.toFixed(2)} m`, o.x + 10 / z, o.y + 14 / z);
   }
 }
 
@@ -1361,7 +1659,102 @@ function advanceToMissing(pointId) {
   return false;
 }
 
+/* -------------------------------------------------------- posing by hand */
+
+/** Hand this body the pose the current drag is building, creating one if the
+ *  body has none yet. Returns the instance, or null with a reason on screen. */
+function poseTarget(im) {
+  const inst = activeInstance();
+  if (!inst) {
+    setStatus('no object selected - add one in the Known objects panel', 'warn');
+    return null;
+  }
+  if (!im.R || !im.t) {
+    setStatus('this photo is not solved yet - draw control lines and press Enter first', 'warn');
+    return null;
+  }
+  if (!ensurePose(inst, im)) {
+    setStatus('nothing solved to aim at yet - press Enter to solve the cameras first', 'warn');
+    return null;
+  }
+  return inst;
+}
+
+/** Write every anchor of this body into this photo at the position the posed
+ *  model predicts.
+ *
+ *  This is the point of posing by hand. Finding a given corner of a given body
+ *  in the seventh photograph is the slow, error-prone part of marking anchors,
+ *  and it is exactly what the alignment has already answered: once the model
+ *  sits over the object, each anchor has a predicted pixel. Dragging a marker
+ *  five pixels onto the true feature is quick and, unlike the eye-fit itself,
+ *  what comes out is a measurement the solver can weigh and report on. */
+function snapAnchorsHere(im) {
+  const inst = activeInstance();
+  const template = inst && templateOf(inst);
+  if (!inst || !isPlaced(inst) || !template) {
+    setStatus('pose the object over this photo first', 'warn');
+    return 0;
+  }
+  const anchors = template.anchors || [];
+  if (!anchors.length) {
+    setStatus('this model has no anchors yet - pick them in the 3D view (D)', 'warn');
+    return 0;
+  }
+  let written = 0, offscreen = 0;
+  for (const a of anchors) {
+    const q = projectWorld(im, objectToWorld(inst, template, a.xyz));
+    // an anchor behind the camera or outside the frame is not a prediction
+    // anybody can nudge, and a marker parked off-canvas is worse than none
+    if (!q || q.x < 0 || q.y < 0 || q.x >= im.width || q.y >= im.height) {
+      offscreen++;
+      continue;
+    }
+    im.anchor_obs[anchorKey(inst.id, a.name)] = [q.x, q.y];
+    written++;
+  }
+  if (written) markDirty();
+  setStatus(
+    written
+      ? `${written} predicted anchor(s) placed in this photo${offscreen ? `, ${offscreen} off-frame` : ''}`
+        + ' - drag each onto the real feature, then press Enter'
+      : 'none of this model\u2019s anchors land inside this photo at that pose',
+    written ? 'ok' : 'warn'
+  );
+  renderPanels();
+  render();
+  return written;
+}
+
+/** Drop a hand-set pose. Anchors are left alone: they are measurements, and a
+ *  bad eye-fit is no reason to throw them away. */
+function clearPose(inst) {
+  inst.R = null;
+  inst.t = null;
+  inst.manual = false;
+  markDirty();
+  renderPanels();
+  render();
+  setStatus(`${inst.label || inst.id}: pose cleared`, 'ok');
+}
+
 /* ------------------------------------------------------- anchor marking */
+
+/** What this object still needs before a solve can place it.
+ *
+ *  Marking anchors writes observations and nothing else: no pose exists until
+ *  a solve triangulates them and fits the model. Saying so at the moment the
+ *  marks go in is the difference between "nothing happened" and "now solve". */
+function placementAdvice(inst) {
+  const n = placeableAnchors(inst);
+  if (n < 3) {
+    return `${n} anchor(s) reach 2+ photos — three in two photos each is the floor `
+         + `for a placement, so mark more`;
+  }
+  return isPlaced(inst)
+    ? `${n} anchors reach 2+ photos`
+    : `${n} anchors reach 2+ photos — press Enter to solve and place it`;
+}
 
 /** Place the active anchor of the active object at ``p``.
  *
@@ -1396,7 +1789,13 @@ function placeAnchor(im, p) {
   } else {
     state.activeAnchor = name;
     if (state.autoAdvance && !advanceToMissingAnchor(inst)) {
-      setStatus(`${inst.label || inst.id}: every anchor marked in every photo`, 'ok');
+      // marking changes nothing on its own -- the pose comes out of a solve,
+      // and without this the last click of a finished body looked like the end
+      // of the job rather than the point at which to run one
+      setStatus(
+        `${inst.label || inst.id}: every anchor marked in every photo — ${placementAdvice(inst)}`,
+        'ok'
+      );
     }
   }
   renderPanels();
@@ -1466,6 +1865,9 @@ canvas.addEventListener('contextmenu', (ev) => {
   ev.preventDefault();
   const im = currentImage();
   if (!im) return;
+  // in pose mode the right button turns the body, so it must not also delete
+  // whatever mark happens to lie under the pointer
+  if (state.mode === 'pose') return;
   const hit = hitTest(toImage(ev));
   if (!hit) return;
   if (hit.kind === 'obs') delete im.observations[hit.point];
@@ -1486,6 +1888,31 @@ canvas.addEventListener('mousedown', (ev) => {
                    px: state.view.panX, py: state.view.panY };
     return;
   }
+  // Pose mode claims the press before hit testing: while posing, the only
+  // thing on the canvas meant to be grabbable is the body, and a press that
+  // happened to land on a control-line handle would otherwise drag the line.
+  // It also claims the right button, which everywhere else deletes a mark --
+  // there is nothing here to delete, and turning a body is wanted often
+  // enough to deserve a button of its own rather than a modifier.
+  if (state.mode === 'pose' && (ev.button === 0 || ev.button === 2)) {
+    const inst = poseTarget(im);
+    if (inst) {
+      // the handle is decided by the button and the keys held at press time,
+      // so a drag cannot change meaning half way through
+      state.drag = {
+        kind: 'pose',
+        inst: inst.id,
+        last: p,
+        scale: ev.button === 0 && state.scaleDown,
+        depth: ev.button === 0 && ev.shiftKey && !state.scaleDown,
+        rotate: ev.button === 2 || ev.ctrlKey || ev.metaKey,
+      };
+      renderPanels();
+      render();
+    }
+    return;
+  }
+
   if (ev.button !== 0) return;
 
   const hit = hitTest(p);
@@ -1575,6 +2002,51 @@ window.addEventListener('mousemove', (ev) => {
     if (ln && (d.flip === undefined || d.moved)) {
       (d.which === 0 ? ln.p0 : ln.p1).splice(0, 2, p.x, p.y);
     }
+  } else if (d.kind === 'pose') {
+    const inst = instanceList().find((o) => o.id === d.inst);
+    if (inst && isPlaced(inst)) {
+      const dx = p.x - d.last.x, dy = p.y - d.last.y;
+      // Turning, sizing and depth are judged by how far the hand moved on the
+      // screen, not by how many photo pixels that crossed: in image units the
+      // same gesture means something wildly different zoomed in than zoomed
+      // out -- an 80 px drag multiplied a model's size by 103 at one zoom.
+      // Moving the body in the image plane is the exception and stays in image
+      // units, because there it has to stay under the pointer.
+      const sdx = dx * state.view.zoom, sdy = dy * state.view.zoom;
+      if (d.scale) {
+        // one axis only: sizing a model against a photograph is a
+        // one-dimensional judgement, and a handle that also responded to
+        // vertical movement would change the answer every time the hand
+        // wandered off the line
+        scaleModel(inst, Math.exp(sdx * 0.004));   // doubles in ~170 px
+        // the size in metres, live, because that is the number being set --
+        // the silhouette on screen cannot distinguish it from depth, and the
+        // model card only catches up when the drag ends
+        const tpl = templateOf(inst);
+        const mesh = tpl && meshFor(tpl.id);
+        if (mesh && mesh.size) {
+          setStatus(`${tpl.name || tpl.id}: `
+            + mesh.size.map((v) => (v * tpl.unit_scale).toFixed(3)).join(' × ') + ' m', 'ok');
+        }
+      } else if (d.rotate) {
+        const ax = cameraAxes(im);
+        // horizontal drag yaws about world up, which is what a body standing on
+        // a floor actually does; vertical drag tips it about the screen
+        // horizontal, which is the only other turn an eye can judge
+        // half a turn per ~500 px of screen, so a whole revolution is a
+        // comfortable two drags rather than a flick
+        if (Math.abs(sdx) > 0) rotateInPlace(inst, [0, 0, 1], sdx * 0.006);
+        if (Math.abs(sdy) > 0) rotateInPlace(inst, ax.right, sdy * 0.006);
+      } else if (d.depth) {
+        // dragging down pushes the body away, matching the way its silhouette
+        // shrinks as it goes
+        nudgeDepth(inst, im, Math.exp(sdy * 0.004));
+      } else {
+        nudgeInPlane(inst, im, dx, dy);
+      }
+      inst.manual = true;
+      d.last = p;
+    }
   } else if (d.kind === 'moveline') {
     const ln = im.axis_lines[d.index];
     if (ln && d.moved) {
@@ -1645,7 +2117,14 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'l') { setMode('lines'); return; }
   if (k === 'p') { setMode('points'); return; }
   if (k === 'o') { setMode('objects'); return; }
+  // S is the size handle while posing, so it must not also leave pose mode.
+  // Held rather than tapped, to match the two drags it sits beside.
+  if (k === 's' && state.mode === 'pose') {
+    if (!state.scaleDown) { state.scaleDown = true; updateHint(); }
+    return;
+  }
   if (k === 's') { setMode('select'); return; }
+  if (k === 'g') { setMode('pose'); return; }
   if (k === 'n') { newPoint(); renderPanels(); render(); return; }
   if (k === 'v') { $('showvp').click(); return; }
   if (k === 'r') { $('showresid').click(); return; }
@@ -1684,6 +2163,7 @@ window.addEventListener('keydown', (ev) => {
 
 window.addEventListener('keyup', (ev) => {
   if (ev.key === ' ') { state.spaceDown = false; canvas.style.cursor = 'crosshair'; }
+  if (ev.key.toLowerCase() === 's' && state.scaleDown) { state.scaleDown = false; updateHint(); }
 });
 
 function step(delta) {
@@ -1698,7 +2178,12 @@ function setMode(mode) {
   for (const b of $('modes').children) b.classList.toggle('on', b.dataset.mode === mode);
   $('axes').style.opacity = mode === 'lines' ? '1' : '.4';
   // marking anchors means looking at the photo, so step out of the 3D view
-  if (mode === 'objects' && Viewer3D.isOn() && Viewer3D.mode() === 'template') toggleViewer(false);
+  if ((mode === 'objects' || mode === 'pose')
+      && Viewer3D.isOn() && Viewer3D.mode() === 'template') toggleViewer(false);
+  // dragging a body you cannot see is not dragging
+  if (mode === 'pose' && !state.showModels) $('showmodels').click();
+  // S means size only while posing; leaving must not strand it held down
+  if (mode !== 'pose') state.scaleDown = false;
   updateHint();
   render();
 }
@@ -1720,7 +2205,20 @@ function updateHint() {
         + `pick its corners on the model in the 3D view (<b>D</b>).`
       : `Click <b>${escapeHtml(anchor)}</b> on <b>${escapeHtml(inst.label || inst.id)}</b>. `
         + `The next unmarked anchor follows automatically; <b>Tab</b> jumps to the next photo. `
-        + `Three anchors in two photos each is the floor for a placement.`;
+        + `${escapeHtml(placementAdvice(inst))}.`;
+
+  const poseHint = !inst
+    ? `No object selected. Add a model and an object in the <b>Known objects</b> panel.`
+    : state.scaleDown
+      ? `<b>Size:</b> drag right to grow, left to shrink. The model card shows the `
+        + `real size in metres as you go. This changes the <i>model</i>, so every photo `
+        + `and every copy of it changes too — and in this one photo it is `
+        + `indistinguishable from depth, so settle it against a photo 60–120° away.`
+      : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S and drag</b> `
+        + `resizes it. <b>Shift-drag</b> down pushes it away. Depth and size look `
+        + `identical in this photo — check both in a photo 60–120° away, where the same `
+        + `error is up to 100x more obvious. Then <b>snap its anchors</b> and nudge them, `
+        + `to turn the eye-fit into a measurement.`;
 
   const hints = {
     lines: `Drag along an edge parallel to the <b>${AXIS_NAME[state.axis]}</b> axis. `
@@ -1731,6 +2229,7 @@ function updateHint() {
           + `<b>N</b> starts a new point, <b>Tab</b> jumps to the next photo missing it. `
           + `Two shared points per image pair is the minimum.`,
     objects: objectHint,
+    pose: poseHint,
     select: `Drag markers or whole control lines; click a line to reverse it. `
           + `Right-click or Delete removes one.`,
   };
@@ -2213,6 +2712,11 @@ function renderObjectsPanel() {
             + `<div class="unitrow">`
             +   `<span class="k">units</span>`
             +   `<select class="tplunit" data-tpl="${escapeHtml(tid)}">`
+            // a model resized by hand no longer sits on any named unit, and
+            // showing it as "mm" when it is not would be a lie the real-size
+            // readout beside it immediately contradicts
+            +     (t.units in UNIT_SCALES ? ''
+                    : `<option value="custom" selected>custom</option>`)
             +     Object.keys(UNIT_SCALES).map((u) =>
                     `<option value="${u}"${u === t.units ? ' selected' : ''}>${u}</option>`).join('')
             +   `</select>`
@@ -2300,6 +2804,24 @@ function renderObjectsPanel() {
             + `<input type="text" id="objlabel" value="${escapeHtml(inst.label)}" style="width:140px"></div>`;
       html += `<label class="toggle"><input type="checkbox" id="objlocked"${inst.locked ? ' checked' : ''}>`
             + ` lock — this object is the world frame</label>`;
+      if (!(rep && rep.placed)) {
+        // a bare "not placed" reads as a failure when it usually means the
+        // solve has not been run since the marks went in
+        html += `<div class="note">${escapeHtml(placementAdvice(inst))}</div>`;
+      }
+      if (inst.manual) {
+        html += `<div class="note">posed by hand${isPlaced(inst) ? '' : ' (no pose yet)'} — `
+              + `an eye-fit, not a measurement. Snap its anchors and press Enter to `
+              + `measure it.</div>`;
+      }
+      if (isPlaced(inst)) {
+        html += `<div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap">`
+              + `<button class="smallbtn" id="posesnap">snap anchors here</button>`
+              + `<button class="smallbtn" id="poseturn" data-ax="0">90° X</button>`
+              + `<button class="smallbtn" id="poseturny" data-ax="1">90° Y</button>`
+              + `<button class="smallbtn" id="poseturnz" data-ax="2">90° Z</button>`
+              + `<button class="smallbtn" id="poseclear">clear pose</button></div>`;
+      }
       if (rep && rep.placed) {
         html += `<div class="row"><span class="k">anchor RMS</span><span class="v">${rep.rms_px.toFixed(2)} px</span></div>`;
         html += `<div class="row"><span class="k">shape error</span>`
@@ -2351,6 +2873,7 @@ function wireObjectsPanel(el) {
   for (const sel of el.querySelectorAll('select.tplunit')) {
     sel.onchange = (e) => {
       const t = templates()[sel.dataset.tpl];
+      if (!(e.target.value in UNIT_SCALES)) return;   // "custom" is a readout
       t.units = e.target.value;
       t.unit_scale = UNIT_SCALES[e.target.value];
       markDirty();
@@ -2458,6 +2981,36 @@ function wireObjectsPanel(el) {
     inst.locked = e.target.checked;
     markDirty();
     renderObjectsPanel();
+  };
+  const snap = $('posesnap');
+  if (snap) snap.onclick = () => {
+    const im = currentImage();
+    if (im) snapAnchorsHere(im);
+  };
+  // quarter turns about the world axes, because a CAD model almost never comes
+  // in facing the way the real object does and nudging 90 degrees by hand is
+  // both slow and never exactly 90
+  for (const [id, axis] of [['poseturn', 0], ['poseturny', 1], ['poseturnz', 2]]) {
+    const btn = $(id);
+    if (!btn) continue;
+    btn.onclick = (e) => {
+      const inst = activeInstance();
+      if (!inst || !isPlaced(inst)) return;
+      const dir = [0, 0, 0];
+      dir[axis] = 1;
+      rotateInPlace(inst, dir, (e.shiftKey ? -1 : 1) * Math.PI / 2);
+      inst.manual = true;
+      markDirty();
+      renderPanels();
+      render();
+      setStatus(`turned ${e.shiftKey ? '-' : '+'}90\u00b0 about world ${AXIS_NAME[axis]}`, 'ok');
+    };
+    btn.title = 'Quarter turn about world ' + AXIS_NAME[axis] + ' (shift for the other way)';
+  }
+  const posedrop = $('poseclear');
+  if (posedrop) posedrop.onclick = () => {
+    const inst = activeInstance();
+    if (inst) clearPose(inst);
   };
   const clear = $('objclear');
   if (clear) clear.onclick = () => {
