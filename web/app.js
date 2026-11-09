@@ -1879,6 +1879,12 @@ canvas.addEventListener('contextmenu', (ev) => {
 });
 
 canvas.addEventListener('mousedown', (ev) => {
+  // Going back to the photo means the panels are finished with. The canvas
+  // cannot take focus itself, so without this a control clicked earlier keeps
+  // it indefinitely -- and a focused text field goes on eating shortcuts.
+  if (document.activeElement && document.activeElement !== document.body) {
+    document.activeElement.blur();
+  }
   const im = currentImage();
   if (!im) return;
   const p = toImage(ev);
@@ -2098,8 +2104,28 @@ canvas.addEventListener('wheel', (ev) => {
 
 /* --------------------------------------------------------------- keyboard */
 
+/** Is the user typing into something, rather than merely having left focus on
+ *  a control they clicked?
+ *
+ *  Worth separating, because the two were treated alike and it cost the whole
+ *  keyboard. The test used to be "an input, a select or a textarea", which is
+ *  also every checkbox in the toolbar and every dropdown in the panels -- so
+ *  choosing units after loading a model left focus on that select and silently
+ *  killed every shortcut in the app. There was no way back, either: a canvas
+ *  takes no focus, so clicking the photo did not clear it. Only a field that
+ *  swallows letters has any business swallowing shortcuts. */
+function typingInto(el) {
+  if (!el) return false;
+  if (el.isContentEditable) return true;
+  if (el.tagName === 'TEXTAREA') return true;
+  if (el.tagName !== 'INPUT') return false;
+  const t = (el.type || 'text').toLowerCase();
+  return !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'range',
+           'color'].includes(t);
+}
+
 window.addEventListener('keydown', (ev) => {
-  if (ev.target.matches('input, select, textarea')) return;
+  if (typingInto(ev.target)) return;
   if (dialogOpen()) return;
   const k = ev.key.toLowerCase();
 
@@ -2128,7 +2154,9 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'n') { newPoint(); renderPanels(); render(); return; }
   if (k === 'v') { $('showvp').click(); return; }
   if (k === 'r') { $('showresid').click(); return; }
-  if (k === 'g') { $('showgrid').click(); return; }
+  // G used to toggle the grid and now opens pose mode, so this was dead and
+  // misleading. The grid keeps its checkbox; a second binding for it would
+  // only be another key to collide with.
   if (k === 'm') { $('showmodels').click(); return; }
   if (k === 'f') { fitView(); render(); return; }
   if (k === 'tab') {
