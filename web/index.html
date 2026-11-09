@@ -82,6 +82,11 @@
     padding: 2px 5px; font-size: 10px; background: linear-gradient(transparent, #000c);
   }
   .film .dot { width: 7px; height: 7px; border-radius: 50%; align-self: center; }
+  /* the posed model, drawn into every photo at once so a fit cannot be judged
+     from one of them alone */
+  .film canvas.filmov {
+    position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none;
+  }
   .film.off img { opacity: .3; filter: grayscale(1); }
 
   /* ------------------------------------------------------------- canvas */

@@ -35,6 +35,7 @@ const state = {
   drag: null,
   spaceDown: false,
   scaleDown: false,
+  axisKey: null,   // 'x' | 'y' | 'z' while held, to turn about that world axis
   showVP: true,
   showResid: true,
   showGrid: false,
@@ -350,6 +351,22 @@ function pivotWorld(inst) {
   return template
     ? objectToWorld(inst, template, modelCentreLocal(template))
     : inst.t.slice();
+}
+
+const WORLD_AXIS = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
+
+/** Turn by an exact angle about one world axis.
+ *
+ *  Dragging is for finding an angle; this is for the angles already known.
+ *  Fixtures are built square, so a part is very often at some multiple of a
+ *  right angle to the scene's own axes, and nudging up to it by hand leaves a
+ *  degree or two that no photograph will later remove. */
+function rotateSteps(inst, axisKey, deg) {
+  const axis = WORLD_AXIS[axisKey];
+  if (!axis) return;
+  rotateInPlace(inst, axis, (deg * Math.PI) / 180);
+  inst.manual = true;
+  markDirty();
 }
 
 /** Rotate about a world-space axis through the body's own centre. */
@@ -1235,6 +1252,79 @@ function render() {
   if (state.drag && state.drag.kind === 'newline') drawPendingLine(z);
 
   $('zoombadge').textContent = `${im.width}x${im.height}  ${(z * 100).toFixed(0)}%`;
+  drawFilmstripOverlays();
+}
+
+/* ------------------------------------------ the same body, in every photo */
+
+/** Draw each placed body into every thumbnail, live.
+ *
+ *  This is the answer to a fit that comes right in one photograph and wrong in
+ *  the next. A body has ONE pose in the world, so there is nothing to fix
+ *  per photo -- and the reason it feels as though there is, is that a single
+ *  photograph is very nearly blind to the one thing that matters most here.
+ *  Sliding a body along the view ray barely changes what this camera sees; its
+ *  apparent size is the only clue, and judging that by eye to better than a few
+ *  per cent is not possible. At 2 m a 5% error is 10 cm, and in a photograph
+ *  taken 90 degrees away 10 cm is not subtle.
+ *
+ *  So the fit has to be judged in two photographs at once, and the cheapest way
+ *  to do that is to show it in all of them while the hand is still on the
+ *  mouse. The thumbnails are small, but the error being hunted is not: a body
+ *  at the wrong depth lands somewhere else entirely over there, which reads
+ *  perfectly well at 70 px wide. */
+function drawFilmstripOverlays() {
+  if (!state.project) return;
+  const strip = $('filmstrip');
+  if (!strip) return;
+  const tiles = strip.querySelectorAll('.film');
+  const placed = instanceList().filter(isPlaced);
+  state.project.images.forEach((im, i) => {
+    const tile = tiles[i];
+    const cv = tile && tile.querySelector('canvas.filmov');
+    if (!cv) return;
+    const w = Math.round(tile.clientWidth), h = Math.round(tile.clientHeight);
+    if (w < 4 || h < 4) return;
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    const c = cv.getContext('2d');
+    c.clearRect(0, 0, w, h);
+    if (!state.showModels || !placed.length || !im.R || !im.t || !im.width) return;
+    const s = w / im.width;
+    for (const inst of placed) {
+      const template = templateOf(inst);
+      const mesh = template && meshFor(inst.template);
+      if (!mesh || !mesh.edges || !mesh.edges.length) continue;
+      // a thumbnail cannot show more than an outline, so spend the edges on
+      // being drawn at all rather than on being complete
+      const budget = 240;
+      const stride = mesh.edges.length > budget
+        ? Math.ceil(mesh.edges.length / budget) : 1;
+      // project only the vertices those edges actually use. This runs for
+      // every photo on every frame of a drag, and a real machined part brings
+      // tens of thousands of vertices -- projecting all of them seven times a
+      // frame to draw 240 lines would make the drag that this view exists to
+      // support the one thing it ruins.
+      const screen = new Map();
+      const at = (idx) => {
+        let p = screen.get(idx);
+        if (p === undefined) {
+          p = projectWorld(im, objectToWorld(inst, template, mesh.vertices[idx]));
+          screen.set(idx, p);
+        }
+        return p;
+      };
+      c.beginPath();
+      for (let e = 0; e < mesh.edges.length; e += stride) {
+        const a = at(mesh.edges[e][0]), b = at(mesh.edges[e][1]);
+        if (!a || !b) continue;              // the edge passes behind the camera
+        c.moveTo(a.x * s, a.y * s);
+        c.lineTo(b.x * s, b.y * s);
+      }
+      c.strokeStyle = inst.id === state.activeInstance ? '#ffd24ad0' : '#7fd4ff80';
+      c.lineWidth = 1;
+      c.stroke();
+    }
+  });
 }
 
 function drawControlLines(im, z) {
@@ -1435,6 +1525,26 @@ function drawPoseGizmo(inst, im, z) {
   ctx.beginPath();
   ctx.arc(o.x, o.y, 7 / z, 0, Math.PI * 2);
   ctx.stroke();
+
+  // the axis a turn is locked to, drawn through the body and well past it, so
+  // the constraint is something seen rather than remembered
+  if (state.axisKey) {
+    const k = { x: 0, y: 1, z: 2 }[state.axisKey];
+    const reach = Math.max(arm * 4, 0.3);
+    const ends = [-1, 1].map((sgn) => projectWorld(
+      im, [0, 1, 2].map((j) => pivot[j] + WORLD_AXIS[state.axisKey][j] * reach * sgn)));
+    if (ends[0] && ends[1]) {
+      ctx.save();
+      ctx.setLineDash([8 / z, 6 / z]);
+      ctx.strokeStyle = AXIS_COLOR[k];
+      ctx.lineWidth = 2 / z;
+      ctx.beginPath();
+      ctx.moveTo(ends[0].x, ends[0].y);
+      ctx.lineTo(ends[1].x, ends[1].y);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
 
   const depth = bodyDepth(inst, im);
   if (depth !== null && z > 0.1) {
@@ -1912,6 +2022,7 @@ canvas.addEventListener('mousedown', (ev) => {
         scale: ev.button === 0 && state.scaleDown,
         depth: ev.button === 0 && ev.shiftKey && !state.scaleDown,
         rotate: ev.button === 2 || ev.ctrlKey || ev.metaKey,
+        axisKey: state.axisKey,
       };
       renderPanels();
       render();
@@ -2034,6 +2145,14 @@ window.addEventListener('mousemove', (ev) => {
           setStatus(`${tpl.name || tpl.id}: `
             + mesh.size.map((v) => (v * tpl.unit_scale).toFixed(3)).join(' × ') + ' m', 'ok');
         }
+      } else if (d.rotate && d.axisKey) {
+        // One axis at a time, chosen by the key held down. Free rotation is
+        // quick to get close with and hopeless to finish with: every drag
+        // moves two angles at once, so correcting the one that is wrong
+        // disturbs the one that was already right, and a part square to the
+        // fixture never quite lands. Constraining it is what makes the last
+        // few degrees reachable at all.
+        rotateInPlace(inst, WORLD_AXIS[d.axisKey], sdx * 0.006);
       } else if (d.rotate) {
         const ax = cameraAxes(im);
         // horizontal drag yaws about world up, which is what a body standing on
@@ -2149,6 +2268,29 @@ window.addEventListener('keydown', (ev) => {
     if (!state.scaleDown) { state.scaleDown = true; updateHint(); }
     return;
   }
+  // X, Y and Z pick a single world axis to turn about, held the same way.
+  if (state.mode === 'pose' && (k === 'x' || k === 'y' || k === 'z')) {
+    if (state.axisKey !== k) { state.axisKey = k; updateHint(); render(); }
+    return;
+  }
+  // With an axis held, the arrows turn by an exact amount instead of stepping
+  // to the next photo: a quarter turn is the commonest correction there is on
+  // a part that was modelled in a different orientation from the one it is
+  // mounted in, and it is not an angle worth hunting for by hand.
+  if (state.mode === 'pose' && state.axisKey
+      && (k === 'arrowleft' || k === 'arrowright')) {
+    ev.preventDefault();
+    const inst = activeInstance();
+    if (inst && isPlaced(inst)) {
+      rotateSteps(inst, state.axisKey,
+                  (ev.shiftKey ? 90 : 15) * (k === 'arrowright' ? 1 : -1));
+      setStatus(`turned ${ev.shiftKey ? 90 : 15}° about `
+                + `${state.axisKey.toUpperCase()}`, 'ok');
+      renderPanels();
+      render();
+    }
+    return;
+  }
   if (k === 's') { setMode('select'); return; }
   if (k === 'g') { setMode('pose'); return; }
   if (k === 'n') { newPoint(); renderPanels(); render(); return; }
@@ -2191,7 +2333,9 @@ window.addEventListener('keydown', (ev) => {
 
 window.addEventListener('keyup', (ev) => {
   if (ev.key === ' ') { state.spaceDown = false; canvas.style.cursor = 'crosshair'; }
-  if (ev.key.toLowerCase() === 's' && state.scaleDown) { state.scaleDown = false; updateHint(); }
+  const ku = ev.key.toLowerCase();
+  if (ku === 's' && state.scaleDown) { state.scaleDown = false; updateHint(); }
+  if (state.axisKey === ku) { state.axisKey = null; updateHint(); render(); }
 });
 
 function step(delta) {
@@ -2210,8 +2354,9 @@ function setMode(mode) {
       && Viewer3D.isOn() && Viewer3D.mode() === 'template') toggleViewer(false);
   // dragging a body you cannot see is not dragging
   if (mode === 'pose' && !state.showModels) $('showmodels').click();
-  // S means size only while posing; leaving must not strand it held down
-  if (mode !== 'pose') state.scaleDown = false;
+  // S and the axis keys mean something only while posing; leaving must not
+  // strand either of them held down
+  if (mode !== 'pose') { state.scaleDown = false; state.axisKey = null; }
   updateHint();
   render();
 }
@@ -2237,16 +2382,21 @@ function updateHint() {
 
   const poseHint = !inst
     ? `No object selected. Add a model and an object in the <b>Known objects</b> panel.`
-    : state.scaleDown
+    : state.axisKey
+      ? `<b>${state.axisKey.toUpperCase()} axis locked.</b> Right-drag turns about world `
+        + `<b>${state.axisKey.toUpperCase()}</b> and nothing else. `
+        + `<b>←</b>/<b>→</b> turn exactly 15°, with <b>Shift</b> exactly 90°. `
+        + `Release ${state.axisKey.toUpperCase()} for free rotation.`
+      : state.scaleDown
       ? `<b>Size:</b> drag right to grow, left to shrink. The model card shows the `
         + `real size in metres as you go. This changes the <i>model</i>, so every photo `
         + `and every copy of it changes too — and in this one photo it is `
         + `indistinguishable from depth, so settle it against a photo 60–120° away.`
-      : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S and drag</b> `
-        + `resizes it. <b>Shift-drag</b> down pushes it away. Depth and size look `
-        + `identical in this photo — check both in a photo 60–120° away, where the same `
-        + `error is up to 100x more obvious. Then <b>snap its anchors</b> and nudge them, `
-        + `to turn the eye-fit into a measurement.`;
+      : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> to resize, `
+        + `<b>hold X/Y/Z</b> to turn about one world axis only. <b>Shift-drag</b> down `
+        + `pushes it away. Watch the filmstrip: the body has one pose in the world, so `
+        + `every photo updates as you drag, and a fit that is right only in this one is `
+        + `not right.`;
 
   const hints = {
     lines: `Drag along an edge parallel to the <b>${AXIS_NAME[state.axis]}</b> axis. `
@@ -2295,13 +2445,21 @@ function buildFilmstrip() {
       // not draggable: dragging a tile hands the browser the thumbnail as a
       // file, which the window drop handler then uploads as a new 220px photo
       `<img loading="lazy" alt="" draggable="false">` +
+      `<canvas class="filmov"></canvas>` +
       `<button class="rm" title="Remove from this project">&times;</button>` +
       `<div class="meta"><span>${st.text}</span>` +
       `<span class="dot" style="background:${st.color}"></span></div>`;
     // the thumbnail's source is resolved asynchronously, since in static mode it
     // is a blob the Python side has to render first
     Backend.photoSrc(im.id, true)
-      .then((src) => { const img = div.querySelector('img'); if (img) img.src = src; })
+      .then((src) => {
+        const img = div.querySelector('img');
+        if (!img) return;
+        // the tile has no height until its thumbnail arrives, and a canvas
+        // sized against a zero-height tile draws nothing
+        img.onload = () => drawFilmstripOverlays();
+        img.src = src;
+      })
       .catch(() => {});
     div.onclick = () => selectImage(im.id, true);
     div.querySelector('.rm').onclick = (ev) => { ev.stopPropagation(); removeImage(im.id); };
