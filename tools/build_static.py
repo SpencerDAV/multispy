@@ -15,6 +15,7 @@ static path without deploying it.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import sys
@@ -88,9 +89,25 @@ def build(out_dir: Path) -> dict[str, int]:
             target.write_bytes(data)
         written[rel] = target.stat().st_size
 
-    for name in WEB_FILES:
-        put(name, (ROOT / "web" / name).read_text(encoding="utf-8"))
-    put("config.js", CONFIG_JS)
+    # Pages serves everything with max-age=600, so for ten minutes after a
+    # deploy a browser may hold any of these files. Mismatched is far worse
+    # than merely stale: a fresh index.html paired with last build's app.js is
+    # a page that looks updated and is not, which is a miserable thing to
+    # debug remotely. Stamping each script with a hash of its own contents
+    # makes that impossible -- once the page itself is fresh, the URLs it asks
+    # for are ones no cache has ever seen.
+    sources = {name: (ROOT / "web" / name).read_text(encoding="utf-8")
+               for name in WEB_FILES}
+    sources["config.js"] = CONFIG_JS
+    index = sources["index.html"]
+    for name, text in sources.items():
+        if name == "index.html":
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+        index = index.replace(f'src="{name}"', f'src="{name}?v={digest}"')
+    sources["index.html"] = index
+    for name, text in sources.items():
+        put(name, text)
 
     for module in PY_MODULES:
         put(f"py/multispy/{module}.py", (ROOT / "multispy" / f"{module}.py").read_text("utf-8"))
