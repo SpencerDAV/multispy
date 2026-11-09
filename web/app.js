@@ -257,6 +257,48 @@ function ensurePose(inst, im) {
   return true;
 }
 
+/** How much of this body lands inside this photo, as a fraction of its anchors
+ *  (or its model's corners when it has no anchors yet). */
+function bodyVisibility(inst, im) {
+  const template = templateOf(inst);
+  if (!template || !isPlaced(inst) || !im.R || !im.t) return 1;
+  let local = (template.anchors || []).map((a) => a.xyz);
+  if (!local.length) {
+    const mesh = meshFor(template.id);
+    local = mesh && mesh.vertices ? mesh.vertices.slice(0, 64) : [];
+  }
+  if (!local.length) return 1;
+  let seen = 0;
+  for (const p of local) {
+    const q = projectWorld(im, objectToWorld(inst, template, p));
+    if (q && q.x >= 0 && q.y >= 0 && q.x < im.width && q.y < im.height) seen++;
+  }
+  return seen / local.length;
+}
+
+/** Put the body back on this camera's view axis, keeping its distance,
+ *  its rotation and its size.
+ *
+ *  Needed the moment the work moves to a second photograph. A body aligned in
+ *  one photo is very often just outside the frame in the next -- these were
+ *  taken metres apart around the subject, so a body a hand's breadth off in
+ *  one view is off the edge in another -- and a body that cannot be seen
+ *  cannot be dragged, which strands the whole align-snap-repeat loop on its
+ *  second step. Only the position across the view changes: the orientation and
+ *  the distance are the parts already worked for, and this throws neither
+ *  away. */
+function bringIntoView(inst, im) {
+  const C = cameraCentre(im);
+  if (!C || !isPlaced(inst)) return false;
+  const fwd = cameraAxes(im).forward;
+  const depth = Math.max(0.2, bodyDepth(inst, im) || 2.0);
+  const pivot = pivotWorld(inst);
+  for (let k = 0; k < 3; k++) inst.t[k] += C[k] + fwd[k] * depth - pivot[k];
+  inst.manual = true;
+  markDirty();
+  return true;
+}
+
 /** Depth of a body along this camera's view ray. */
 function bodyDepth(inst, im) {
   const C = cameraCentre(im);
@@ -2268,6 +2310,21 @@ window.addEventListener('keydown', (ev) => {
     if (!state.scaleDown) { state.scaleDown = true; updateHint(); }
     return;
   }
+  // H recalls a body that has drifted out of this photo's frame.
+  if (k === 'h' && state.mode === 'pose') {
+    const inst = activeInstance();
+    const im = currentImage();
+    if (inst && im && isPlaced(inst) && bringIntoView(inst, im)) {
+      setStatus(`${inst.label || inst.id} brought onto this view at `
+                + `${bodyDepth(inst, im).toFixed(2)} m — its turn and size are unchanged`,
+                'ok');
+      renderPanels();
+      render();
+    } else {
+      setStatus('nothing placed to bring into view', 'warn');
+    }
+    return;
+  }
   // X, Y and Z pick a single world axis to turn about, held the same way.
   if (state.mode === 'pose' && (k === 'x' || k === 'y' || k === 'z')) {
     if (state.axisKey !== k) { state.axisKey = k; updateHint(); render(); }
@@ -2392,11 +2449,23 @@ function updateHint() {
         + `real size in metres as you go. This changes the <i>model</i>, so every photo `
         + `and every copy of it changes too — and in this one photo it is `
         + `indistinguishable from depth, so settle it against a photo 60–120° away.`
+      : isPlaced(inst) && currentImage() && bodyVisibility(inst, currentImage()) === 0
+      ? `<b>${escapeHtml(inst.label || inst.id)} is outside this photo.</b> That is normal `
+        + `on the second view — these were taken metres apart, so a body a little off in `
+        + `one is off the edge in another. Press <b>H</b> to bring it onto this view at `
+        + `the same distance; its turn and size are kept.`
+      : !((templateOf(inst) || {}).anchors || []).length
+      ? `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> to resize, `
+        + `<b>hold X/Y/Z</b> to turn about one axis. But this model has no anchors yet, `
+        + `so the fit stays an eye-fit and nothing can refine it — press `
+        + `<b>use model features</b> in Known objects to take the ones the model already `
+        + `offers.`
       : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> to resize, `
         + `<b>hold X/Y/Z</b> to turn about one world axis only. <b>Shift-drag</b> down `
-        + `pushes it away. Watch the filmstrip: the body has one pose in the world, so `
-        + `every photo updates as you drag, and a fit that is right only in this one is `
-        + `not right.`;
+        + `pushes it away. Watch the filmstrip: the body has one pose, so every photo `
+        + `updates as you drag. When it looks right here, <b>snap anchors</b>, then do `
+        + `the next photo and snap again — <b>Enter</b> then reconciles all of them into `
+        + `one measured pose, and moves the cameras to match.`;
 
   const hints = {
     lines: `Drag along an edge parallel to the <b>${AXIS_NAME[state.axis]}</b> axis. `
@@ -2957,6 +3026,9 @@ function renderObjectsPanel() {
       html += `<div class="msg">Without one the solve places the body, not the camera inside it.</div>`;
     }
     html += `<div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap">`
+          + `<button class="smallbtn" data-autoanchor="${escapeHtml(tid)}" `
+          +   `title="Take the best-spread features the model already offers, `
+          +   `so posing can start without picking them by hand">use model features</button>`
           + `<button class="smallbtn" data-pick="${escapeHtml(tid)}">pick anchors in 3D</button>`
           + `<button class="smallbtn" data-typed="${escapeHtml(tid)}">type a position…</button>`
           + `<button class="smallbtn" data-optical="${escapeHtml(tid)}">${o ? 'edit' : 'set'} optical</button>`
@@ -3101,6 +3173,17 @@ function wireObjectsPanel(el) {
       renderPanels();
       syncViewer();
       render();
+    };
+  }
+  for (const btn of el.querySelectorAll('[data-autoanchor]')) {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const tid = btn.dataset.autoanchor;
+      state.activeTemplate = tid;
+      if (!autoAnchors(tid)) {
+        setStatus('this model offers no pickable features — try the 3D view, or '
+                  + 'type a position from the drawing', 'warn');
+      }
     };
   }
   for (const btn of el.querySelectorAll('[data-pick]')) {
@@ -3708,6 +3791,69 @@ function addAnchor(xyz, label) {
     'ok'
   );
   return name;
+}
+
+/* Quality order for the points a model offers. A bored-hole or bolt-head
+ * centre reads the same from every angle, so it is worth more than a filleted
+ * corner, which is at least well defined; a sharp vertex is worth least,
+ * because a part with fasteners on it has dozens of identical ones and no way
+ * to say in a photograph which was clicked. */
+const PICK_RANK = { centre: 0, virtual: 1, corner: 2 };
+const PICK_WEIGHT = { centre: 1.0, virtual: 0.85, corner: 0.7 };
+
+/** Adopt the model's own best features as anchors, spread over the body.
+ *
+ *  The per-photo loop -- align by eye, snap the anchors, move to the next
+ *  photo, solve -- cannot start at all until a model has anchors, and picking
+ *  them by hand in the 3D view is a detour taken before any of the value
+ *  appears. The model has already offered candidates; this takes them.
+ *
+ *  Spread is the thing to optimise, not count. Anchors bunched together pin
+ *  the body's position and barely its rotation, and three in a line leave it
+ *  free to spin about that line however well they are marked. So this is
+ *  farthest-point sampling, seeded with the best feature on the part and
+ *  weighted so a good kind of feature wins a near tie with a distant poor one. */
+function autoAnchors(tid, want = 8) {
+  const t = templates()[tid];
+  const mesh = meshFor(tid);
+  const picks = (mesh && mesh.picks) || [];
+  if (!t || !picks.length) return 0;
+  const pool = picks.slice().sort(
+    (a, b) => (PICK_RANK[a.kind] ?? 9) - (PICK_RANK[b.kind] ?? 9) || b.score - a.score);
+  const dist = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+  const chosen = [pool[0]];
+  while (chosen.length < want && chosen.length < pool.length) {
+    let best = null, bestScore = -Infinity;
+    for (const c of pool) {
+      if (chosen.includes(c)) continue;
+      const near = Math.min(...chosen.map((k) => dist(c.xyz, k.xyz)));
+      const s = near * (PICK_WEIGHT[c.kind] ?? 0.7);
+      if (s > bestScore) { bestScore = s; best = c; }
+    }
+    if (!best) break;
+    chosen.push(best);
+  }
+  t.anchors = t.anchors || [];
+  const used = new Set(t.anchors.map((a) => a.name));
+  let i = 1;
+  for (const c of chosen) {
+    while (used.has(`a${i}`)) i++;
+    const name = `a${i}`;
+    used.add(name);
+    t.anchors.push({ name, xyz: c.xyz.map(Number) });
+  }
+  const kinds = chosen.reduce((m, c) => (m[c.kind] = (m[c.kind] || 0) + 1, m), {});
+  markDirty();
+  renderObjectsPanel();
+  syncViewer();
+  render();
+  setStatus(
+    `${chosen.length} anchor(s) taken from the model `
+      + `(${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')}) — `
+      + `pose it over a photo and snap them, or open the 3D view (D) to check them`,
+    'ok'
+  );
+  return chosen.length;
 }
 
 /** One of the points the model offered, picked in the 3D view. */
