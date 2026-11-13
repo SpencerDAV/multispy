@@ -3431,9 +3431,18 @@ function wireCalibPicker() {
     } else {
       pt.nominal = chosen.nominal.map(Number);
       pt.nominal_source = chosen.feature;
-      if (chosen.sigma !== null && chosen.sigma !== undefined) {
-        pt.nominal_sigma = Number(chosen.sigma);
-      }
+      // Clear the tolerance when the file states no spec limit for this
+      // feature, instead of leaving the previous pick's number sitting there.
+      // A tolerance carried over from a different feature would be stamped
+      // with this one's provenance and weighted as though the file had
+      // vouched for it -- the one kind of wrong number that looks sourced.
+      // Null falls back to Settings.sigma_nominal, which the tolerance field
+      // shows as its placeholder, so what is actually being used stays on
+      // screen.
+      pt.nominal_sigma =
+        chosen.sigma === null || chosen.sigma === undefined
+          ? null
+          : Number(chosen.sigma);
     }
     markDirty();
     renderPanels();
