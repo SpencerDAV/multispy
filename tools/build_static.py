@@ -52,6 +52,7 @@ PY_MODULES = (
     "sensors",
     "calibfile",
     "sensorcheck",
+    "nominalcheck",
     "export",
     "webapp",
 )

@@ -562,6 +562,70 @@ solve they then anchor are self-consistent by construction, so they inflate
 nothing here while validating nothing either. Read it as a floor on the
 uncertainty, never a ceiling.
 
+### Is each nominal on the feature it names?
+
+The section above ends on a limit: a datum point clicked on the wrong feature in
+every photograph moves the origin without widening that sphere at all. This is
+the check for that one.
+
+A nominal is two claims stapled together — *this coordinate is right*, which
+comes off the drawing, and *this clicked point is that feature*, which comes off
+somebody's judgement at a screen. Only the first is ever examined. On hardware
+that repeats, the second is the one that goes wrong: a frame near-symmetric left
+to right, identical clamps down a tube, three sensor bodies across fifteen
+stations. Pick `LH_CP_58` where `RH_CP_58` was meant and every number in the
+file is still a real number off a real drawing. Only the pairing is wrong.
+
+And the usual readouts go quiet when it is. `align_to_nominals` fits an origin
+and a scale to a mislabelled set as readily as to a good one; the
+asked-versus-achieved table then shows each nominal met, because the solve bent
+itself to meet it; and a point whose feature carries no stated tolerance falls
+back to `sigma_nominal`, tight enough to act as a rigid anchor — so the wrong
+point is reported as the perfect one while the correctly toleranced points
+absorb its error. Measured on a nine-photograph truck-frame cell, two
+mislabelled points pinned at the 0.1 mm default held their own deviation at
+0.0 mm, pushed the two honest nominals 97 mm and 210 mm out, took the
+reprojection RMS from 2.4 px to 20 px, drove the shared focal to 2.37× its EXIF
+value, and stopped the bundle adjustment converging. Every one of those says
+something is wrong. Not one says what.
+
+So this asks a question the fit cannot answer about itself: forget the frame,
+forget the units, and compare **shapes**. Distance is unchanged by rotation and
+translation, and one distance over another cancels the scale — so a correctly
+linked set agrees with itself on a single scale, pair after pair, and a swapped
+one does not. The two features the drawing puts closest together stop being the
+two the photographs put closest together, and no rigid motion repairs it.
+
+**It re-solves before it compares, and that is the whole method.** Run the
+comparison against a solve the nominals are driving and it passes trivially —
+they are what put those points there, so they agree with themselves by
+construction, the mislabelled ones most tightly of all. The project is copied,
+every nominal stripped from the copy, and the copy re-solved from the
+photographs alone. Scale goes arbitrary when the nominals go, which costs this
+nothing, and it means the check works on a project that has never reached part
+space — which is exactly when you want it.
+
+| | |
+|---|---|
+| **spread** | Largest pair ratio over smallest. 1.0 is a set that agrees with itself. This is the headline because it owes nothing to a fit: no rotation and no origin were chosen before computing it, so nothing can absorb the error. |
+| **rms**, **worst sigma** | The similarity fit's residual, per point, against that point's own stated tolerance. In sigmas because one calibration file's tolerances run 0.5 mm to 8 mm, and a fixed millimetre threshold would excuse the tight features or condemn the loose ones. |
+| **consistent / suspect / contradicted** | Worst point within 3× its tolerance, within 5×, or beyond. |
+| **untestable** | A real answer, not a failure. Fewer than three nominal'd points, a set too near collinear, too few of them placeable from the photographs alone, or a solve that failed. |
+| **reproj** | The nominal-free re-solve's own RMS. Read it first: if the photographs do not agree with each other, their disagreement with the drawing says nothing yet about the links. |
+
+Why both readings are kept: a swap along a plate's 20 mm thickness barely moves
+the spread — about 6% — while the shape residual goes to forty times tolerance.
+A swap across its 120 mm length moves the spread by a factor of 37. Either
+number alone has a blind spot the other covers.
+
+Three limits worth stating. It cannot say **which** point is wrong, only that
+the set disagrees — with one bad link among four, the fit spreads the residual
+over all four. It cannot see an error that **preserves shape**: a whole set
+shifted together, or nominals taken from the solve they then anchor. And below
+three points it declines rather than passes, because two points and a free scale
+fit each other whatever they are, and a pass there would be the pass somebody
+quotes.
+
 ### Is the sensor calibration file telling the truth?
 
 A measurement cell's calibration file states, per sensor, where it sits, which

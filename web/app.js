@@ -3333,6 +3333,86 @@ function originPanelHtml() {
        + `</div>`;
 }
 
+/* Whether each nominal is on the feature it names.
+ *
+ * Kept out of the project file on purpose: it is a reading, not a setting, and
+ * it is only true of the marks as they were when it ran. The sphere above can
+ * afford to persist because it carries a fingerprint that marks it stale; this
+ * one would need the same apparatus to earn the same privilege, and until it
+ * has it, showing yesterday's verdict against today's links would be the exact
+ * species of quietly-wrong number the check exists to catch. */
+const SHAPE_COLOR = {
+  consistent: 'good', suspect: 'warn', contradicted: 'bad', untestable: 'unknown',
+};
+
+function shapeCheckHtml() {
+  const r = state.shapeCheck;
+  if (!r) {
+    return `<div class="note">Compares the shape the nominal'd points make with the shape `
+         + `their coordinates describe — scale-free, and against a re-solve with every `
+         + `nominal stripped out, so a wrong link cannot pass by having bent the solve to `
+         + `meet itself. Needs three nominal'd points.</div>`;
+  }
+  const col = GRADE_COLOR[SHAPE_COLOR[r.verdict] || 'unknown'] || GRADE_COLOR.unknown;
+  let html = `<div class="row" style="align-items:center;gap:6px">`
+           +   `<span style="width:10px;height:10px;border-radius:50%;background:${col};`
+           +     `display:inline-block;flex:none"></span>`
+           +   `<b>${escapeHtml(r.verdict)}</b>`;
+  if (r.ok) {
+    html += `<span style="color:var(--text-dim)">${r.n_compared} point(s), `
+          + `spread ${r.spread.toFixed(2)}×</span>`;
+  }
+  html += `</div>`;
+  if (r.ok) {
+    html += `<div class="note">Shape fit leaves ${r.rms.toFixed(1)} ${escapeHtml(r.units)} RMS, `
+          + `worst ${r.worst_sigmas.toFixed(1)}× its own tolerance. The nominal-free `
+          + `re-solve ran at ${r.reproj_px.toFixed(2)} px — read that first.</div>`;
+    const rows = (r.points || []).filter((q) => q.positioned)
+      .sort((a, b) => b.sigmas - a.sigmas);
+    if (rows.length) {
+      html += `<table class="obs"><tr><th>point</th><th>from</th><th>off</th><th>×tol</th></tr>`
+            + rows.map((q) =>
+                `<tr><td>${escapeHtml(q.id)}</td>`
+              + `<td>${escapeHtml(q.source || 'typed')}</td>`
+              + `<td>${q.deviation.toFixed(1)}</td>`
+              + `<td>${q.sigmas > 999 ? '&gt;999' : q.sigmas.toFixed(1)}`
+              + `${q.sigma_defaulted ? ' <span style="color:var(--text-dim)">(default)</span>' : ''}`
+              + `</td></tr>`).join('')
+            + `</table>`;
+    }
+  } else if (r.reason) {
+    html += `<div class="note">${escapeHtml(r.reason)}</div>`;
+  }
+  for (const w of (r.warnings || [])) html += `<div class="note bad">${escapeHtml(w)}</div>`;
+  return html;
+}
+
+function wireShapeCheck() {
+  const shape = $('checkshape');
+  if (!shape) return;
+  shape.onclick = async () => {
+    shape.disabled = true;
+    setStatus('checking the nominal links — one re-solve without them…');
+    try {
+      const data = await api('/api/check_nominal_shape', { project: projectPayload() });
+      const r = data.shape;
+      state.shapeCheck = r;
+      setStatus(
+        r.ok
+          ? `nominal links ${r.verdict}: ${r.n_compared} point(s), spread `
+            + `${r.spread.toFixed(2)}×, worst ${r.worst_sigmas.toFixed(1)}× tolerance`
+          : `nominal links untestable: ${r.reason}`,
+        r.verdict === 'consistent' ? 'ok' : 'warn');
+    } catch (err) {
+      setStatus(`could not check the nominal links: ${err.message || err}`, 'warn');
+    } finally {
+      shape.disabled = false;
+      renderPanels();
+      render();
+    }
+  };
+}
+
 function wireOriginPanel() {
   const btn = $('measureorigin');
   if (!btn) return;
@@ -3483,6 +3563,9 @@ function renderPointsPanel() {
         + `orientation and scale. A CAD model of the part belongs at the identity.</div>`
       : `<div class="note">${ps.n} nominal'd point(s). Three or more, not in a straight line, `
         + `put the solve into the part's own frame.</div>`;
+    html += `<div class="row"><span class="k">nominal links</span>`
+          +   `<button class="smallbtn" id="checkshape">check shape</button></div>`
+          + shapeCheckHtml();
   }
   if (ps.ok) html += originPanelHtml();
   html += `<div style="display:flex;gap:5px;margin-bottom:6px">`
@@ -3582,6 +3665,7 @@ function renderPointsPanel() {
   el.innerHTML = html;
 
   wireOriginPanel();
+  wireShapeCheck();
   wireCalibPicker();
   $('newpt').onclick = () => { newPoint(); setMode('points'); renderPanels(); render(); };
   $('nextmissing').onclick = () => { if (state.activePoint) advanceToMissing(state.activePoint); };

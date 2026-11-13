@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import calibfile, exif, export, sensorcheck, sensors, uncertainty
+from . import calibfile, exif, export, nominalcheck, sensorcheck, sensors, uncertainty
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
 from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
 from .part import PartFitReport, part_fit, place_part
@@ -58,6 +58,7 @@ SHARED_ROUTES = frozenset(
         "/api/origin_uncertainty",
         "/api/check_calibration",
         "/api/check_sensors_in_photos",
+        "/api/check_nominal_shape",
         "/api/use_calibration_nominals",
     }
 )
@@ -639,6 +640,23 @@ class Workspace:
                 calibration=filed,
             )
             return {"check": result.to_dict()}
+
+        # Read-only, and deliberately not folded into /api/solve: the comparison
+        # only means anything against a solve the nominals are NOT driving, so it
+        # runs its own with them stripped out. Folding it in would have left it
+        # reading the very numbers it is supposed to be auditing.
+        if route == "/api/check_nominal_shape":
+            project = Project.from_dict(body["project"], path=self.project.path)
+            report = nominalcheck.check_nominal_shape(
+                project,
+                tol_sigmas=float(
+                    body.get("tol_sigmas") or nominalcheck.DEFAULT_TOL_SIGMAS
+                ),
+                warn_sigmas=float(
+                    body.get("warn_sigmas") or nominalcheck.DEFAULT_WARN_SIGMAS
+                ),
+            )
+            return {"shape": report.to_dict(), "verdict": report.verdict}
 
         # Adopting the file's feature coordinates as nominals you can pick from.
         # A separate route from /api/check_calibration, which stays read-only:
