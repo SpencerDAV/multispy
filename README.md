@@ -562,6 +562,76 @@ solve they then anchor are self-consistent by construction, so they inflate
 nothing here while validating nothing either. Read it as a floor on the
 uncertainty, never a ceiling.
 
+### Is the sensor calibration file telling the truth?
+
+A measurement cell's calibration file states, per sensor, where it sits, which
+way it faces, how far it stands off the part and how big its field of view is.
+Those numbers would make superb nominals — the sensors are spread across the
+whole cell, so they shorten the lever arm that makes an origin uncertain. The
+catch is that calibration files lie, and the ones that lie worst look exactly
+like the ones that do not.
+
+So the file is read as a set of claims and checked before any of it is believed.
+The check needs nothing else — no reconstruction, no photographs, no CAD —
+because **the file falsifies itself**. It states each sensor's field of view
+*and* the nominal of the feature that sensor is pointed at. If the feature lies
+outside the field of view, the sensor cannot see the thing it claims to be
+measuring, and that is a contradiction inside a single row.
+
+Point it at an export and it reports, per sensor:
+
+| | |
+|---|---|
+| **consistent** | Every feature it measures sits inside the field of view it declares. Read this narrowly: the box is 200–300 mm across and the tolerance you inspect to is a few millimetres, so it rules out a gross fault and says nothing finer. |
+| **edge** | A feature sits just outside the box, by less than 1.3×. Marginal rather than damning — a feature nominal slightly out, or a sensor that was always tight on that feature. |
+| **explained** | Wrong, and one catalogued fault accounts for it: the mirrored feature across the cell, a pose reflected through the centreline, a body turned about an axis. The useful verdict, because it comes with the correction. |
+| **suspect** | Wrong, and nothing in the catalogue explains it. It still says whether a single translation would fix it — displaced rather than misoriented — and which axis the overrun is on, since an overrun along the sight line is a standoff error and one across it means the sensor is pointed somewhere else. |
+
+**The most useful line in the report is about a day, not a sensor.** Faults in
+these files are made by people in sittings: the part is set up once, the nominals
+are loaded once, and every sensor calibrated that day inherits whatever was wrong
+with the setup. So sensors are grouped by `Calibration Date`. On the cell this
+was built against — 15 sensors, 22 features — three sensors are wrong by 2.3×,
+4.8× and 7.5× of their own field of view, all three were calibrated on the same
+morning, their corrections agree on X to within 1 mm at +411, +411 and +412, and
+no sensor from any other session is wrong at all. That is one mistake in one
+setup, fixed in one action. Three separate sensor verdicts would have been three
+things to go and check.
+
+What it will not do is tell you whether the sensors moved or the nominals they
+were calibrated against did. A shared offset looks identical either way from the
+file alone, and both readings are named rather than one being chosen.
+
+The range axis is not assumed either. A triangulation sensor trades depth for
+resolution, so its depth half-range is smaller than its lateral extents, and
+every sensor votes from its own frustum. A sensor whose field of view is square
+in cross-section abstains rather than voting for whichever axis came first.
+
+Three limits, and the third is the one that matters most:
+
+- **A 180° turn about the aim axis is invisible here.** The wrong sweep face
+  moves neither the sight line nor the field of view, so it comes back
+  *consistent* — correctly, since nothing in the file can see it. Every verdict,
+  including the passing ones, carries the record that this fault was never
+  tested. Only a photograph can catch it, and only a close one: these bodies are
+  70 × 168 mm in section, so the turn maps the outline onto itself and leaves
+  only off-centre detail to tell them apart.
+- **A translation along the sight line is nearly invisible**, for the same
+  reason. The depth half-range gives the test some power there, far less than
+  across the beam.
+- **A fault shared by most of the file reads as the truth.** This measures
+  agreement, never correctness. The independent referees are the control-line
+  axes, the clicked tie points, the mounting structure the sensors physically sit
+  on, and the photographs.
+
+Importing is read-only and does not touch the project. Turning imported poses
+into nominals and then judging the fit by how well those nominals were met would
+be circular — the same trap the confidence sphere above is built to avoid — so
+reading the file and believing it stay separate actions. `sensor_tol` and
+`sensor_warn` (10 and 50 in your nominal units) grade the corrections; they do
+not set the conviction threshold, which comes from each sensor's own declared
+optics.
+
 **Residuals** draws observed → reprojected vectors at **×10**, since a good fit
 is otherwise invisible.
 
