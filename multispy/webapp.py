@@ -58,6 +58,7 @@ SHARED_ROUTES = frozenset(
         "/api/origin_uncertainty",
         "/api/check_calibration",
         "/api/check_sensors_in_photos",
+        "/api/use_calibration_nominals",
     }
 )
 """Routes :meth:`Workspace.handle` answers, and both front ends therefore share.
@@ -638,6 +639,36 @@ class Workspace:
                 calibration=filed,
             )
             return {"check": result.to_dict()}
+
+        # Adopting the file's feature coordinates as nominals you can pick from.
+        # A separate route from /api/check_calibration, which stays read-only:
+        # looking at a calibration file and taking its word for where things are
+        # ought to be two deliberate actions, not one. This is the second.
+        #
+        # The candidates are stored, not applied. Nothing becomes a point's
+        # nominal until somebody picks it for that point, because which clicked
+        # feature IS which named feature is a judgement only the person marking
+        # the photographs can make.
+        if route == "/api/use_calibration_nominals":
+            project = self.adopt(body["project"])
+            imported = calibfile.read_export(body.get("text") or "")
+            filed = sensors.diagnose(
+                imported.sensors,
+                tol=float(project.settings.sensor_tol),
+                warn=float(project.settings.sensor_warn),
+                units=project.nominal_units,
+            )
+            candidates = sensors.nominal_candidates(imported.sensors, filed)
+            project.calibration_nominals = [c.to_dict() for c in candidates]
+            self.save()
+            usable = sum(1 for c in candidates if c.usable)
+            return {
+                "project": project_payload(self.project),
+                "n_candidates": len(candidates),
+                "n_usable": usable,
+                "warnings": imported.warnings,
+                "report": filed.to_dict(),
+            }
 
         if route == "/api/rig":
             project = Project.from_dict(body["project"], path=self.project.path)

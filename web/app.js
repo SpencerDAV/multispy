@@ -3374,6 +3374,92 @@ function wireOriginPanel() {
   };
 }
 
+/* Nominals the calibration file already states, as a list to pick from.
+ *
+ * Forty-two numbers typed by hand is forty-two chances to transpose a digit, and
+ * a transposed digit in a nominal does not read as a mistake -- it reads as a
+ * part that is out of tolerance, which is the most expensive kind of wrong this
+ * tool can produce. Picking a named feature instead carries its coordinate, its
+ * own tolerance from the file's spec limits, and a record of where it came from.
+ *
+ * Withheld candidates are shown, disabled, with their reason. A feature whose
+ * sensor was convicted is not a feature that does not exist, and hiding it would
+ * only invite someone to type the number in by hand. */
+function calibPickerHtml(ap) {
+  const all = state.project.calibration_nominals || [];
+  if (!all.length) {
+    return `<div class="note">No calibration file imported. One would offer its features `
+         + `here as nominals to pick from, with their own tolerances, instead of numbers to `
+         + `type. <button class="smallbtn" id="calibimport">import calibration…</button></div>`;
+  }
+  const usable = all.filter((c) => c.usable);
+  const src = ap.nominal_source || '';
+  const opts = [`<option value="">— type by hand —</option>`]
+    .concat(all.map((c) => {
+      const label = `${c.feature}  (${c.nominal.map((v) => Number(v).toFixed(1)).join(', ')})`;
+      return `<option value="${escapeHtml(c.feature)}"${c.feature === src ? ' selected' : ''}`
+           + `${c.usable ? '' : ' disabled'}>${escapeHtml(label)}`
+           + `${c.usable ? '' : ' — withheld'}</option>`;
+    }));
+  const chosen = all.find((c) => c.feature === src);
+  return `<div class="row" style="margin-top:4px"><span class="k">from file</span>`
+       +   `<select id="calibpick" style="flex:1;min-width:0">${opts.join('')}</select></div>`
+       + (chosen
+            ? `<div class="msg">${escapeHtml(chosen.note)}</div>`
+            : `<div class="note">${usable.length} of ${all.length} features offered; the rest `
+              + `are withheld because the sensor that measures them disagrees with the nominal, `
+              + `which says one of the two is wrong and not which. `
+              + `<button class="smallbtn" id="calibimport">re-import…</button></div>`);
+}
+
+function wireCalibPicker() {
+  const open = $('calibimport');
+  if (open) open.onclick = () => $('calibinput').click();
+
+  const pick = $('calibpick');
+  if (!pick) return;
+  pick.onchange = () => {
+    const pt = state.project.points.find((p) => p.id === state.activePoint);
+    if (!pt) return;
+    const chosen = (state.project.calibration_nominals || [])
+      .find((c) => c.feature === pick.value);
+    if (!chosen) {
+      // Back to typing by hand clears the provenance but keeps the numbers: the
+      // coordinate may well be right, and silently blanking a nominal someone
+      // has already solved against would be the surprising half of "undo".
+      pt.nominal_source = '';
+    } else {
+      pt.nominal = chosen.nominal.map(Number);
+      pt.nominal_source = chosen.feature;
+      if (chosen.sigma !== null && chosen.sigma !== undefined) {
+        pt.nominal_sigma = Number(chosen.sigma);
+      }
+    }
+    markDirty();
+    renderPanels();
+    render();
+    if (Viewer3D.isOn()) Viewer3D.render();
+  };
+}
+
+async function importCalibration(file) {
+  setStatus(`reading ${file.name}…`);
+  try {
+    const text = await file.text();
+    const data = await api('/api/use_calibration_nominals',
+                           { project: projectPayload(), text });
+    adopt(data);
+    for (const w of (data.warnings || [])) setStatus(w, 'warn');
+    setStatus(
+      `${data.n_usable} of ${data.n_candidates} features offered as nominals`,
+      data.n_usable ? 'ok' : 'warn');
+  } catch (err) {
+    setStatus(`could not read the calibration file: ${err.message || err}`, 'warn');
+  }
+  renderPanels();
+  render();
+}
+
 function renderPointsPanel() {
   const im = currentImage();
   const el = $('ptpanel');
@@ -3453,7 +3539,8 @@ function renderPointsPanel() {
               +   `value="${ap.nominal_sigma === null || ap.nominal_sigma === undefined
                             ? '' : ap.nominal_sigma}" `
               +   `placeholder="${(state.project.settings.sigma_nominal ?? 0.1)}">`
-              +   `<span class="est">${escapeHtml(u)}</span></div>`;
+              +   `<span class="est">${escapeHtml(u)}</span></div>`
+              + calibPickerHtml(ap);
 
         const miss = nominalMiss(ap.id);
         if (miss) {
@@ -3486,6 +3573,7 @@ function renderPointsPanel() {
   el.innerHTML = html;
 
   wireOriginPanel();
+  wireCalibPicker();
   $('newpt').onclick = () => { newPoint(); setMode('points'); renderPanels(); render(); };
   $('nextmissing').onclick = () => { if (state.activePoint) advanceToMissing(state.activePoint); };
   $('autoadv').onchange = (e) => { state.autoAdvance = e.target.checked; };
@@ -4944,6 +5032,10 @@ $('fileinput').onchange = (ev) => {
 };
 $('modelinput').onchange = (ev) => {
   if (ev.target.files.length) uploadModel(ev.target.files[0]);
+  ev.target.value = '';
+};
+$('calibinput').onchange = (ev) => {
+  if (ev.target.files.length) importCalibration(ev.target.files[0]);
   ev.target.value = '';
 };
 

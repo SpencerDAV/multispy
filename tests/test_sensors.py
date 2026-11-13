@@ -36,7 +36,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from multispy.calibfile import read_export
-from multispy.project import Project
+from multispy.project import Project, TiePoint
 from multispy.sensors import (
     CONSISTENT,
     EDGE,
@@ -51,6 +51,7 @@ from multispy.sensors import (
     euler_matrix,
     fault_catalogue,
     infer_depth_axis,
+    nominal_candidates,
     place_sensors,
     quaternion_matrix,
     quaternion_scalar_position,
@@ -707,6 +708,99 @@ def test_the_range_axis_sign_is_declared_as_an_assumption():
     assert any("photograph" in m for m in placed.messages), (
         "the assumption is stated without saying what would settle it"
     )
+
+
+# ------------------------------------------- nominals you can pick from
+
+
+def test_the_features_of_healthy_sensors_are_offered_as_nominals():
+    """The point of the import, reduced to something a person can click.
+
+    Three typed datum points spanning a metre know their origin to a centimetre
+    or two; a dozen features spread across the whole cell do far better, and the
+    file already states every one of them.
+    """
+    cell = healthy_cell(5)
+    centre = np.array([7000.0, 0.0, 600.0])
+    cell.sensor("BAD", centre, features=[centre], shift=np.array([-900.0, 0.0, 0.0]))
+    imp = cell.read()
+    cands = nominal_candidates(imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+
+    assert len(cands) == imp.n_features, "a feature went missing from the pick-list"
+    usable = [c for c in cands if c.usable]
+    assert len(usable) == 5, f"{len(usable)} usable of {len(cands)}"
+    assert all(c.usable for c in cands[:len(usable)]), "usable candidates are not listed first"
+
+
+def test_a_convicted_sensors_nominal_is_withheld_rather_than_deleted():
+    """It says one of the transform and the nominal is wrong, not which.
+
+    So the feature stays in the list, disabled, with its reason -- hiding it
+    would only invite someone to type the number in by hand, and condemning the
+    nominal would be picking a side at random.
+    """
+    cell = healthy_cell(5)
+    centre = np.array([7000.0, 0.0, 600.0])
+    cell.sensor("BAD", centre, features=[centre], shift=np.array([-900.0, 0.0, 0.0]))
+    imp = cell.read()
+    cands = nominal_candidates(imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+
+    withheld = [c for c in cands if not c.usable]
+    assert len(withheld) == 1 and withheld[0].serial == "BAD"
+    assert "withheld" in withheld[0].note
+    assert "not which" in withheld[0].note, (
+        f"the reason claims to know which of the two is wrong: {withheld[0].note}"
+    )
+    assert withheld[0].nominal, "the coordinate was dropped rather than withheld"
+
+
+def test_a_candidates_tolerance_comes_from_the_file_not_from_a_default():
+    """And is absent, rather than invented, when the file states none."""
+    centre = np.array([5000.0, 0.0, 600.0])
+    cell = healthy_cell(4)
+    cell.sensor("WITHLIM", centre, features=[centre])
+    imp = cell.read()
+    cands = nominal_candidates(imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+    got = next(c for c in cands if c.serial == "WITHLIM")
+    # The fixture writes +-5.00 on every axis, as the real export does.
+    assert got.sigma == 5.0, f"tolerance came back {got.sigma}"
+
+    bare = imp.sensors[0]
+    bare.features[0].limits = ((None, None), (None, None), (None, None))
+    again = nominal_candidates([bare], diagnose([bare], tol=TOL, warn=WARN))
+    assert again[0].sigma is None, (
+        "a feature with no stated tolerance was given one, which dresses a guess as a "
+        "measurement -- Settings.sigma_nominal is the honest fallback"
+    )
+
+
+def test_the_pick_list_and_its_provenance_round_trip():
+    cell = healthy_cell(4)
+    imp = cell.read()
+    cands = nominal_candidates(imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+    project = Project(name="t", nominal_units="mm", nominal_scale=0.001)
+    project.calibration_nominals = [c.to_dict() for c in cands]
+    chosen = cands[0]
+    project.points.append(
+        TiePoint(id="p0", nominal=list(chosen.nominal), nominal_sigma=chosen.sigma,
+                 nominal_source=chosen.feature)
+    )
+
+    back = Project.from_dict(project.to_dict())
+    assert back.calibration_nominals and len(back.calibration_nominals) == len(cands)
+    assert back.calibration_nominals[0]["feature"] == chosen.feature
+    point = back.point("p0")
+    assert point is not None
+    assert point.nominal_source == chosen.feature, "provenance was lost on the round trip"
+    assert point.nominal == list(chosen.nominal)
+
+
+def test_a_point_with_a_typed_nominal_has_no_source():
+    """A typed nominal and an adopted one are different kinds of claim."""
+    project = Project(name="t")
+    project.points.append(TiePoint(id="p0", nominal=[1.0, 2.0, 3.0]))
+    back = Project.from_dict(project.to_dict())
+    assert back.point("p0").nominal_source == ""
 
 
 # ------------------------------------------------------------- the units check

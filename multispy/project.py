@@ -164,6 +164,16 @@ class TiePoint:
     A real tolerance, not a formality: it is what decides whether the solve
     bends to meet the drawing or the drawing bends to meet the solve. Tight on
     the datum features that define the frame, loose on everything else."""
+    nominal_source: str = ""
+    """Which named feature this point's nominal was taken from, if any.
+
+    Provenance again, and for the same reason ``ObjectInstance.calibrated``
+    carries a session: a typed nominal and one adopted from a calibration file
+    are different kinds of claim. A typed one is what someone read off a drawing.
+    An adopted one inherits everything that was wrong with the sitting that
+    produced it, so when a session turns out to have been calibrated against a
+    part positioned half a metre out, this is what makes it possible to find
+    every nominal that came from it instead of re-checking all of them."""
     uncertain: bool = False
     """Marked where you could not quite see the feature.
 
@@ -514,6 +524,15 @@ class Project:
     nominal_scale: float = 0.001
     """World metres per nominal unit. Kept explicitly beside ``nominal_units``,
     the same way a template does, so an odd scale survives a round trip."""
+    calibration_nominals: list[dict[str, Any]] | None = None
+    """Features a calibration import offered as nominals, as
+    ``sensors.NominalCandidate.to_dict()``.
+
+    Stored with the project so the file does not have to be re-imported every
+    session, and so the pick-list a point was chosen from is still there to be
+    audited later. Withheld candidates are kept in the list rather than filtered
+    out, with their reason, because "this feature exists and here is why you may
+    not use it" is more useful than its absence."""
     origin_uncertainty: dict[str, Any] | None = None
     """Last measured spread of the part-space origin, as
     ``uncertainty.OriginUncertainty.to_dict()``. Stored rather than recomputed
@@ -860,6 +879,7 @@ class Project:
             "version": FORMAT_VERSION,
             "name": self.name,
             "origin_uncertainty": self.origin_uncertainty,
+            "calibration_nominals": self.calibration_nominals,
             "settings": asdict(self.settings),
             "groups": {gid: asdict(g) for gid, g in self.groups.items()},
             "images": [
@@ -889,6 +909,7 @@ class Project:
                     "xyz": p.xyz.tolist() if p.xyz is not None else None,
                     "nominal": p.nominal,
                     "nominal_sigma": p.nominal_sigma,
+                    "nominal_source": p.nominal_source,
                     "uncertain": p.uncertain,
                 }
                 for p in self.points
@@ -986,6 +1007,7 @@ class Project:
                 pt.nominal = [None if v is None else float(v) for v in nominal]
             if raw.get("nominal_sigma") is not None:
                 pt.nominal_sigma = float(raw["nominal_sigma"])
+            pt.nominal_source = str(raw.get("nominal_source", "") or "")
             points.append(pt)
 
         constraints: list[Constraint] = []
@@ -1078,6 +1100,7 @@ class Project:
             nominal_units=d.get("nominal_units", "mm"),
             nominal_scale=float(d.get("nominal_scale", 0.001)),
             origin_uncertainty=d.get("origin_uncertainty") or None,
+            calibration_nominals=d.get("calibration_nominals") or None,
             path=path,
         )
         project.pin_part()

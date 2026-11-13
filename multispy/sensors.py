@@ -1457,3 +1457,126 @@ def _ensure_template(project: Any, cls: Any, part: str, mesh_path: str | None) -
         unit_scale=0.001,
     )
     return template_id
+
+
+# ------------------------------------------------- nominals you can click on
+
+
+@dataclass
+class NominalCandidate:
+    """A feature whose part-space coordinate the calibration file already states.
+
+    The point of the whole import, reduced to something a person can click. A
+    project in part space off three typed datum points knows its origin to a
+    centimetre or two, because three points spanning a metre carrying an origin a
+    metre and a half beyond them hand every angular error a lever (see
+    :mod:`multispy.uncertainty`). A calibration file for a cell this size names a
+    dozen or more features spread across its whole length, each with a coordinate
+    and a real tolerance. Marking those instead is the single biggest thing that
+    can be done about that lever arm.
+
+    Offered as a list to pick from rather than numbers to type, because fourteen
+    features at three coordinates each is forty-two chances to transpose a digit,
+    and a transposed digit in a nominal does not look like an error -- it looks
+    like a part that is out of tolerance.
+    """
+
+    feature: str
+    serial: str
+    session: str
+    nominal: list[float]
+    sigma: float | None = None
+    """Tolerance in the file's units, taken from its own spec limits rather than
+    invented. The tightest half-limit across the axes that state one, which is
+    the conservative reading: a feature held to +-3 on one axis and +-8 on another
+    is a feature worth trusting to 3."""
+    verdict: str = ""
+    """The sensor's verdict, carried along so the pick-list can show it."""
+    usable: bool = True
+    """Whether this nominal should be used at all.
+
+    ``False`` where the sensor that measures the feature was convicted. Note what
+    that does and does not mean: a suspect verdict says the transform and the
+    nominal *contradict each other*, not which of the two is wrong. So these are
+    withheld rather than condemned -- using either number before the contradiction
+    is resolved would be picking a side at random."""
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "feature": self.feature,
+            "serial": self.serial,
+            "session": self.session,
+            "nominal": list(self.nominal),
+            "sigma": self.sigma,
+            "verdict": self.verdict,
+            "usable": self.usable,
+            "note": self.note,
+        }
+
+
+def nominal_candidates(
+    claims: Sequence[SensorClaim], report: CalibrationReport
+) -> list[NominalCandidate]:
+    """Every feature in the file that could serve as a clicked point's nominal.
+
+    Ordered usable first, then by name, so the pick-list reads top-down.
+    """
+    verdicts = {v.serial: v for v in report.verdicts}
+    out: list[NominalCandidate] = []
+    for claim in claims:
+        if not claim.enabled:
+            continue
+        verdict = verdicts.get(claim.serial)
+        state = verdict.verdict if verdict else UNTESTABLE
+        usable = state in (CONSISTENT, EDGE)
+        for feature in claim.features:
+            if not feature.name:
+                continue
+            if usable and state == EDGE:
+                note = (
+                    f"the sensor that measures this sits right at the edge of its own field "
+                    f"of view ({verdict.ratio:.2f}x), so the nominal is probably sound but the "
+                    f"pairing is marginal"
+                )
+            elif usable:
+                note = f"sensor {claim.serial}, calibrated {session_key(claim)}"
+            else:
+                note = (
+                    f"withheld: this sensor's transform and this nominal contradict each other "
+                    f"({verdict.worst_feature} at {verdict.ratio:.1f}x its field of view). That "
+                    f"says one of the two is wrong, not which, so neither is safe to mark until "
+                    f"it is resolved"
+                    if verdict
+                    else "withheld: no verdict was reached for this sensor"
+                )
+            out.append(
+                NominalCandidate(
+                    feature=feature.name,
+                    serial=claim.serial,
+                    session=session_key(claim),
+                    nominal=[float(v) for v in feature.nominal],
+                    sigma=_tightest_limit(feature),
+                    verdict=state,
+                    usable=usable,
+                    note=note,
+                )
+            )
+    out.sort(key=lambda c: (not c.usable, c.feature))
+    return out
+
+
+def _tightest_limit(feature: FeatureClaim) -> float | None:
+    """The feature's own tolerance, from the file's spec limits.
+
+    Half-limits, because ``nominal_sigma`` is a one-sided tolerance while the
+    file states an upper and a lower. Returns ``None`` rather than a default when
+    the file states nothing -- ``Settings.sigma_nominal`` is then the honest
+    fallback, and inventing a tolerance here would dress a guess as a measurement.
+    """
+    halves: list[float] = []
+    for usl, lsl in feature.limits:
+        for value in (usl, lsl):
+            if value is not None and abs(float(value)) > 1e-9:
+                halves.append(abs(float(value)))
+    return min(halves) if halves else None

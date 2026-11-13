@@ -662,6 +662,18 @@ none, and the displaced one was located at **44 mm against the 40 mm injected**.
 That last case is the useful one: a body found strongly a few centimetres off is
 a measured correction to the calibration, not a failed check.
 
+**Marking is faster with the file open.** A cell this size names a dozen or more
+features with part-space coordinates already in it, and the import offers them in
+the Points panel as a list to pick from — choose `LH_CP_76` and its coordinate,
+its own tolerance from the file's spec limits, and a record of where it came from
+all arrive together. Forty-two numbers typed by hand is forty-two chances to
+transpose a digit, and a transposed digit in a nominal does not read as a mistake:
+it reads as a part that is out of tolerance. Features whose sensor was convicted
+are listed too, disabled, with the reason — that verdict says one of the
+transform and the nominal is wrong without saying which, so neither is safe to
+mark until it is resolved, and hiding the feature would only invite someone to
+type the number in anyway.
+
 **Where this contradicts the file, that is the output.** A sensor the file calls
 consistent that no photograph can find, or one the file convicts that every
 photograph finds exactly where it claims — meaning the feature nominal is wrong
