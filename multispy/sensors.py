@@ -1277,3 +1277,183 @@ def aim_consensus(
         distances={c.serial: float(x) for c, x in zip(live, d)},
         n_front=int((along < 0).sum()),
     )
+
+
+# ------------------------------------------------- putting them in the project
+
+
+@dataclass
+class PlacementReport:
+    """What an import actually put into the project, and what it left out."""
+
+    placed: list[str] = field(default_factory=list)
+    skipped: dict[str, str] = field(default_factory=dict)
+    """Serial -> why, for every sensor not placed. Populated rather than silent:
+    a sensor missing from the scene with no reason given is indistinguishable
+    from one the importer never saw."""
+    templates: dict[str, str] = field(default_factory=dict)
+    """Part number -> template id. One template per sensor model, many instances,
+    which is what ``ObjectTemplate`` exists for -- ten identical sensors share one
+    body, so measuring that body once pins all ten placements."""
+    instances: list[str] = field(default_factory=list)
+    messages: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "placed": list(self.placed),
+            "skipped": dict(self.skipped),
+            "templates": dict(self.templates),
+            "instances": list(self.instances),
+            "messages": list(self.messages),
+        }
+
+
+def place_sensors(
+    project: Any,
+    claims: Sequence[SensorClaim],
+    report: CalibrationReport,
+    *,
+    depth_axis: int | None = None,
+    sign: float = 1.0,
+    mesh_for: Callable[[str], str | None] | None = None,
+    model_frame: np.ndarray | None = None,
+    include: Sequence[str] = (CONSISTENT, EDGE),
+    lock: bool = False,
+) -> PlacementReport:
+    """Turn the sensors that survived judgement into bodies in the scene.
+
+    A sensor with a position and an orientation *is* an
+    :class:`~multispy.project.ObjectInstance`, so nothing new is needed to hold
+    one -- which is the point. The pose lands in the project with a ``calibrated``
+    provenance naming its session, so that nothing downstream mistakes an
+    imported claim for a pose this project measured, and so a solve keeps it
+    rather than discarding it as stale.
+
+    **Only the sensors that passed are placed, by default.** Importing a transform
+    the report has just convicted would put a body half a metre from where it is
+    and then invite the photographs to disagree with it, which wastes the one
+    referee that could have settled the question. The convicted ones are listed in
+    ``skipped`` with their reason instead of vanishing.
+
+    **Two assumptions this makes, neither yet verified.** The first is the sign of
+    the range axis: whether the body sits a standoff in front of its field of view
+    centre or behind it. The file cannot settle that -- it is exactly as consistent
+    either way, and an attempt to infer it from geometry was removed from this
+    module because the test could never fire. A sensor's own feature sits at its
+    field of view centre, so the wrong sign places the body exactly one standoff
+    below it and never more, which no threshold can catch. It takes one
+    photograph.
+
+    The second is that the CAD body's own local axes are the calibration's local
+    axes. They agree on
+    which axis is the range direction -- measured independently, the body is
+    longer along it in proportion to the standoff -- but nothing yet establishes
+    that they agree on its *sign*, or on the roll about it. Pass ``model_frame``
+    to correct that once it is known; a photograph shows it in one look, since a
+    wrong sign puts the body an equal distance the wrong side of the part and a
+    wrong roll leaves it in the right place facing the wrong way. Until then this
+    places bodies in approximately the right places and makes no claim about their
+    orientation beyond the range axis.
+
+    ``lock`` makes every placed body define the world frame. Off by default and
+    deliberately so: locking imported poses is what turns this from evidence into
+    an assumption, and if those poses then become the thing a fit is judged
+    against, the fit has proved nothing. Lock a body only once something
+    independent has confirmed it.
+    """
+    from .project import ObjectInstance, ObjectTemplate
+
+    out = PlacementReport()
+    axis = depth_axis if depth_axis is not None else infer_depth_axis(claims).axis
+    out.messages.append(
+        f"the range axis is assumed to point {'at' if sign > 0 else 'away from'} the part, "
+        f"which is an assumption and not a finding. The file is exactly as self-consistent "
+        f"either way -- a body one standoff either side of its field of view is the same claim "
+        f"twice -- so nothing in it, and nothing in any residual, can separate them. Draw one "
+        f"body over a photograph: a wrong sign puts it an equal distance the wrong side of the "
+        f"part, which is unmissable the first time it is drawn"
+    )
+    verdicts = {v.serial: v for v in report.verdicts}
+    scale = float(getattr(project, "nominal_scale", 0.001)) or 0.001
+    correction = np.eye(3) if model_frame is None else np.asarray(model_frame, dtype=float)
+
+    for claim in claims:
+        if not claim.enabled:
+            out.skipped[claim.serial] = "disabled in the import"
+            continue
+        verdict = verdicts.get(claim.serial)
+        if verdict is None:
+            out.skipped[claim.serial] = "no verdict was reached for it"
+            continue
+        if verdict.verdict not in include:
+            # Built from the fields rather than sliced out of the prose. Cutting
+            # the reason at its first full stop truncated "lands 7.5x outside..."
+            # to "lands 7", because a decimal point is a full stop.
+            out.skipped[claim.serial] = (
+                f"{verdict.verdict}: {verdict.worst_feature} at {verdict.ratio:.1f}x its "
+                f"field of view"
+                if verdict.worst_feature
+                else verdict.verdict
+            )
+            continue
+
+        part = claim.part_number or "sensor"
+        template_id = out.templates.get(part)
+        if template_id is None:
+            template_id = _ensure_template(
+                project, ObjectTemplate, part, mesh_for(part) if mesh_for else None
+            )
+            out.templates[part] = template_id
+
+        instance_id = f"sensor_{claim.serial}"
+        existing = next((o for o in project.instances if o.id == instance_id), None)
+        inst = existing or ObjectInstance(id=instance_id, template=template_id)
+        inst.template = template_id
+        inst.label = f"{claim.serial} ({part})"
+        inst.R = claim.R @ correction
+        inst.t = claim.position(axis, sign=sign) * scale
+        inst.calibrated = session_key(claim)
+        inst.locked = bool(lock)
+        if existing is None:
+            project.instances.append(inst)
+        out.placed.append(claim.serial)
+        out.instances.append(instance_id)
+
+    if out.skipped:
+        out.messages.append(
+            f"{len(out.skipped)} sensor(s) were not placed: "
+            + "; ".join(f"{k} ({v})" for k, v in sorted(out.skipped.items()))
+        )
+    if out.placed:
+        out.messages.append(
+            f"{len(out.placed)} sensor bodies placed from the calibration file, carrying their "
+            f"session as provenance. Their orientation assumes the CAD's local axes are the "
+            f"calibration's -- confirmed only for which axis is the range direction, not for "
+            f"its sign or the roll about it, so check one body against a photograph before "
+            f"trusting any angle"
+        )
+    if lock:
+        out.messages.append(
+            "these bodies are locked, so they now define the world frame. Nothing measured in "
+            "this project can contradict them any more, which means the solve can no longer be "
+            "used as evidence that the calibration was right"
+        )
+    return out
+
+
+def _ensure_template(project: Any, cls: Any, part: str, mesh_path: str | None) -> str:
+    """One template per sensor model, reused across every instance of it."""
+    template_id = f"tpl_{re.sub(r'[^A-Za-z0-9_-]', '_', part)}"
+    existing = project.templates.get(template_id)
+    if existing is not None:
+        if mesh_path and not existing.mesh_path:
+            existing.mesh_path = mesh_path
+        return template_id
+    project.templates[template_id] = cls(
+        id=template_id,
+        name=part,
+        mesh_path=mesh_path,
+        units="mm",
+        unit_scale=0.001,
+    )
+    return template_id

@@ -291,6 +291,27 @@ class ObjectInstance:
     body needs a flag of its own. The pose still moves with the scene when the
     coordinates are re-expressed, and anchors still override it: three anchors
     in two photos measure the pose far better than an eye can judge it."""
+    calibrated: str = ""
+    """This pose came out of a sensor calibration file, and this says which one.
+
+    The third provenance, beside ``locked`` and ``manual``, and it exists for the
+    same reason they do: everything downstream has to know where a pose came
+    from. A calibrated pose is not a measurement this project made, it is a claim
+    imported from a document that :mod:`multispy.sensors` has already shown can
+    be wrong by half a metre -- so it must never be mistaken for a solved pose,
+    and a solve must not silently discard it either.
+
+    It holds the calibration session rather than a bare ``True`` because that is
+    the unit the faults come in: sensors calibrated in one sitting share whatever
+    was wrong with that setup, so being able to see at a glance which bodies in
+    the scene came from the same morning is worth the extra string.
+
+    The circularity this guards is the one ``uncertainty.py`` names. Imported
+    poses make excellent nominals -- they are spread across the whole cell, which
+    is exactly what shortens the lever arm on the origin -- but a fit judged by
+    how well it met nominals taken from the thing being judged has proved
+    nothing. Keeping the provenance means a report can say which bodies are
+    evidence and which are assumptions."""
 
 
 @dataclass
@@ -895,6 +916,7 @@ class Project:
                     "label": o.label,
                     "locked": o.locked,
                     "manual": o.manual,
+                    "calibrated": o.calibrated,
                     "is_part": o.is_part,
                     "R": o.R.tolist() if o.R is not None else None,
                     "t": o.t.tolist() if o.t is not None else None,
@@ -1024,6 +1046,7 @@ class Project:
                 label=raw.get("label", ""),
                 locked=bool(raw.get("locked", False)),
                 manual=bool(raw.get("manual", False)),
+                calibrated=str(raw.get("calibrated", "") or ""),
                 is_part=bool(raw.get("is_part", False)),
             )
             if raw.get("R") is not None:

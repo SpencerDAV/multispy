@@ -36,6 +36,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from multispy.calibfile import read_export
+from multispy.project import Project
 from multispy.sensors import (
     CONSISTENT,
     EDGE,
@@ -50,6 +51,7 @@ from multispy.sensors import (
     euler_matrix,
     fault_catalogue,
     infer_depth_axis,
+    place_sensors,
     quaternion_matrix,
     quaternion_scalar_position,
     session_key,
@@ -573,6 +575,137 @@ def test_too_few_sensors_refuses_a_consensus_verdict():
     assert not got.ok
     assert str(MIN_CONSENSUS_SENSORS) in got.reason, (
         "the refusal does not say how many sensors would be enough"
+    )
+
+
+# --------------------------------------------- putting them into the project
+
+
+def test_only_the_sensors_that_passed_are_placed():
+    """Importing a transform the report has just convicted would put a body half a
+    metre from where it is and then invite the photographs to disagree with it,
+    wasting the one referee that could have settled the question."""
+    cell = healthy_cell(5)
+    centre = np.array([7000.0, 0.0, 600.0])
+    cell.sensor("BAD", centre, features=[centre], shift=np.array([-900.0, 0.0, 0.0]))
+    imp = cell.read()
+    report = diagnose(imp.sensors, tol=TOL, warn=WARN)
+
+    project = Project(name="t")
+    placed = place_sensors(project, imp.sensors, report)
+    assert "BAD" not in placed.placed
+    assert "BAD" in placed.skipped
+    assert len(placed.placed) == 5 and len(project.instances) == 5
+    # The reason is built from fields, not sliced out of prose: an earlier version
+    # cut "lands 7.5x outside..." at its first full stop and said "lands 7".
+    assert "x its field of view" in placed.skipped["BAD"], placed.skipped["BAD"]
+
+
+def test_a_placed_sensor_carries_its_session_as_provenance():
+    """Nothing downstream may mistake an imported claim for a pose this project
+    measured, and a solve must not discard it as stale either."""
+    cell = healthy_cell(4)
+    imp = cell.read()
+    report = diagnose(imp.sensors, tol=TOL, warn=WARN)
+    project = Project(name="t")
+    place_sensors(project, imp.sensors, report)
+    assert project.instances
+    for inst in project.instances:
+        assert inst.calibrated, f"{inst.id} was placed with no provenance"
+        assert "/" in inst.calibrated, f"provenance {inst.calibrated!r} is not a session"
+        assert not inst.locked, "imported poses must not define the frame by default"
+
+
+def test_placed_poses_round_trip_through_the_project_file():
+    cell = healthy_cell(4)
+    imp = cell.read()
+    project = Project(name="t")
+    place_sensors(project, imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+    back = Project.from_dict(project.to_dict())
+    before = {i.id: i for i in project.instances}
+    after = {i.id: i for i in back.instances}
+    assert set(before) == set(after)
+    for key, inst in before.items():
+        assert np.allclose(inst.t, after[key].t)
+        assert np.allclose(inst.R, after[key].R)
+        assert inst.calibrated == after[key].calibrated, "provenance was lost on the round trip"
+
+
+def test_the_pose_lands_a_standoff_from_the_field_of_view_centre():
+    """The one geometric claim the placement makes, and it is checkable."""
+    cell = healthy_cell(4)
+    imp = cell.read()
+    project = Project(name="t")
+    place_sensors(project, imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+    scale = project.nominal_scale
+    for claim in imp.sensors:
+        inst = next(i for i in project.instances if i.id == f"sensor_{claim.serial}")
+        gap = float(np.linalg.norm(inst.t / scale - claim.cfov))
+        assert abs(gap - claim.standoff) < 1.0, (
+            f"{claim.serial} was placed {gap:.1f} from its field of view centre, not the "
+            f"{claim.standoff:.0f} it declares"
+        )
+
+
+def test_one_template_per_sensor_model_not_per_sensor():
+    """Ten identical sensors share one body, which is what ObjectTemplate is for."""
+    cell = Cell()
+    for i in range(4):
+        centre = np.array([5000.0 + 400.0 * i, 0.0, 600.0])
+        cell.sensor(f"A{i}", centre, features=[centre], part="917-4012")
+    for i in range(2):
+        centre = np.array([6800.0 + 400.0 * i, 0.0, 600.0])
+        cell.sensor(f"B{i}", centre, features=[centre], part="917-4008", standoff=400.0)
+    imp = cell.read()
+    project = Project(name="t")
+    placed = place_sensors(project, imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+    assert len(placed.templates) == 2, f"made {len(placed.templates)} templates for 2 models"
+    assert len(project.templates) == 2
+    assert len(project.instances) == 6
+
+
+def test_importing_twice_updates_rather_than_duplicates():
+    cell = healthy_cell(4)
+    imp = cell.read()
+    report = diagnose(imp.sensors, tol=TOL, warn=WARN)
+    project = Project(name="t")
+    place_sensors(project, imp.sensors, report)
+    first = len(project.instances)
+    place_sensors(project, imp.sensors, report)
+    assert len(project.instances) == first, "a second import doubled the bodies in the scene"
+
+
+def test_locking_imported_poses_says_what_it_costs():
+    """Locking is what turns this from evidence into an assumption."""
+    cell = healthy_cell(4)
+    imp = cell.read()
+    project = Project(name="t")
+    placed = place_sensors(project, imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN),
+                           lock=True)
+    assert all(i.locked for i in project.instances)
+    assert any("no longer be used as evidence" in m for m in placed.messages), (
+        "locking imported poses did not warn that it destroys the independence of the check"
+    )
+
+
+def test_the_range_axis_sign_is_declared_as_an_assumption():
+    """It cannot be inferred, so it has to be announced.
+
+    A body one standoff either side of its field of view centre is the same claim
+    twice: the file is exactly as self-consistent either way and no residual
+    separates them. An earlier version of this module tried to infer it by
+    counting sensors that landed underground -- but a sensor's own feature sits at
+    its field of view centre, so the wrong sign places the body exactly one
+    standoff below it and never more. The check could not fire for any input,
+    which is worse than not having one, so it was removed and the assumption is
+    stated instead.
+    """
+    imp = healthy_cell(5).read()
+    project = Project(name="t")
+    placed = place_sensors(project, imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+    assert any("assumption and not a finding" in m for m in placed.messages), placed.messages
+    assert any("photograph" in m for m in placed.messages), (
+        "the assumption is stated without saying what would settle it"
     )
 
 
