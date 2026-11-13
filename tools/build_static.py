@@ -51,6 +51,7 @@ PY_MODULES = (
     "uncertainty",
     "sensors",
     "calibfile",
+    "sensorcheck",
     "export",
     "webapp",
 )

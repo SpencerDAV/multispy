@@ -36,3 +36,4 @@ Thumbs.db
 
 # Static build output (rebuilt by tools/build_static.py)
 dist/
+tests/_scratch_sensorcheck/

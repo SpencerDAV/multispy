@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import calibfile, exif, export, sensors, uncertainty
+from . import calibfile, exif, export, sensorcheck, sensors, uncertainty
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
 from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
 from .part import PartFitReport, part_fit, place_part
@@ -57,6 +57,7 @@ SHARED_ROUTES = frozenset(
         "/api/edge_revert",
         "/api/origin_uncertainty",
         "/api/check_calibration",
+        "/api/check_sensors_in_photos",
     }
 )
 """Routes :meth:`Workspace.handle` answers, and both front ends therefore share.
@@ -612,6 +613,31 @@ class Workspace:
                 "report": report.to_dict(),
                 "grade": report.grade(float(s.sensor_tol), float(s.sensor_warn)),
             }
+
+        # Asking the photographs about the bodies a calibration import placed.
+        # Its own route and not folded into the import, because it reads every
+        # photograph and builds an edge field per image -- seconds, not
+        # milliseconds -- and because the two are different claims: the import
+        # asks whether the file contradicts itself, and this asks whether the
+        # cell agrees with it.
+        if route == "/api/check_sensors_in_photos":
+            project = self.adopt(body["project"])
+            text = body.get("calibration_text") or ""
+            filed = None
+            if text:
+                imported = calibfile.read_export(text)
+                filed = sensors.diagnose(
+                    imported.sensors,
+                    tol=float(project.settings.sensor_tol),
+                    warn=float(project.settings.sensor_warn),
+                    units=project.nominal_units,
+                )
+            result = sensorcheck.check_sensors(
+                project,
+                mesh_loader=lambda path: load_mesh(path),
+                calibration=filed,
+            )
+            return {"check": result.to_dict()}
 
         if route == "/api/rig":
             project = Project.from_dict(body["project"], path=self.project.path)

@@ -632,6 +632,57 @@ reading the file and believing it stay separate actions. `sensor_tol` and
 not set the conviction threshold, which comes from each sensor's own declared
 optics.
 
+### Asking the photographs whether the sensor is really there
+
+The check above can only make the calibration file contradict itself, and two
+things are beyond it by construction: a 180° turn about the aim axis moves
+neither the sight line nor the field of view, and a transform wrong by less than
+one field of view is wrong by less than the only ruler that check has. For both,
+the photographs are the last referee.
+
+The cameras are already solved, so a body at a known pose projects into every
+photograph with no search in it — one matrix multiply per vertex. Put each
+sensor where the file says it is, draw its wireframe into every photo, and look.
+
+**The score is never the verdict.** `edgefit.py` documents measuring a chamfer
+cost converge confidently onto a bookshelf, and the photographs this was written
+for are of a tube frame where every surface is an edge. So two referees the
+score does not get to influence decide instead:
+
+| | |
+|---|---|
+| **agreement across views** | A body that is really there scores well in *every* photograph that can see it. A coincidental alignment with a piece of tube does not repeat from sixty degrees away, because the coincidence belonged to that one projection. The strong referee, and free once the geometry has run. |
+| **a null distribution per photo** | The same wireframe is scored at a spread of deliberately wrong nearby offsets, which measures what "nothing there" scores *in this photograph's own clutter*. The figure reported is a z-score against that, because a raw cost of 3 px is excellent against a wall and unremarkable against a tube frame. |
+
+Verdicts are **found**, **absent**, **displaced** and **undecided**. Measured on
+a synthetic scene with ground truth — three claimed bodies, one rendered where
+it is claimed, one rendered 40 mm away, one not rendered at all — the found
+body came back at z 5.2 with every view agreeing, the absent one at z 0.3 with
+none, and the displaced one was located at **44 mm against the 40 mm injected**.
+That last case is the useful one: a body found strongly a few centimetres off is
+a measured correction to the calibration, not a failed check.
+
+**Where this contradicts the file, that is the output.** A sensor the file calls
+consistent that no photograph can find, or one the file convicts that every
+photograph finds exactly where it claims — meaning the feature nominal is wrong
+rather than the sensor — is worth more than any number of agreeing verdicts.
+They are collected separately rather than averaged into a summary.
+
+Four limits, all of them real on this cell:
+
+- **Small in frame defeats it.** A 70 × 168 mm body at four metres is a few
+  dozen pixels, which is not enough silhouette to tell from a bracket. Under
+  25 px it reports undecided, never absent.
+- **Sensors look alike.** Every sensor of one model is the same body, so a
+  wireframe landing on the *neighbouring* sensor scores beautifully in every
+  view. Cross-view agreement cannot catch that one — the neighbour is in every
+  photo too — and only the displacement figure can.
+- **One photograph is never a verdict.** A sensor seen once is reported as seen
+  once.
+- **A confident score is not proof.** All of this is evidence that edges are
+  present where a body would put them, which is a narrower claim than the body
+  being there.
+
 **Residuals** draws observed → reprojected vectors at **×10**, since a good fit
 is otherwise invisible.
 
