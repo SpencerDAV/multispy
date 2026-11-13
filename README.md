@@ -509,6 +509,24 @@ floor of the point cloud, plus an axis gizmo. If the grid lies flat along the
 real ground in the photo and converges correctly, the solve is right. (Draw your
 vertical edges as **Z** for this to land on the ground.)
 
+Turn on **Origin** once your points carry nominals. Where the grid is anchored
+to the floor of the point cloud, this is anchored to the part: it draws the
+drawing's own zero and axes through the solved camera, labelled with the axis
+length in your nominal units. If that triad lands on the datum corner of the
+real part, the frame the nominals defined is right; if the labelled 50 mm axis
+spans half the photograph, your units are not what you think they are. It draws
+nothing until three nominal'd points, not in a straight line, pin the frame —
+before that the origin is a gauge choice and pointing at a pixel would be a
+guess. When the origin falls outside the photo it says so at the border rather
+than drawing a triad into the margin.
+
+The same toggle governs the **3D** view, where the triad replaces the plain
+origin gizmo and is drawn at the same dimension, measured from the points
+rather than from the camera spread — so the length you read while orbiting is
+the length you read on a photograph. Turn it off and the gizmo comes back: that
+one marks the solved frame, which is worth seeing in a project with no nominals
+and worth nothing more than that.
+
 **Residuals** draws observed → reprojected vectors at **×10**, since a good fit
 is otherwise invisible.
 

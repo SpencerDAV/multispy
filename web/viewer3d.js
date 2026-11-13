@@ -132,8 +132,12 @@ const Viewer3D = (() => {
     ctx.fillRect(0, 0, w, h);
   }
 
-  /** A ground grid on the world XY plane, stepped to a round number. */
-  function drawGrid(ctx, P, extent) {
+  /** A ground grid on the world XY plane, stepped to a round number.
+   *
+   *  ``hasPartOrigin`` suppresses the plain gizmo: in part space the origin is
+   *  drawn properly, with a ring and a dimension, and two triads sharing one
+   *  point would only make the honest one look like a rendering artefact. */
+  function drawGrid(ctx, P, extent, hasPartOrigin) {
     const step = Math.pow(10, Math.round(Math.log10(Math.max(extent, 1e-6) / 6)));
     const reach = step * 12;
     const cx = Math.round(state.target[0] / step) * step;
@@ -160,6 +164,7 @@ const Viewer3D = (() => {
     ctx.stroke(major);
 
     // world axis gizmo at the origin
+    if (hasPartOrigin) return step;
     for (let a = 0; a < 3; a++) {
       const end = [0, 0, 0];
       end[a] = step * 2;
@@ -177,6 +182,50 @@ const Viewer3D = (() => {
       ctx.fillText('XYZ'[a], p1.x + 4, p1.y - 4);
     }
     return step;
+  }
+
+  /* The part's own zero, once the nominals have pinned it.
+   *
+   * The gizmo above marks the solved frame's origin, which without nominals is
+   * a gauge choice -- somewhere in the middle of nothing in particular. With
+   * them it is the drawing's zero, so it is drawn the way the photo overlay
+   * draws it: longer axes, a ring on the origin, and the axis length written
+   * in the drawing's own units. Seeing the triad sit on the datum corner of
+   * the solved point cloud from any angle is the check the photographs can
+   * only make one at a time. */
+  function drawPartOrigin(ctx, P, origin) {
+    const len = origin.len;
+    const o = P.project([0, 0, 0]);
+    if (!o) return;
+
+    for (let a = 0; a < 3; a++) {
+      const end = [0, 0, 0];
+      end[a] = len;
+      const e = P.project(end);
+      if (!e) continue;
+      ctx.strokeStyle = COLOR.axis[a];
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(o.x, o.y);
+      ctx.lineTo(e.x, e.y);
+      ctx.stroke();
+      ctx.fillStyle = COLOR.axis[a];
+      ctx.font = '12px sans-serif';
+      ctx.fillText('XYZ'[a], e.x + 4, e.y - 4);
+    }
+
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(o.x, o.y, 5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.font = '11px sans-serif';
+    const caption = `0,0,0 · ${origin.L} ${origin.units} axes`;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#0b0d10cc';
+    ctx.strokeText(caption, o.x + 9, o.y + 16);
+    ctx.fillStyle = '#ffffffdd';
+    ctx.fillText(caption, o.x + 9, o.y + 16);
   }
 
   /** One batched stroke per colour -- the thing that keeps this interactive. */
@@ -250,12 +299,16 @@ const Viewer3D = (() => {
     if (!scene) return;
 
     const extent = Math.max(scene.extent || 1, 1e-6);
-    drawGrid(ctx, P, extent);
+    const partOrigin = state.mode === 'template' ? null : scene.origin;
+    drawGrid(ctx, P, extent, !!partOrigin);
 
     if (state.mode === 'template') {
       renderTemplate(ctx, P, extent);
     } else {
       renderScene(ctx, P, scene, extent);
+      // after the scene, not before it: a reference the wireframe hides is
+      // not a reference
+      if (partOrigin) drawPartOrigin(ctx, P, partOrigin);
     }
     drawLegend(ctx, P, scene);
   }
@@ -460,6 +513,7 @@ const Viewer3D = (() => {
     const lines = [
       `${(scene.cameras || []).length} photo camera(s)`,
       `${(scene.objects || []).filter((o) => o.placed).length} placed object(s)`,
+      ...(scene.origin ? ["0,0,0 is the drawing's own origin"] : []),
       'click a camera to jump to that photo',
     ];
     ctx.font = '11px sans-serif';

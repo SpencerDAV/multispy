@@ -168,7 +168,7 @@ across many photos is a mis-clicked corner — the Tie points panel flags it.
 
 ### Step 6 — Check it with your eyes
 
-Turn on **Grid** (**G**). A ground-plane grid is drawn using the solved camera.
+Turn on **Grid**. A ground-plane grid is drawn using the solved camera.
 
 This is the check no number gives you. If the grid lies flat along the box's base
 and converges correctly into the distance, the solve is right. If it skews or

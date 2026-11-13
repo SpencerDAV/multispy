@@ -39,7 +39,11 @@ const state = {
   showVP: true,
   showResid: true,
   showGrid: false,
+  showOrigin: true,
   showModels: true,
+  partFit: null,       // the latest fit report, which outlives one solve
+  partPlacement: null,
+  refine: null,        // the latest edge-alignment outcomes, per image
 };
 
 /* Anchors are keyed "<instance>/<anchor>" to match the project format, where
@@ -137,6 +141,28 @@ function objectToWorld(inst, template, local) {
 }
 
 const isPlaced = (inst) => !!(inst && inst.R && inst.t);
+
+/* ------------------------------------------------------------------ the part
+
+ * The part is the object the photographs are OF, as opposed to an object placed
+ * in the scene. Once the point nominals have put the reconstruction into the
+ * part's own coordinate frame, the part's pose is not unknown: it is the
+ * identity, because that frame was built out of the part's own drawing. So it
+ * needs no anchors, no hand placement and no search -- it draws itself in every
+ * photo the moment the cameras are solved.
+ *
+ * It is a normal instance carrying `is_part`, which is what makes the wireframe
+ * drawing, the 3D view and the save format work on it without a second code
+ * path. Everything below is about not letting it be *edited* like a placement. */
+
+const partInstance = () => instanceList().find((o) => o.is_part) || null;
+const partTemplate = () => { const i = partInstance(); return i ? templateOf(i) : null; };
+const isPartTemplate = (tid) => { const i = partInstance(); return !!i && i.template === tid; };
+const partFit = () => (state.partFit || (state.report && state.report.part_fit) || null);
+
+/** Images whose pose was moved by the edge alignment rather than by the solve. */
+const refinedImages = () =>
+  (state.project ? state.project.images : []).filter((im) => im.edge_refined);
 
 /* -------------------------------------------------------------- pose by hand
 
@@ -763,6 +789,11 @@ async function solveNow() {
       setStatus(`could not solve (${r ? r.stage : 'unknown'}) — see the Solve panel`, 'warn');
     }
     state.rig = null; // the fresh report carries its own layout
+    // Same reasoning for the part: the solve moved the very point positions the
+    // fit was measured against, so a kept fit report now describes nothing.
+    state.partFit = null;
+    state.partPlacement = null;
+    state.refine = null;
     buildFilmstrip();
     renderPanels();
     syncViewer();
@@ -1280,6 +1311,7 @@ function render() {
   ctx.strokeRect(0, 0, im.width, im.height);
 
   if (state.showGrid) drawGrid(im, z);
+  if (state.showOrigin) drawPartOrigin(im, z);
   if (state.showVP) drawVanishingRays(im, z);
   if (state.showModels) drawObjectModels(im, z);
   drawControlLines(im, z);
@@ -1370,10 +1402,14 @@ function drawControlLines(im, z) {
     const isHover = state.hover && state.hover.kind === 'line' && state.hover.index === idx;
     ctx.strokeStyle = AXIS_COLOR[ln.axis];
     ctx.lineWidth = (isHover ? 3.5 : 2) / z;
+    // dashed means flagged uncertain: still in the solve, at a wider sigma,
+    // and the first thing dropped if something has to go
+    ctx.setLineDash(ln.uncertain ? [7 / z, 5 / z] : []);
     ctx.beginPath();
     ctx.moveTo(ln.p0[0], ln.p0[1]);
     ctx.lineTo(ln.p1[0], ln.p1[1]);
     ctx.stroke();
+    ctx.setLineDash([]);
 
     // direction arrow: p0 -> p1 must point along the POSITIVE axis
     const dx = ln.p1[0] - ln.p0[0], dy = ln.p1[1] - ln.p0[1];
@@ -1450,11 +1486,17 @@ function drawObservations(im, z) {
     const err = pointErr[pid];
     const color = active ? '#ffd24a' : err > 4 ? '#e5604f' : '#4dd0e1';
     const r = (active || hot ? 8 : 6) / z;
+    // a dashed ring means the point is flagged uncertain -- the flag is on the
+    // point, so it shows in every photo the point appears in, which is the
+    // honest picture: you doubted the feature, not one view of it
+    const doubt = state.project.points.find((q) => q.id === pid)?.uncertain;
+    ctx.setLineDash(doubt ? [3.4 / z, 2.6 / z] : []);
     ctx.beginPath();
     ctx.arc(uv[0], uv[1], r, 0, Math.PI * 2);
     ctx.strokeStyle = color;
     ctx.lineWidth = (active ? 2.6 : 1.8) / z;
     ctx.stroke();
+    ctx.setLineDash([]);
     ctx.beginPath();
     ctx.arc(uv[0], uv[1], 1.4 / z, 0, Math.PI * 2);
     ctx.fillStyle = color;
@@ -1535,17 +1577,26 @@ function drawObjectModels(im, z) {
       ctx.lineTo(b.x, b.y);
     }
     const selected = inst.id === state.activeInstance;
-    ctx.strokeStyle = selected ? '#ffd24a99' : inst.locked ? '#9affc866' : '#7fd4ff66';
-    ctx.lineWidth = (selected ? 1.6 : 1.1) / z;
+    /* The part gets its own colour and a heavier line. It is not one more body
+     * among several -- it is the thing in the photograph, drawn from a pose
+     * nobody adjusted, and whether its wireframe sits on the real part is the
+     * single most informative thing on this screen. */
+    ctx.strokeStyle = inst.is_part
+      ? (selected ? '#ffb86cdd' : '#ffb86c99')
+      : selected ? '#ffd24a99' : inst.locked ? '#9affc866' : '#7fd4ff66';
+    ctx.lineWidth = (inst.is_part ? 1.8 : selected ? 1.6 : 1.1) / z;
     ctx.stroke();
 
     const center = projectWorld(im, objectToWorld(inst, template, [0, 0, 0]));
     if (center && z > 0.12) {
-      ctx.fillStyle = selected ? '#ffd24a' : '#7fd4ffaa';
+      ctx.fillStyle = inst.is_part ? '#ffb86c' : selected ? '#ffd24a' : '#7fd4ffaa';
       ctx.font = `${12 / z}px sans-serif`;
-      ctx.fillText(inst.label || inst.id, center.x + 6 / z, center.y - 6 / z);
+      const tag = inst.is_part ? `${inst.label || 'part'} — at the origin` : (inst.label || inst.id);
+      ctx.fillText(tag, center.x + 6 / z, center.y - 6 / z);
     }
-    if (selected && state.mode === 'pose') drawPoseGizmo(inst, im, z);
+    // No gizmo on the part, ever. Dragging it would be dragging the coordinate
+    // frame the nominals define, which is not an edit anyone means to make.
+    if (selected && state.mode === 'pose' && !inst.is_part) drawPoseGizmo(inst, im, z);
   }
 }
 
@@ -1667,20 +1718,33 @@ function drawAnchors(im, z) {
   }
 }
 
+/* Culled marks are drawn red and dashed rather than hidden. A cull that
+ * disappears is just data loss: the whole point of dropping a mark is to tell
+ * the user which click to go and fix, and they can only see that if the bad
+ * arrow is still on the photo, visibly distinct from the ones that counted. */
 function drawResiduals(im, z) {
   if (!state.report || !state.report.residual_lines) return;
-  ctx.strokeStyle = '#ffa23f';
   ctx.lineWidth = 1.6 / z;
-  for (const rl of state.report.residual_lines) {
-    if (rl.image !== im.id) continue;
-    const ox = rl.observed[0], oy = rl.observed[1];
-    const dx = (rl.reprojected[0] - ox) * RESIDUAL_GAIN;
-    const dy = (rl.reprojected[1] - oy) * RESIDUAL_GAIN;
-    ctx.beginPath();
-    ctx.moveTo(ox, oy);
-    ctx.lineTo(ox + dx, oy + dy);
-    ctx.stroke();
+  for (const pass of [false, true]) {   // culled ones last, so they draw on top
+    ctx.strokeStyle = pass ? '#ff4d4d' : '#ffa23f';
+    ctx.setLineDash(pass ? [4 / z, 3 / z] : []);
+    for (const rl of state.report.residual_lines) {
+      if (rl.image !== im.id || Boolean(rl.culled) !== pass) continue;
+      const ox = rl.observed[0], oy = rl.observed[1];
+      const dx = (rl.reprojected[0] - ox) * RESIDUAL_GAIN;
+      const dy = (rl.reprojected[1] - oy) * RESIDUAL_GAIN;
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(ox + dx, oy + dy);
+      ctx.stroke();
+      if (pass) {   // ring the click itself, so it is findable without the arrow
+        ctx.beginPath();
+        ctx.arc(ox, oy, 7 / z, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
   }
+  ctx.setLineDash([]);
 }
 
 /* Grid on the world XY plane, i.e. perpendicular to the Z axis -- so draw
@@ -1746,6 +1810,120 @@ function drawGrid(im, z) {
       ctx.fillText(AXIS_NAME[a], e.x + 4 / z, e.y - 4 / z);
     }
   }
+}
+
+/* The part's own origin, once the nominals have put the solve in part space.
+ *
+ * This overlay is either exactly right or has no business being drawn. Without
+ * three non-collinear nominals the solved frame's position, orientation and
+ * scale are a gauge choice -- zero is wherever the solver happened to leave it
+ * -- so putting a crosshair there and calling it the origin would be a lie
+ * with a label on it. With them, world zero *is* the drawing's zero, and
+ * seeing it land on the datum corner of the real part confirms the frame came
+ * out right in a way no residual table can. This is the question the grid
+ * cannot answer: that grid is anchored to the floor of the point cloud, not to
+ * the part.
+ *
+ * The axis length is a round number of nominal units rather than a fraction of
+ * the scene, and it is written next to the origin, so the triad doubles as a
+ * ruler: if the part is 50 mm across and the 50 mm axis spans half the photo,
+ * the units are wrong by a factor this says out loud. */
+/* How long the origin's axes are drawn, as a round 1/2/5 x 10^n of the
+ * drawing's own unit, about a sixth of the point cloud across.
+ *
+ * Deliberately measured from the points rather than from the whole scene: in
+ * the 3D view the cameras stand metres back from a part that is 80 mm across,
+ * and sizing the triad to them would quote a dimension the part has nothing
+ * to do with. Shared by both overlays so the photograph and the 3D view never
+ * put two different numbers on the same triad. */
+function partOriginAxis() {
+  const unit = nominalScale();          // world metres per nominal unit
+  const pts = state.project.points.filter((p) => p.xyz);
+  let span = 0;
+  for (let a = 0; a < 3; a++) {
+    const v = pts.map((p) => p.xyz[a]);
+    if (v.length > 1) span = Math.max(span, Math.max(...v) - Math.min(...v));
+  }
+  const target = ((span || unit * 100) / 6) / unit;
+  const pow = Math.pow(10, Math.floor(Math.log10(target || 1)));
+  const nice = [1, 2, 5, 10].map((m) => m * pow);
+  const L = nice.find((v) => v >= target) || nice[nice.length - 1];
+  return { L, len: L * unit, units: nominalUnits() };
+}
+
+function drawPartOrigin(im, z) {
+  if (!im.R) return;
+  if (!partSpaceState().ok) return;
+
+  const { L, len } = partOriginAxis();
+
+  const o = projectWorld(im, [0, 0, 0]);
+  if (!o) return;   // behind this camera: there is nothing honest to draw
+
+  // On a close-up the datum corner is often outside the frame. Say so at the
+  // edge instead of drawing a triad into the margin.
+  if (o.x < 0 || o.y < 0 || o.x > im.width || o.y > im.height) {
+    const cx = Math.min(Math.max(o.x, 10 / z), im.width - 10 / z);
+    const cy = Math.min(Math.max(o.y, 10 / z), im.height - 10 / z);
+    ctx.strokeStyle = '#ffffff99';
+    ctx.lineWidth = 1.5 / z;
+    ctx.setLineDash([3 / z, 3 / z]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, 6 / z, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#ffffff99';
+    ctx.font = `${11 / z}px sans-serif`;
+    // the marker sits on the border it went out through, so the label has to
+    // turn back into the photograph or it is written off the edge too
+    const back = o.x > im.width;
+    ctx.textAlign = back ? 'right' : 'left';
+    ctx.fillText('0,0,0 off frame',
+                 cx + (back ? -9 : 9) / z,
+                 o.y > im.height ? cy - 10 / z : cy + 4 / z);
+    ctx.textAlign = 'left';
+    return;
+  }
+
+  // Each axis is sampled rather than drawn as one segment: a short axis can
+  // still cross behind the camera, and a straight line to a wrapped point
+  // would shoot across the photograph.
+  for (let a = 0; a < 3; a++) {
+    ctx.strokeStyle = AXIS_COLOR[a];
+    ctx.lineWidth = 3 / z;
+    let prev = null;
+    ctx.beginPath();
+    for (let i = 0; i <= 24; i++) {
+      const w = [0, 0, 0];
+      w[a] = len * (i / 24);
+      const p = projectWorld(im, w);
+      if (!p) { prev = null; continue; }
+      if (prev) ctx.lineTo(p.x, p.y); else ctx.moveTo(p.x, p.y);
+      prev = p;
+    }
+    ctx.stroke();
+
+    const end = [0, 0, 0];
+    end[a] = len;
+    const e = projectWorld(im, end);
+    if (!e) continue;
+    ctx.fillStyle = AXIS_COLOR[a];
+    ctx.font = `${13 / z}px sans-serif`;
+    ctx.fillText(AXIS_NAME[a], e.x + 4 / z, e.y - 4 / z);
+  }
+
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1.5 / z;
+  ctx.beginPath();
+  ctx.arc(o.x, o.y, 5 / z, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.font = `${11 / z}px sans-serif`;
+  const caption = `0,0,0 · ${L} ${nominalUnits()} axes`;
+  ctx.lineWidth = 3 / z;
+  ctx.strokeStyle = '#000000aa';
+  ctx.strokeText(caption, o.x + 9 / z, o.y + 15 / z);
+  ctx.fillStyle = '#ffffffdd';
+  ctx.fillText(caption, o.x + 9 / z, o.y + 15 / z);
 }
 
 function drawPendingLine(z) {
@@ -2397,6 +2575,39 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'arrowleft' || k === '[') { step(-1); return; }
   if (k === 'arrowright' || k === ']') { step(1); return; }
 
+  /* U: "I could not see that clearly."
+   *
+   * On the hover target rather than on a selection, to match how Delete
+   * already works here -- point at the thing and say it. A doubtful mark is
+   * not a mark to delete: in a photo with only two lines on an axis it may be
+   * all there is, so it keeps contributing at a wider sigma and is simply
+   * first in line when the solve decides something has to go. */
+  if (k === 'u') {
+    const im = currentImage();
+    if (im && state.hover) {
+      if (state.hover.kind === 'line' || state.hover.kind === 'handle') {
+        const ln = im.axis_lines[state.hover.index];
+        if (ln) {
+          ln.uncertain = !ln.uncertain;
+          setStatus(`${AXIS_NAME[ln.axis]} line marked ${ln.uncertain ? 'uncertain' : 'confident'}`, 'ok');
+        }
+      } else if (state.hover.kind === 'obs') {
+        const pt = state.project.points.find((q) => q.id === state.hover.point);
+        if (pt) {
+          pt.uncertain = !pt.uncertain;
+          setStatus(`${pt.label || pt.id} marked ${pt.uncertain ? 'uncertain' : 'confident'}`
+                  + ` — this applies to the point in every photo`, 'ok');
+        }
+      }
+      markDirty();
+      renderPanels();
+      render();
+    } else {
+      setStatus('hover a control line or a tie point, then press U', 'warn');
+    }
+    return;
+  }
+
   if (k === 'delete' || k === 'backspace') {
     const im = currentImage();
     if (im && state.hover) {
@@ -2496,15 +2707,15 @@ function updateHint() {
   const hints = {
     lines: `Drag along an edge parallel to the <b>${AXIS_NAME[state.axis]}</b> axis. `
          + `Draw in the <b>+${AXIS_NAME[state.axis]}</b> direction — the arrow shows which way. `
-         + `Click a drawn line to reverse it, right-click to delete. `
-         + `Two per axis minimum, three is better. Keys 1/2/3 switch axis.`,
+         + `Click a drawn line to reverse it, right-click to delete, <b>U</b> to flag it `
+         + `uncertain. Two per axis minimum, three is better. Keys 1/2/3 switch axis.`,
     points: `Click the same physical feature in each photo it appears in. `
-          + `<b>N</b> starts a new point, <b>Tab</b> jumps to the next photo missing it. `
-          + `Two shared points per image pair is the minimum.`,
+          + `<b>N</b> starts a new point, <b>Tab</b> jumps to the next photo missing it, `
+          + `<b>U</b> flags one uncertain. Two shared points per image pair is the minimum.`,
     objects: objectHint,
     pose: poseHint,
     select: `Drag markers or whole control lines; click a line to reverse it. `
-          + `Right-click or Delete removes one.`,
+          + `Right-click or Delete removes one, <b>U</b> flags it uncertain.`,
   };
   $('hint').innerHTML = hints[state.mode]
     + ` &nbsp;·&nbsp; wheel zoom, space-drag pan, <b>F</b> fit`
@@ -2591,6 +2802,7 @@ function buildFilmstrip() {
 function renderPanels() {
   renderSolvePanel();
   renderImagePanel();
+  renderPartPanel();
   renderObjectsPanel();
   renderPointsPanel();
   renderConstraintsPanel();
@@ -2646,6 +2858,15 @@ function renderImagePanel() {
 
   const counts = [0, 1, 2].map((a) => im.axis_lines.filter((l) => l.axis === a).length);
   $('imgcount').textContent = meta.name || im.id;
+  /* A pose moved by the edge alignment is not a pose the bundle adjustment ever
+   * agreed to, and it outlives the panel that produced it. Saying so here --
+   * where you look when you are reading this photo's residuals -- is the
+   * difference between a recorded caveat and a visible one. */
+  const refinedNote = im.edge_refined
+    ? `<div class="note">This camera's pose was moved by the edge alignment, not by the solve. `
+      + `Its residuals below are against that pose. `
+      + `<button class="smallbtn" id="imgrefineundo">put the solved pose back</button></div>`
+    : '';
 
   let html = `<div class="axiscounts">` + counts.map((c, a) =>
     `<div class="${['x','y','z'][a]} ${c < 2 ? 'short' : ''}">${AXIS_NAME[a]} ${c}</div>`
@@ -2660,6 +2881,7 @@ function renderImagePanel() {
     html += `<div class="row"><span class="k">line RMS</span><span class="v">${rep.line_rms_px.toFixed(2)} px</span></div>`;
   }
   for (const n of (rep && rep.notes) || []) html += `<div class="note">${escapeHtml(n)}</div>`;
+  html += refinedNote;
 
   html += `<div class="row" style="margin-top:7px"><span class="k">camera group</span>`
         + `<input type="text" id="grpname" value="${escapeHtml(im.group)}" style="width:90px"></span></div>`;
@@ -2728,6 +2950,8 @@ function renderImagePanel() {
   };
   $('clearlines').onclick = () => { im.axis_lines = []; markDirty(); renderPanels(); render(); };
   $('removeimg').onclick = () => removeImage(im.id);
+  const undoOne = $('imgrefineundo');
+  if (undoOne) undoOne.onclick = () => revertEdges([im.id]);
   scheduleExif();
 }
 
@@ -2886,13 +3110,126 @@ function renderObservability(d) {
   panel.innerHTML = html;
 }
 
+/* ------------------------------------------------------------ nominals
+ *
+ * A nominal is what the drawing says, as opposed to what the photographs say.
+ * Give three or more points their drawing coordinates and the reconstruction
+ * stops floating in an arbitrary frame and lands in the part's own -- which is
+ * the only frame in which "does the CAD model fit?" is a question with an
+ * answer.
+ *
+ * Typed in the project's nominal units, not metres, because that is what is
+ * written on the drawing. */
+
+const nominalUnits = () => (state.project.nominal_units || 'mm');
+const nominalScale = () => (state.project.nominal_scale || UNIT_SCALES[nominalUnits()] || 0.001);
+
+const seenIn = (pid) => state.project.images.filter((i) => pid in i.observations).length;
+
+function hasNominal(p) {
+  return Array.isArray(p.nominal) && p.nominal.length === 3
+      && p.nominal.some((v) => v !== null && v !== undefined);
+}
+
+/* How far this point ended up from where the drawing put it, in nominal units.
+ * Read out of the constraint report rather than recomputed, so the number on
+ * screen is the one the solver actually answered. */
+function nominalMiss(pid) {
+  const rep = state.report && state.report.constraints;
+  if (!rep) return null;
+  const rows = rep.filter((c) => c.source === 'nominal' && c.applied && c.points[0] === pid);
+  if (rows.length !== 3) return null;
+  const d = rows.map((c) => c.error / nominalScale());
+  return { d, mag: Math.hypot(d[0], d[1], d[2]), sigmas: Math.max(...rows.map((c) => c.sigmas_off)) };
+}
+
+/* Count of nominal'd points, and whether they actually pin a frame. Mirrors
+ * Project.in_part_space() -- three points in a straight line are three points
+ * and still leave a rotation free. */
+function partSpaceState() {
+  const nom = state.project.points.filter(hasNominal);
+  if (nom.length < 3) return { n: nom.length, ok: false };
+  const P = nom.map((p) => p.nominal.map(Number));
+  const c = [0, 1, 2].map((k) => P.reduce((s, q) => s + q[k], 0) / P.length);
+  // rank-2 test by the largest cross product of centred positions
+  const V = P.map((q) => [q[0] - c[0], q[1] - c[1], q[2] - c[2]]);
+  let best = 0;
+  for (let i = 0; i < V.length; i++) {
+    for (let j = i + 1; j < V.length; j++) {
+      const a = V[i], b = V[j];
+      best = Math.max(best, Math.hypot(
+        a[1]*b[2] - a[2]*b[1], a[2]*b[0] - a[0]*b[2], a[0]*b[1] - a[1]*b[0]));
+    }
+  }
+  return { n: nom.length, ok: best > 1e-9 };
+}
+
+/* ---------------------------------------------------------- folding
+ *
+ * Remembered rather than reset each load: a project with four models is one
+ * very tall sidebar, and re-collapsing the three you are not working on every
+ * time you reopen it is the kind of small tax that makes a tool tiring. Keyed
+ * by project name so two projects do not share one layout. */
+
+const FOLD_KEY = () => `multispy.folded.${state.project.name || 'untitled'}`;
+let foldedSet = null;
+
+function foldState() {
+  if (foldedSet === null) {
+    try {
+      foldedSet = new Set(JSON.parse(localStorage.getItem(FOLD_KEY()) || '[]'));
+    } catch (e) {
+      foldedSet = new Set();   // private window, blocked storage: fold nothing
+    }
+  }
+  return foldedSet;
+}
+
+const isFolded = (key) => foldState().has(key);
+
+function setFolded(key, folded) {
+  const s = foldState();
+  if (folded) s.add(key); else s.delete(key);
+  try {
+    localStorage.setItem(FOLD_KEY(), JSON.stringify([...s]));
+  } catch (e) { /* nothing to do; the fold still applies for this session */ }
+}
+
+function toggleFold(key) {
+  setFolded(key, !isFolded(key));
+}
+
+/* Section headers are in the static markup, so they are wired once and their
+ * state re-applied rather than re-rendered. */
+function initSectionFolding() {
+  for (const sec of document.querySelectorAll('#panel .section')) {
+    const h = sec.querySelector('h3');
+    if (!h) continue;
+    const key = 'sec:' + (sec.querySelector('.inner')?.id || h.textContent.trim());
+    sec.classList.toggle('folded', isFolded(key));
+    h.addEventListener('click', () => {
+      toggleFold(key);
+      sec.classList.toggle('folded', isFolded(key));
+    });
+  }
+}
+
 function renderPointsPanel() {
   const im = currentImage();
   const el = $('ptpanel');
   const pts = state.project.points;
   $('ptcount').textContent = `${pts.length}`;
 
-  let html = `<div style="display:flex;gap:5px;margin-bottom:6px">`
+  const ps = partSpaceState();
+  let html = '';
+  if (ps.n) {
+    html += ps.ok
+      ? `<div class="note good">In part space — ${ps.n} nominal'd point(s) fix the origin, `
+        + `orientation and scale. A CAD model of the part belongs at the identity.</div>`
+      : `<div class="note">${ps.n} nominal'd point(s). Three or more, not in a straight line, `
+        + `put the solve into the part's own frame.</div>`;
+  }
+  html += `<div style="display:flex;gap:5px;margin-bottom:6px">`
            + `<button class="smallbtn" id="newpt">new point (N)</button>`
            + `<button class="smallbtn" id="nextmissing">next missing (Tab)</button></div>`
            + `<label class="toggle" style="margin-bottom:6px"><input type="checkbox" id="autoadv"`
@@ -2908,10 +3245,19 @@ function renderPointsPanel() {
       const here = im && p.id in im.observations;
       const err = rep && rep.rms_px ? `${rep.rms_px.toFixed(1)}px` : '';
       const warn = seen < 2 ? ' hi' : (rep && rep.rms_px > 4 ? ' hi' : '');
+      const miss = nominalMiss(p.id);
+      const badges = (hasNominal(p) ? `<span class="tag nom" title="has a nominal XYZ">nom</span>` : '')
+                   + (p.uncertain ? `<span class="tag unc" title="flagged uncertain">?</span>` : '');
+      // once in part space the deviation from nominal is the interesting
+      // number, not the reprojection error -- it is the one in millimetres
+      const right = miss ? `${miss.mag.toFixed(2)}${nominalUnits()}`
+                         : (err || (seen < 2 ? 'needs 2' : ''));
+      const rwarn = miss ? (miss.sigmas > 3 ? ' hi' : '') : warn;
       html += `<div class="pt${p.id === state.activePoint ? ' sel' : ''}${here ? ' here' : ''}" data-pt="${p.id}">`
             + `<span class="swatch"></span>`
-            + `<span class="name">${escapeHtml(p.label || p.id)} <span style="color:var(--text-dim)">${seen}img</span></span>`
-            + `<span class="err${warn}">${err || (seen < 2 ? 'needs 2' : '')}</span></div>`;
+            + `<span class="name">${escapeHtml(p.label || p.id)} ${badges}`
+            +   `<span style="color:var(--text-dim)">${seen}img</span></span>`
+            + `<span class="err${rwarn}">${right}</span></div>`;
     }
     html += '</div>';
     if (state.activePoint) {
@@ -2919,7 +3265,59 @@ function renderPointsPanel() {
       if (ap) {
         html += `<div class="row" style="margin-top:7px"><span class="k">label</span>`
               + `<input type="text" id="ptlabel" value="${escapeHtml(ap.label)}" style="width:150px"></div>`;
+
+        html += `<label class="toggle" style="margin-top:5px"><input type="checkbox" id="ptunc"`
+              + `${ap.uncertain ? ' checked' : ''}> uncertain — I could not see this feature `
+              + `clearly (U)</label>`;
+
+        // ---- nominal XYZ
+        const nom = hasNominal(ap) ? ap.nominal : [null, null, null];
+        const u = nominalUnits();
+        html += `<div class="nomhead">`
+              +   `<span class="k">nominal (${escapeHtml(u)})</span>`
+              +   `<select id="nomunit" title="Units the nominals are typed in">`
+              +     Object.keys(UNIT_SCALES).map((k) =>
+                      `<option value="${k}"${k === u ? ' selected' : ''}>${k}</option>`).join('')
+              +   `</select>`
+              + `</div>`
+              + `<div class="nomrow">`
+              +   ['X', 'Y', 'Z'].map((ax, i) =>
+                    `<label class="nomcell"><span>${ax}</span>`
+                  + `<input type="number" step="any" class="nomval" data-axis="${i}" `
+                  + `value="${nom[i] === null || nom[i] === undefined ? '' : nom[i]}" `
+                  + `placeholder="—"></label>`).join('')
+              + `</div>`
+              + `<div class="row"><span class="k">tolerance ±</span>`
+              +   `<input type="number" step="any" id="nomtol" style="width:72px" `
+              +   `value="${ap.nominal_sigma === null || ap.nominal_sigma === undefined
+                            ? '' : ap.nominal_sigma}" `
+              +   `placeholder="${(state.project.settings.sigma_nominal ?? 0.1)}">`
+              +   `<span class="est">${escapeHtml(u)}</span></div>`;
+
+        const miss = nominalMiss(ap.id);
+        if (miss) {
+          const cls = miss.sigmas > 3 ? 'note bad' : 'msg';
+          html += `<div class="${cls}">solved ${miss.mag.toFixed(3)} ${escapeHtml(u)} from nominal `
+                + `(X ${miss.d[0] >= 0 ? '+' : ''}${miss.d[0].toFixed(3)}, `
+                + `Y ${miss.d[1] >= 0 ? '+' : ''}${miss.d[1].toFixed(3)}, `
+                + `Z ${miss.d[2] >= 0 ? '+' : ''}${miss.d[2].toFixed(3)}) `
+                + `— ${miss.sigmas.toFixed(1)}× the stated tolerance</div>`;
+        } else if (hasNominal(ap)) {
+          html += `<div class="msg">solve to see how far this landed from its nominal</div>`;
+        }
+        // Two rays cross in exactly one place, so a two-view point fits its
+        // photos perfectly wherever the nominal puts it. The deviation readout
+        // above will say 0.000 whatever the drawing claims, which looks like
+        // agreement and is actually the absence of a test.
+        if (hasNominal(ap) && seenIn(ap.id) < 3) {
+          html += `<div class="note">marked in only ${seenIn(ap.id)} photo(s). A point seen `
+                + `twice sits wherever its two rays cross and fits both exactly, so this `
+                + `nominal steers the solve but nothing can check it. Mark it in a third `
+                + `photo.</div>`;
+        }
+
         html += `<div style="display:flex;gap:5px;margin-top:5px">`
+              + (hasNominal(ap) ? `<button class="smallbtn" id="clearnom">clear nominal</button>` : '')
               + `<button class="smallbtn" id="delpt">delete point</button></div>`;
       }
     }
@@ -2939,6 +3337,50 @@ function renderPointsPanel() {
   };
   const del = $('delpt');
   if (del) del.onclick = () => { deletePoint(state.activePoint); renderPanels(); render(); };
+
+  const unc = $('ptunc');
+  if (unc) unc.onchange = (e) => {
+    const ap = pts.find((p) => p.id === state.activePoint);
+    if (ap) { ap.uncertain = e.target.checked; markDirty(); renderPanels(); render(); }
+  };
+
+  for (const inp of el.querySelectorAll('.nomval')) {
+    inp.onchange = (e) => {
+      const ap = pts.find((p) => p.id === state.activePoint);
+      if (!ap) return;
+      if (!Array.isArray(ap.nominal) || ap.nominal.length !== 3) ap.nominal = [null, null, null];
+      const raw = e.target.value.trim();
+      ap.nominal[+e.target.dataset.axis] = raw === '' ? null : Number(raw);
+      // all three cleared means no nominal at all, not a nominal of nothing
+      if (ap.nominal.every((v) => v === null)) ap.nominal = null;
+      markDirty(); renderPanels(); render();
+    };
+  }
+
+  const tol = $('nomtol');
+  if (tol) tol.onchange = (e) => {
+    const ap = pts.find((p) => p.id === state.activePoint);
+    if (!ap) return;
+    const raw = e.target.value.trim();
+    ap.nominal_sigma = raw === '' ? null : Number(raw);
+    markDirty(); renderPanels();
+  };
+
+  const nu = $('nomunit');
+  if (nu) nu.onchange = (e) => {
+    // the numbers stay as typed; what changes is what they mean. Saying so is
+    // the difference between a unit switch and a silent 1000x on the datum.
+    state.project.nominal_units = e.target.value;
+    state.project.nominal_scale = UNIT_SCALES[e.target.value];
+    setStatus(`nominals are now read as ${e.target.value} — the typed numbers did not change`, 'ok');
+    markDirty(); renderPanels(); render();
+  };
+
+  const cn = $('clearnom');
+  if (cn) cn.onclick = () => {
+    const ap = pts.find((p) => p.id === state.activePoint);
+    if (ap) { ap.nominal = null; ap.nominal_sigma = null; markDirty(); renderPanels(); render(); }
+  };
 }
 
 /* --------------------------------------------------------- known objects
@@ -2965,7 +3407,8 @@ function renderObjectsPanel() {
   const el = $('objpanel');
   const tpls = Object.entries(templates());
   const objs = instanceList();
-  $('objcount').textContent = objs.length ? `${objs.length}` : '';
+  $('objcount').textContent = objs.filter((o) => !o.is_part).length
+    ? `${objs.filter((o) => !o.is_part).length}` : '';
 
   let html = '';
 
@@ -2979,9 +3422,16 @@ function renderObjectsPanel() {
     const mesh = state.meshes.get(tid);
     const sel = tid === state.activeTemplate;
     const anchors = t.anchors || [];
-    html += `<div class="tpl${sel ? ' sel' : ''}" data-tpl="${escapeHtml(tid)}">`
-          + `<div class="tplhead"><b>${escapeHtml(t.name || tid)}</b>`
-          + `<span class="est">${anchors.length} anchor(s)</span></div>`;
+    const nInst = objs.filter((o) => o.template === tid).length;
+    html += `<div class="tpl${sel ? ' sel' : ''}${isFolded('tpl:' + tid) ? ' folded' : ''}" `
+          +   `data-tpl="${escapeHtml(tid)}">`
+          // the header stays readable folded, so a collapsed card still says
+          // what it is and how far along it is
+          + `<div class="tplhead" data-fold="tpl:${escapeHtml(tid)}">`
+          +   `<b>${escapeHtml(t.name || tid)}</b>`
+          +   `<span class="est">${anchors.length} anchor(s)`
+          +     `${nInst ? ` · ${nInst} object(s)` : ''}</span></div>`
+          + `<div class="tplbody">`;
 
     if (mesh === null) {
       html += `<div class="msg">loading model…</div>`;
@@ -3073,15 +3523,27 @@ function renderObjectsPanel() {
           + `<button class="smallbtn" data-typed="${escapeHtml(tid)}">type a position…</button>`
           + `<button class="smallbtn" data-optical="${escapeHtml(tid)}">${o ? 'edit' : 'set'} optical</button>`
           + `<button class="smallbtn" data-newobj="${escapeHtml(tid)}">+ object</button>`
+          // The part is a different kind of thing from a placed object, so the
+          // button says so rather than reading as one more placement.
+          + (isPartTemplate(tid)
+              ? `<button class="smallbtn" data-setpart="" title="Go back to treating this as an `
+                + `ordinary placed object">is the part ✓</button>`
+              : `<button class="smallbtn" data-setpart="${escapeHtml(tid)}" title="This is the `
+                + `object being photographed, not something placed in the scene. In part space it `
+                + `goes in at the origin with no anchors.">this is the part</button>`)
           + `<button class="smallbtn" data-deltpl="${escapeHtml(tid)}">remove model</button>`
-          + `</div></div>`;
+          + `</div></div></div>`;
   }
 
   html += `<button class="smallbtn" id="addmodel" style="width:100%">+ add model (OBJ / STL / PLY)</button>`;
 
-  if (objs.length) {
+  // The part is listed in its own panel, not here: it has no anchors to count,
+  // no pose to clear and no shape error to read, so every column in this table
+  // would be blank or misleading for it.
+  const placedObjs = objs.filter((o) => !o.is_part);
+  if (placedObjs.length) {
     html += `<div class="objlist" style="margin-top:7px">`;
-    for (const inst of objs) {
+    for (const inst of placedObjs) {
       const rep = state.report && state.report.instances ? state.report.instances[inst.id] : null;
       const placed = isPlaced(inst);
       const shape = rep && rep.placed ? `${(rep.shape_rms * 1000).toFixed(1)}mm` : '';
@@ -3160,9 +3622,27 @@ function renderObjectsPanel() {
 function wireObjectsPanel(el) {
   $('addmodel').onclick = () => $('modelinput').click();
 
+  for (const btn of el.querySelectorAll('[data-setpart]')) {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      designatePart(btn.dataset.setpart || null);
+    };
+  }
+
+  // The header folds the card; clicking anywhere else in it still selects the
+  // model, so folding never costs you the selection you were about to make.
+  for (const head of el.querySelectorAll('.tplhead[data-fold]')) {
+    head.onclick = (ev) => {
+      ev.stopPropagation();
+      state.activeTemplate = head.parentElement.dataset.tpl;
+      toggleFold(head.dataset.fold);
+      renderObjectsPanel();
+      syncViewer();
+    };
+  }
   for (const card of el.querySelectorAll('.tpl[data-tpl]')) {
     card.onclick = (ev) => {
-      if (ev.target.closest('button, select, input, .an')) return;
+      if (ev.target.closest('button, select, input, .an, .tplhead')) return;
       state.activeTemplate = card.dataset.tpl;
       renderObjectsPanel();
       syncViewer();
@@ -3398,6 +3878,309 @@ function renameAnchor(raw) {
   markDirty();
   renderPanels();
   syncViewer();
+  render();
+}
+
+
+/* ------------------------------------------------------------- the part panel
+ *
+ * Two features share this panel because they are two halves of one question:
+ * "does the CAD model agree with the photographs?" The fit report answers it in
+ * numbers, and the projected wireframe answers it by eye -- and the second is
+ * the one that catches a body placed half a turn out, which no number does.
+ */
+
+const PART_DEV_WARN = 1.0;
+/* Deviation, in nominal units, past which a row is coloured. Deliberately a
+ * fixed figure and not derived from the tolerances: a nominal's tolerance is
+ * what the solve was *told*, and colouring by it would mean a slack tolerance
+ * painted a bad fit green. */
+
+function renderPartPanel() {
+  const el = $('partpanel');
+  if (!el) return;
+  const inst = partInstance();
+  const t = partTemplate();
+  const tpls = Object.entries(templates());
+  const ps = partSpaceState();
+  $('partcount').textContent = inst ? (ps.ok ? 'placed' : 'no frame') : '';
+
+  let html = '';
+
+  if (!inst) {
+    html += `<div class="empty">No model is marked as the part. A placed object needs anchors `
+          + `and a pose; <b>the part</b> needs neither — once the nominals put the solve in the `
+          + `part's own frame it sits at the origin by definition, and its wireframe lands in `
+          + `every photo with nothing marked.</div>`;
+    if (!tpls.length) {
+      html += `<div class="msg">Add the part's CAD model in <b>Known objects</b> below first.</div>`;
+    } else {
+      html += `<div style="display:flex;gap:4px;flex-wrap:wrap">`
+            + tpls.map(([tid, tp]) =>
+                `<button class="smallbtn" data-setpart="${escapeHtml(tid)}">`
+                + `use “${escapeHtml(tp.name || tid)}”</button>`).join('')
+            + `</div>`;
+    }
+    el.innerHTML = html;
+    wirePartPanel(el);
+    return;
+  }
+
+  html += `<div class="row"><span class="k">model</span>`
+        + `<span class="v">${escapeHtml(t ? (t.name || t.id) : inst.template)}</span></div>`;
+
+  // Units first and always, agreeing or not. A factor of 1000 between the two
+  // declarations makes every number below it meaningless, and it is invisible
+  // in all of them.
+  const fit = partFit();
+  const nu = nominalUnits();
+  if (t) {
+    const agree = Math.abs((t.unit_scale || 0) - nominalScale()) < 1e-12;
+    html += `<div class="row"><span class="k">units</span>`
+          + `<span class="v${agree ? '' : ' v-poor'}">model ${escapeHtml(t.units)} · `
+          + `nominals ${escapeHtml(nu)}</span></div>`;
+    if (!agree) {
+      const ratio = (t.unit_scale || 0) / nominalScale();
+      const factor = ratio > 1 ? ratio : 1 / ratio;
+      html += `<div class="note bad">These disagree by a factor of ${factor.toPrecision(6)}×. `
+            + `Nothing has been rescaled to hide it — if one declaration is wrong, the wireframe `
+            + `lands that factor out in every photo and every deviation below is meaningless. `
+            + `A model in inches against a millimetre drawing is legitimate; a model in metres `
+            + `against one is a mistake.</div>`;
+    }
+  }
+
+  if (!ps.ok) {
+    html += `<div class="note bad">Not in part space — ${ps.n} nominal'd point(s), and it takes `
+          + `three or more that are not in a straight line. Until then the part has no known `
+          + `pose, so it is held at the origin but nothing confirms that is where it belongs. `
+          + `Type the drawing's coordinates onto three points in <b>Tie points</b>.</div>`;
+  }
+
+  if (fit && fit.ok) {
+    const bad = fit.rms_deviation > PART_DEV_WARN;
+    html += `<div class="row"><span class="k">fit to the drawing</span>`
+          + `<span class="v${bad ? ' v-poor' : ' v-good'}">`
+          + `${fit.rms_deviation.toFixed(3)} ${escapeHtml(nu)} RMS</span></div>`
+          + `<div class="row"><span class="k">off the model surface</span>`
+          + `<span class="v${fit.rms_surface > PART_DEV_WARN ? ' v-poor' : ''}">`
+          + `${fit.rms_surface.toFixed(3)} ${escapeHtml(nu)} RMS</span></div>`
+          + `<div class="row"><span class="k">worst point</span>`
+          + `<span class="v">${escapeHtml(fit.worst_point || '—')} `
+          + `(${fit.max_deviation.toFixed(3)})</span></div>`
+          + `<div class="row"><span class="k">checkable points</span>`
+          + `<span class="v${fit.n_checkable < 3 ? ' v-weak' : ''}">`
+          + `${fit.n_checkable} of ${fit.n_points}</span></div>`;
+
+    html += `<table class="rigtable" style="margin-top:6px">`
+          + `<tr><th>point</th><th>views</th><th>dev</th><th>surface</th></tr>`;
+    for (const row of fit.points) {
+      if (!row.solved || !row.solved.length) {
+        html += `<tr><td>${escapeHtml(row.point)}</td><td>${row.n_views}</td>`
+              + `<td colspan="2" class="est">not solved</td></tr>`;
+        continue;
+      }
+      // A two-view point's deviation is structurally near zero whatever the
+      // drawing says, so it is shown struck through rather than green.
+      const cls = row.deviation_mag > PART_DEV_WARN ? ' class="hi"' : '';
+      html += `<tr${row.checkable ? '' : ' style="opacity:.55"'}>`
+            + `<td>${escapeHtml(row.point)}</td>`
+            + `<td>${row.n_views}${row.checkable ? '' : '<span class="est">!</span>'}</td>`
+            + `<td${cls}>${row.deviation_mag.toFixed(3)}</td>`
+            + `<td>${Number.isFinite(row.surface_distance) ? row.surface_distance.toFixed(3) : '—'}</td>`
+            + `</tr>`;
+    }
+    html += `</table>`;
+    html += `<div class="msg">dev = how far the solve put the point from the drawing; `
+          + `surface = how far it is from the model's own geometry. A point marked in fewer `
+          + `than three photos (<b>!</b>) sits wherever its nominal puts it and checks nothing.</div>`;
+  } else if (fit && fit.stage && fit.stage !== 'no part designated') {
+    html += `<div class="msg">fit: ${escapeHtml(fit.stage)}</div>`;
+  } else {
+    html += `<div class="msg">Solve, or press <b>place from nominals</b>, to get the fit.</div>`;
+  }
+
+  for (const w of (fit && fit.warnings) || []) {
+    html += `<div class="note bad">${escapeHtml(w)}</div>`;
+  }
+
+  // ---- stage one
+  const pl = state.partPlacement;
+  html += `<div style="display:flex;gap:4px;margin-top:6px;flex-wrap:wrap">`
+        + `<button class="smallbtn" id="partplace" title="Pin the part at the origin and `
+        +   `project its wireframe into every photo. Pure geometry: no anchors, no search.">`
+        +   `place from nominals</button>`
+        + `<button class="smallbtn" id="partclear">not the part</button></div>`;
+  if (pl && pl.images && pl.images.length) {
+    const off = pl.images.filter((i) => i.positioned && !i.n_inside).length;
+    const none = pl.images.filter((i) => !i.positioned).length;
+    html += `<div class="msg">stage one: drawn in `
+          + `${pl.images.filter((i) => i.positioned && i.n_inside).length} photo(s)`
+          + `${off ? `, off-frame in ${off}` : ''}${none ? `, ${none} with no pose` : ''}.</div>`;
+  }
+
+  // ---- stage two
+  html += `<label class="toggle" title="Reads the photograph and slides the wireframe onto its `
+        + `edges. Off by default, and per image."><input type="checkbox" id="edgerefine"`
+        + `${state.project.settings.edge_refine ? ' checked' : ''}> align to image edges `
+        + `(experimental)</label>`;
+  if (state.project.settings.edge_refine) {
+    html += `<div class="note">This is a <b>recovery</b> tool, not a refinement. Measured on a `
+          + `scene with known truth: a pose a few pixels out is pulled back to about 1.5 px, but `
+          + `a pose that is already good is made <i>worse</i> — the distance transform cannot `
+          + `resolve better than half a working pixel and the bundle adjustment already does. `
+          + `So this photo's own clicked marks decide, not the edge score, and a photo with no `
+          + `marks is refused. Use it when the wireframe is visibly beside the part.</div>`;
+    const im = currentImage();
+    html += `<div style="display:flex;gap:4px;margin-top:4px;flex-wrap:wrap">`
+          + (im ? `<button class="smallbtn" id="refinethis">align ${escapeHtml(im.id)}</button>` : '')
+          + `<button class="smallbtn" id="refineall">align every photo</button>`
+          + (refinedImages().length
+              ? `<button class="smallbtn" id="refineundo">undo all `
+                + `(${refinedImages().length})</button>` : '')
+          + `</div>`;
+    const rf = state.refine;
+    if (rf && rf.results && rf.results.length) {
+      html += `<table class="rigtable" style="margin-top:6px">`
+            + `<tr><th>photo</th><th>wireframe px</th><th>marks px</th><th>outcome</th></tr>`;
+      for (const r of rf.results) {
+        const edge = Number.isFinite(r.median_before)
+          ? `${r.median_before.toFixed(1)} → ${r.median_after.toFixed(1)}` : '—';
+        const marks = r.mark_rms_before == null ? '—'
+          : `${r.mark_rms_before.toFixed(2)} → `
+            + `${(r.mark_rms_after == null ? r.mark_rms_before : r.mark_rms_after).toFixed(2)}`;
+        html += `<tr><td>${escapeHtml(r.image)}</td><td>${edge}</td>`
+              + `<td${r.accepted ? '' : ' class="hi"'}>${marks}</td>`
+              + `<td>${r.accepted ? 'kept' : escapeHtml(r.stage)}</td></tr>`;
+      }
+      html += `</table>`;
+      for (const r of rf.results) {
+        if (r.reason) html += `<div class="msg">${escapeHtml(r.image)}: ${escapeHtml(r.reason)}</div>`;
+      }
+      for (const w of rf.warnings || []) html += `<div class="note bad">${escapeHtml(w)}</div>`;
+    }
+  }
+
+  el.innerHTML = html;
+  wirePartPanel(el);
+}
+
+function wirePartPanel(el) {
+  for (const btn of el.querySelectorAll('[data-setpart]')) {
+    btn.onclick = () => designatePart(btn.dataset.setpart);
+  }
+  const place = $('partplace');
+  if (place) place.onclick = () => placePartNow();
+  const clear = $('partclear');
+  if (clear) clear.onclick = () => designatePart(null);
+  const toggle = $('edgerefine');
+  if (toggle) {
+    toggle.onchange = (e) => {
+      state.project.settings.edge_refine = e.target.checked;
+      markDirty();
+      renderPartPanel();
+    };
+  }
+  const one = $('refinethis');
+  if (one) one.onclick = () => refineEdges(currentImage() ? [currentImage().id] : []);
+  const all = $('refineall');
+  if (all) all.onclick = () => refineEdges(state.project.images.map((im) => im.id));
+  const undo = $('refineundo');
+  if (undo) undo.onclick = () => revertEdges(null);
+}
+
+/** Mark a template as the part, or (null) stop treating anything as one. */
+async function designatePart(templateId) {
+  if (templateId === null) {
+    const inst = partInstance();
+    if (!inst) return;
+    if (!(await askConfirm(
+      `Stop treating “${(partTemplate() || {}).name || inst.template}” as the part?`
+      + `\n\nThe model stays in the project; it just goes back to being an object you would `
+      + `have to place.`, { ok: 'Not the part' }))) return;
+  }
+  try {
+    const data = await api('/api/set_part', {
+      project: projectPayload(), template: templateId,
+    });
+    adopt(data);
+    if (data.fit) state.partFit = data.fit;
+    state.partPlacement = null;
+    clearDirty();
+    setStatus(templateId
+      ? 'marked as the part — it sits at the origin, no anchors needed'
+      : 'no longer treated as the part');
+  } catch (err) {
+    setStatus(`could not set the part: ${err.message}`, 'bad');
+    return;
+  }
+  renderPanels();
+  syncViewer();
+  render();
+}
+
+/** Stage one: pin the part at the origin and see where it lands in each photo. */
+async function placePartNow() {
+  setStatus('placing the part from the nominals…');
+  try {
+    const data = await api('/api/place_part', { project: projectPayload() });
+    adopt(data);
+    state.partPlacement = data.placement;
+    if (data.fit) state.partFit = data.fit;
+    clearDirty();
+    const pl = data.placement || {};
+    if (!pl.ok) {
+      setStatus((pl.warnings && pl.warnings[0]) || pl.stage || 'could not place the part', 'warn');
+    } else {
+      const drawn = (pl.images || []).filter((i) => i.positioned && i.n_inside).length;
+      setStatus(`the part is projected into ${drawn} photo(s) from its known pose — `
+                + `check the wireframe lands on it`);
+    }
+  } catch (err) {
+    setStatus(`could not place the part: ${err.message}`, 'bad');
+  }
+  renderPanels();
+  syncViewer();
+  render();
+}
+
+async function refineEdges(imageIds) {
+  if (!imageIds || !imageIds.length) return;
+  setStatus(`aligning ${imageIds.length} photo(s) to their image edges…`);
+  try {
+    const data = await api('/api/edge_refine', {
+      project: projectPayload(), images: imageIds,
+    });
+    adopt(data);
+    state.refine = data.refine;
+    if (data.fit) state.partFit = data.fit;
+    clearDirty();
+    const n = (data.refine && data.refine.n_accepted) || 0;
+    const total = ((data.refine && data.refine.results) || []).length;
+    setStatus(n
+      ? `${n} of ${total} pose(s) accepted — the rest were left exactly as the solve had them`
+      : `nothing accepted: all ${total} pose(s) kept, which is the usual answer when the solve `
+        + `was already good`, n ? null : 'warn');
+  } catch (err) {
+    setStatus(`edge alignment failed: ${err.message}`, 'bad');
+  }
+  renderPanels();
+  render();
+}
+
+async function revertEdges(imageIds) {
+  try {
+    const data = await api('/api/edge_revert', {
+      project: projectPayload(), images: imageIds || [],
+    });
+    adopt(data);
+    state.refine = null;
+    clearDirty();
+    setStatus(`put back ${(data.reverted || []).length} pose(s) as the solve left them`);
+  } catch (err) {
+    setStatus(`could not undo: ${err.message}`, 'bad');
+  }
+  renderPanels();
   render();
 }
 
@@ -3756,7 +4539,14 @@ function buildScene() {
     center = [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2);
     extent = Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]), 1e-6);
   }
-  return { points, cameras, objects, center, extent };
+  /* The part's own zero, for the viewer to draw the way the photo overlay
+   * does. Sent only when the nominals have actually pinned the frame, so the
+   * viewer never has to decide whether the origin means anything -- and only
+   * while the Origin toggle is on, so one checkbox governs both views. */
+  const ps = partSpaceState();
+  const origin = state.showOrigin && ps.ok ? partOriginAxis() : null;
+
+  return { points, cameras, objects, center, extent, origin };
 }
 
 /** In model mode the viewer works in the model's own units, so the scene it
@@ -3957,6 +4747,27 @@ $('btn-export').onclick = exportNow;
 $('showvp').onchange = (e) => { state.showVP = e.target.checked; render(); };
 $('showresid').onchange = (e) => { state.showResid = e.target.checked; updateHint(); render(); };
 $('showgrid').onchange = (e) => { state.showGrid = e.target.checked; render(); };
+/* Ticked on by default, because once a project is in part space the origin is
+ * the thing worth looking at -- and in a project with no nominals it draws
+ * nothing, so it costs those projects nothing. Ticking it there is a fair
+ * question to ask, though, and silence would look like a broken checkbox. */
+$('showorigin').onchange = (e) => {
+  state.showOrigin = e.target.checked;
+  if (e.target.checked) {
+    const ps = partSpaceState();
+    if (!ps.ok) {
+      setStatus(ps.n < 3
+        ? `the origin needs three nominal'd points, not in a straight line; `
+          + `this project has ${ps.n}`
+        : `the ${ps.n} nominal'd points are in a straight line, which leaves a `
+          + `rotation free, so there is no part origin to draw yet`, 'warn');
+    }
+  }
+  render();
+  // the photo canvas and the 3D view are two renderers; this toggle is the
+  // only one that governs both, so it has to ask both to repaint
+  if (Viewer3D.isOn()) Viewer3D.render();
+};
 $('showmodels').onchange = (e) => { state.showModels = e.target.checked; render(); };
 $('btn-project').onclick = (ev) => { ev.stopPropagation(); toggleProjectMenu(); };
 $('fileinput').onchange = (ev) => {
@@ -4052,6 +4863,7 @@ async function start() {
   if (Backend.isStatic()) await showLauncher();
   try {
     await loadState();
+    initSectionFolding();
     // fit once the grid has actually laid the canvas out, otherwise the first
     // fitView measures a stale (usually too small) rect
     requestAnimationFrame(() => { resizeCanvas(); fitView(); render(); });

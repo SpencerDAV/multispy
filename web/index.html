@@ -114,6 +114,43 @@
   .section > h3 .count { color: var(--text); background: var(--surface-2);
     border-radius: 9px; padding: 1px 7px; font-size: 10px; letter-spacing: 0; }
   .section .inner { padding: 0 10px 10px; }
+
+  /* Collapsing. The sidebar is one tall scroll and a project with several
+   * models pushes the points and constraints below the fold, so every section
+   * header and every model card folds away. Click the header; the state is
+   * remembered per project in localStorage. */
+  .section > h3 { cursor: pointer; user-select: none; }
+  .section > h3:hover { color: var(--text); }
+  .section > h3::before {
+    content: '▾'; font-size: 9px; margin-right: 6px; opacity: .55;
+    transition: transform .12s ease; display: inline-block;
+  }
+  .section.folded > h3::before { transform: rotate(-90deg); }
+  .section.folded > .inner { display: none; }
+  .section > h3 .hdr { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; }
+
+  .tplhead { cursor: pointer; user-select: none; }
+  .tplhead::before {
+    content: '▾'; font-size: 9px; margin-right: 5px; opacity: .55;
+    transition: transform .12s ease; display: inline-block;
+  }
+  .tpl.folded .tplhead::before { transform: rotate(-90deg); }
+  .tpl.folded .tplbody { display: none; }
+
+  /* nominals: what the drawing says, as against what the photos say */
+  .tag { font-size: 9px; border-radius: 3px; padding: 0 4px; margin: 0 3px;
+    letter-spacing: .3px; vertical-align: 1px; }
+  .tag.nom { background: #2a4a63; color: #9ad2ff; }
+  .tag.unc { background: #4a3c22; color: var(--warn); }
+  .nomhead { display: flex; align-items: center; justify-content: space-between;
+    gap: 6px; margin-top: 7px; }
+  .nomhead select { width: 62px; flex: none; }
+  .nomrow { display: flex; gap: 4px; margin-top: 3px; }
+  .nomcell { flex: 1; min-width: 0; display: flex; align-items: center; gap: 3px; }
+  .nomcell > span { color: var(--text-dim); font-size: 10px; width: 9px; }
+  .nomcell input { width: 100%; min-width: 0; font-variant-numeric: tabular-nums; }
+  .note.good { color: var(--good); }
+
   .row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
   .row .k { color: var(--text-dim); }
   .row .v { font-variant-numeric: tabular-nums; }
@@ -390,8 +427,12 @@
     <label class="toggle" title="Show reprojection error vectors (R)">
       <input type="checkbox" id="showresid" checked> Residuals
     </label>
-    <label class="toggle" title="Overlay the solved ground plane grid (G)">
+    <label class="toggle" title="Overlay the solved ground plane grid">
       <input type="checkbox" id="showgrid"> Grid
+    </label>
+    <label class="toggle" id="originlabel"
+           title="Overlay the part-space origin and axes, once three nominals pin the frame">
+      <input type="checkbox" id="showorigin" checked> Origin
     </label>
     <label class="toggle" title="Overlay each placed object's model, projected through this camera (M)">
       <input type="checkbox" id="showmodels" checked> Models
@@ -438,6 +479,10 @@
       <div class="section">
         <h3>Focal check <span class="count" id="obsverdict"></span></h3>
         <div class="inner" id="obspanel"></div>
+      </div>
+      <div class="section">
+        <h3>The part <span class="count" id="partcount"></span></h3>
+        <div class="inner" id="partpanel"></div>
       </div>
       <div class="section">
         <h3>Known objects <span class="count" id="objcount"></span></h3>

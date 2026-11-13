@@ -686,6 +686,149 @@ def test_round_trip_keeps_objects():
 # --------------------------------------------------------------------------
 
 
+
+# --------------------------------------------------------------------------
+# one bad body must not cost you the rest of the rig
+# --------------------------------------------------------------------------
+
+
+def legacy_weighting(project: Project) -> Project:
+    """Settings that reproduce the pre-reweighting behaviour exactly, so the
+    two arms of these tests differ only in weighting, not in code path."""
+    s = project.settings
+    s.sigma_anchor_px = s.sigma_px
+    s.anchor_count_ref = 0.0
+    s.reweight_instances = False
+    s.cull_sigma = 0.0
+    return project
+
+
+def spoil_body(project: Project, instance: str = "obj2", mode: str = "swap", seed: int = 5):
+    """Mis-mark one body the way a person actually does it: either two corners
+    swapped, or that one body clicked much less carefully than the rest."""
+    if mode == "swap":
+        a, b, _n = shared_anchor_pair(project, instance)
+        for im in project.images:
+            if a in im.anchor_obs and b in im.anchor_obs:
+                im.anchor_obs[a], im.anchor_obs[b] = im.anchor_obs[b], im.anchor_obs[a]
+    else:
+        rng = np.random.default_rng(seed)
+        for im in project.images:
+            for key in list(im.anchor_obs):
+                if key.startswith(instance):
+                    uv = im.anchor_obs[key]
+                    im.anchor_obs[key] = [
+                        float(uv[0] + rng.normal(0.0, 8.0)),
+                        float(uv[1] + rng.normal(0.0, 8.0)),
+                    ]
+    return project
+
+
+def good_body_baseline_error(project: Project, truth: dict, skip: str = "obj2") -> float:
+    """RMS error, in mm, of the baselines between the bodies marked *fine*.
+
+    Gauge-invariant by construction -- these are distances, so they survive the
+    arbitrary world rotation and translation -- which makes this the honest
+    measure of collateral damage: one bad body should cost you that body, not
+    the rig measurement you came for.
+    """
+    keep = [i for i in range(N_CAMERAS) if f"obj{i}" != skip]
+    solved = np.array([project.instance(f"obj{i}").t for i in keep])
+    true = np.array([truth["bodies"][i][1] for i in keep])
+    return float(np.sqrt(np.mean(((pairwise(solved) - pairwise(true)) * 1000.0) ** 2)))
+
+
+def test_a_sloppily_marked_body_does_not_drag_the_others():
+    """A body clicked carelessly should be weighted as carelessly as it was
+    clicked, and the well-marked bodies should come out as if it were not there.
+
+    The old behaviour weighted every anchor at the tie-point sigma, so a body
+    marked to 8 px pulled the cameras with the authority of a 1.5 px click --
+    and because a body is rigid, that pull had nowhere to go but the poses.
+    """
+    clean, truth = build_rig_project()
+    solve(clean)
+    reference = good_body_baseline_error(clean, truth)
+
+    old, truth_old = build_rig_project()
+    legacy_weighting(spoil_body(old, mode="sloppy"))
+    solve(old)
+    old_err = good_body_baseline_error(old, truth_old)
+
+    new, truth_new = build_rig_project()
+    spoil_body(new, mode="sloppy")
+    report = solve(new)
+    new_err = good_body_baseline_error(new, truth_new)
+
+    assert old_err > 4 * reference, (old_err, reference)
+    assert new_err < old_err / 3, (new_err, old_err)
+    assert new_err < 2 * reference, (new_err, reference)
+
+    # and it should say why, rather than quietly fixing it
+    sigma = report.instances["obj2"].sigma_px
+    assert sigma > 2 * new.settings.sigma_anchor_px, sigma
+    assert all(
+        report.instances[f"obj{i}"].sigma_px <= new.settings.sigma_anchor_px * 1.5
+        for i in (0, 1, 3, 4)
+    ), {i: report.instances[f"obj{i}"].sigma_px for i in range(N_CAMERAS)}
+
+
+def test_a_swapped_corner_is_culled_and_reported():
+    """Two anchors marked on each other's corner is a blunder, not noise. Huber
+    can only soften it -- at 40 px it still pulls with the force of one at the
+    knee -- so it has to come out, and the user has to be told it came out."""
+    old, truth_old = build_rig_project()
+    legacy_weighting(spoil_body(old, mode="swap"))
+    solve(old)
+    old_err = good_body_baseline_error(old, truth_old)
+
+    new, truth_new = build_rig_project()
+    spoil_body(new, mode="swap")
+    report = solve(new)
+    new_err = good_body_baseline_error(new, truth_new)
+
+    assert report.n_culled > 0, report.messages
+    assert new_err < old_err / 5, (new_err, old_err)
+    assert report.rms_reprojection_px < 3.0, report.rms_reprojection_px
+    assert report.instances["obj2"].n_culled > 0, report.instances["obj2"]
+    assert any("left out of the final solve" in w for w in report.warnings), report.warnings
+
+    # the culled marks are still reported, or the user cannot see what to re-click
+    culled = [r for r in report.residual_lines if r.get("culled")]
+    assert len(culled) == report.n_culled, (len(culled), report.n_culled)
+    assert all(r["error_px"] > 5.0 for r in culled), sorted(r["error_px"] for r in culled)[:3]
+
+
+def test_culling_never_starves_the_solve():
+    """Dropping marks can break the thing it is cleaning. The guards cap the
+    cull at a fifth of the data and refuse any drop that would leave a track,
+    a photo or a body below what it needs, so a scene where *everything* looks
+    bad still solves and says so rather than deleting itself."""
+    project, _truth = build_rig_project(anchor_noise_px=14.0, tie_noise_px=14.0)
+    report = solve(project)
+    assert report.ok, report.messages
+    total = sum(len(im.anchor_obs) + len(im.observations) for im in project.images)
+    assert report.n_culled <= 0.2 * total + 1, (report.n_culled, total)
+    for inst_id in (f"obj{i}" for i in range(N_CAMERAS)):
+        rep = report.instances.get(inst_id)
+        if rep is not None and rep.placed:
+            assert rep.n_observations >= 3, (inst_id, rep.n_observations)
+
+
+def test_weighting_is_off_by_the_settings():
+    """Every piece of this is a setting, and turning them all off has to give
+    back the old numbers exactly -- otherwise the comparison above is measuring
+    two different code paths rather than two different weightings."""
+    a, _ = build_rig_project()
+    legacy_weighting(a)
+    report_a = solve(a)
+    assert report_a.n_culled == 0
+    assert not any("second pass" in m for m in report_a.messages), report_a.messages
+    for rep in report_a.instances.values():
+        if rep.placed:
+            assert abs(rep.sigma_px - a.settings.sigma_px) < 1e-9, rep.sigma_px
+
+
 def main() -> int:
     tests = [
         test_known_objects_make_the_scale_metric,
@@ -701,6 +844,10 @@ def main() -> int:
         test_units_error_shows_up_as_scale_disagreement,
         test_axis_locks_alone_imply_a_scale,
         test_round_trip_keeps_objects,
+        test_a_sloppily_marked_body_does_not_drag_the_others,
+        test_a_swapped_corner_is_culled_and_reported,
+        test_culling_never_starves_the_solve,
+        test_weighting_is_off_by_the_settings,
     ]
     failures = 0
     for fn in tests:

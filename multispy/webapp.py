@@ -26,6 +26,7 @@ from PIL import Image, ImageOps
 from . import exif, export
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
 from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
+from .part import PartFitReport, part_fit, place_part
 from .project import CameraGroup, ImageView, ObjectTemplate, Project
 from .solve import solve
 
@@ -49,6 +50,11 @@ SHARED_ROUTES = frozenset(
         "/api/mesh",
         "/api/rig",
         "/api/remove_image",
+        "/api/set_part",
+        "/api/part_fit",
+        "/api/place_part",
+        "/api/edge_refine",
+        "/api/edge_revert",
     }
 )
 """Routes :meth:`Workspace.handle` answers, and both front ends therefore share.
@@ -376,6 +382,15 @@ class Workspace:
         self.autosave = autosave
         self.display_cache: dict[Any, bytes] = {}
         self.mesh_cache: dict[Any, dict] = {}
+        self.geometry_cache: dict[Any, Any] = {}
+        """Loaded :class:`multispy.mesh.Mesh` objects, keyed by path and mtime.
+
+        Separate from ``mesh_cache``, which holds the thinned *display* payload
+        the client draws. The part's fit and its edge alignment need the real
+        triangles -- the display payload has had its edges sorted, trimmed and
+        its faces dropped entirely -- and re-parsing a production OBJ on every
+        request is the difference between a fit report that feels instant and
+        one that does not."""
         self.last_report: dict | None = None
 
     # ---------------------------------------------------------------- files
@@ -463,6 +478,36 @@ class Workspace:
             "mesh": payload,
         }
 
+    def geometry_for(self, project: Project, template: ObjectTemplate):
+        """The template's real triangle mesh, memoised by file mtime."""
+        path = project.resolve_mesh_path(template)
+        if path is None:
+            raise ValueError("this object has no model file")
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"model file is missing: {path}")
+        key = (str(path), path.stat().st_mtime)
+        if key not in self.geometry_cache:
+            if len(self.geometry_cache) > 4:
+                self.geometry_cache.clear()
+            self.geometry_cache[key] = load_mesh(path)
+        return self.geometry_cache[key]
+
+    def part_geometry(self, project: Project):
+        """``(instance, template, mesh)`` for the designated part.
+
+        Raises rather than returning a sentinel: every caller here needs all
+        three, and a route that answered "no part" by returning half a tuple
+        would push that check into four places instead of one.
+        """
+        inst = project.part_instance()
+        if inst is None:
+            raise KeyError("no model is marked as the part in this project")
+        template = project.template_of(inst)
+        if template is None:
+            raise KeyError(f"the part's template {inst.template!r} is missing")
+        return inst, template, self.geometry_for(project, template)
+
     def photo_bytes(self, image_id: str, thumb: bool = False) -> bytes:
         image = self.project.image(image_id)
         if image is None:
@@ -524,6 +569,85 @@ class Workspace:
         if route == "/api/rig":
             project = Project.from_dict(body["project"], path=self.project.path)
             return export.rig_payload(project)
+
+        # ---- the part: designating it, placing it, and checking the fit
+        #
+        # Designation is its own route rather than a field the client sets in
+        # the project payload, because it has invariants to enforce -- one part
+        # at most, pinned at the identity -- and a flag the client could set
+        # directly would put those in the client as well as here.
+        if route == "/api/set_part":
+            project = self.adopt(body["project"])
+            template_id = body.get("template")
+            if template_id is None:
+                changed = project.clear_part()
+                self.save()
+                return {"project": project_payload(self.project), "cleared": changed}
+            inst = project.set_part(str(template_id), label=str(body.get("label") or ""))
+            self.save()
+            out: dict[str, Any] = {
+                "project": project_payload(self.project),
+                "instance": inst.id,
+                "template": inst.template,
+            }
+            # The units check is the one thing worth answering at the moment of
+            # designation rather than at the next solve: it needs no solve, and
+            # a model declared in the wrong units is best caught before anyone
+            # reads a wireframe that is a thousand times too big.
+            out["fit"] = part_fit(project).to_dict()
+            return out
+
+        if route == "/api/place_part":
+            project = self.adopt(body["project"])
+            _inst, template, mesh = self.part_geometry(project)
+            placement = place_part(project, mesh=mesh)
+            self.save()
+            return {
+                "project": project_payload(self.project),
+                "placement": placement.to_dict(),
+                "fit": part_fit(project, mesh=mesh).to_dict(),
+            }
+
+        if route == "/api/part_fit":
+            # read-only: asking how well the part fits must not move anything
+            project = Project.from_dict(body["project"], path=self.project.path)
+            try:
+                _inst, _template, mesh = self.part_geometry(project)
+            except (KeyError, ValueError, FileNotFoundError):
+                mesh = None
+            return {"fit": part_fit(project, mesh=mesh).to_dict()}
+
+        if route == "/api/edge_refine":
+            from .edgefit import refine_images
+
+            project = self.adopt(body["project"])
+            _inst, template, mesh = self.part_geometry(project)
+            ids = [str(i) for i in (body.get("images") or [])]
+            if not ids:
+                raise ValueError("name at least one image to refine")
+            # The display JPEG, not the original file: the gradients are
+            # computed on a downscaled working image anyway, and the field maps
+            # itself back to original pixels from the image's stored dimensions.
+            refine = refine_images(
+                project, mesh, template, ids, source_for=lambda iid: self.photo_bytes(iid)
+            )
+            self.save()
+            return {
+                "project": project_payload(self.project),
+                "refine": refine.to_dict(),
+                "fit": part_fit(project, mesh=mesh).to_dict(),
+            }
+
+        if route == "/api/edge_revert":
+            from .edgefit import revert_image_pose
+
+            project = self.adopt(body["project"])
+            ids = [str(i) for i in (body.get("images") or [])]
+            if not ids:
+                ids = [im.id for im in project.images if im.edge_refined]
+            reverted = [iid for iid in ids if (im := project.image(iid)) and revert_image_pose(im)]
+            self.save()
+            return {"project": project_payload(self.project), "reverted": reverted}
 
         if route == "/api/remove_image":
             project = self.adopt(body["project"])

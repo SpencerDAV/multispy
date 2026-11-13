@@ -16,9 +16,10 @@ import numpy as np
 
 from .mesh import FEATURE_ANGLE_DEG
 
-FORMAT_VERSION = 2
-"""Version 2 adds object templates and instances. Version 1 files load unchanged
--- they simply have none."""
+FORMAT_VERSION = 3
+"""Version 2 adds object templates and instances. Version 3 adds the part
+instance and the per-image record of an edge refinement. Older files load
+unchanged -- they simply have none."""
 
 ANCHOR_SEP = "/"
 """Separates instance id from anchor name in an observation key.
@@ -56,6 +57,13 @@ class AxisLine:
     axis: int  # 0=X, 1=Y, 2=Z
     p0: list[float]
     p1: list[float]
+    uncertain: bool = False
+    """Drawn along an edge you are not sure is really parallel to the axis.
+
+    Not the same as deleting it. A doubtful line still says something, and in a
+    photo with only two lines on an axis it may be all there is -- so it keeps
+    contributing, at ``Settings.uncertain_factor`` times its usual sigma, and it
+    is the first thing dropped when the solve decides something has to go."""
 
     def length(self) -> float:
         return float(np.hypot(self.p1[0] - self.p0[0], self.p1[1] - self.p0[1]))
@@ -100,6 +108,22 @@ class ImageView:
     R: np.ndarray | None = None
     t: np.ndarray | None = None
     notes: list[str] = field(default_factory=list)
+    edge_refined: bool = False
+    """This camera's pose was nudged by the edge refinement rather than by the
+    solve alone.
+
+    Recorded on the image, not in a report, because the pose outlives the report
+    that produced it: a project reopened a week later would otherwise give no
+    sign that one of its cameras carries a number no bundle adjustment ever
+    agreed to."""
+    R_unrefined: np.ndarray | None = None
+    t_unrefined: np.ndarray | None = None
+    """The pose as the solve left it, kept so a refinement can be undone exactly.
+
+    Cheap insurance against the failure mode this whole feature has: an
+    alignment onto the wrong edges is confident, plausible and wrong, and the
+    only honest answer to it is to be able to put the old pose back without
+    re-solving the entire project."""
 
     def axis_segments(self) -> dict[int, np.ndarray]:
         """Control lines regrouped as ``{axis: (N,4) array}`` for the geometry code."""
@@ -120,6 +144,31 @@ class TiePoint:
     id: str
     label: str = ""
     xyz: np.ndarray | None = None
+    nominal: list[float] | None = None
+    """Where this point is *supposed* to be, in ``Project.nominal_units``.
+
+    This is what puts a reconstruction into part space. A photogrammetric solve
+    has no idea where the origin is or which way is up; a drawing does. Give
+    three or more points the coordinates the drawing states and the solved frame
+    stops being arbitrary and becomes the part's own frame -- at which point a
+    CAD model of the part can be dropped in at the identity and the fit is
+    meaningful.
+
+    Stored in the project's nominal units rather than in metres, because that is
+    what you read off the drawing, and a round 120.0 that silently becomes
+    0.12000000000000001 in the file is a round number nobody can search for."""
+    nominal_sigma: float | None = None
+    """Tolerance on this point's nominal, in nominal units. ``None`` uses
+    ``Settings.sigma_nominal``.
+
+    A real tolerance, not a formality: it is what decides whether the solve
+    bends to meet the drawing or the drawing bends to meet the solve. Tight on
+    the datum features that define the frame, loose on everything else."""
+    uncertain: bool = False
+    """Marked where you could not quite see the feature.
+
+    Keeps contributing, at ``Settings.uncertain_factor`` times its usual sigma,
+    and is dropped sooner than a confident mark when the outlier pass runs."""
 
 
 @dataclass
@@ -212,6 +261,25 @@ class ObjectInstance:
     locked: bool = False
     """Hold this placement fixed during the bundle adjustment. Useful once one
     body is trusted and you want it to define the frame for the rest."""
+    is_part: bool = False
+    """This is *the part itself*, not an object placed in the scene.
+
+    A placed object has an unknown pose that anchors measure. The part has no
+    pose to measure: once the point nominals have put the reconstruction into
+    the part's own coordinate frame, the part is at the origin by definition,
+    because that frame was built from the part's own drawing. So this instance
+    is pinned at ``R = I, t = 0`` and never enters the bundle as a parameter --
+    it carries no anchors, costs no unknowns, and its wireframe lands in every
+    photograph the moment the cameras are solved.
+
+    The flag lives on the instance rather than the template because it is a
+    statement about a *placement*, which is what an instance is: the same CAD
+    file could legitimately be the part in one project and a placed object in
+    another. It sits beside ``locked`` and ``manual`` for the same reason -- all
+    three say where a pose came from.
+
+    At most one instance in a project carries it; :meth:`Project.set_part`
+    enforces that."""
     manual: bool = False
     """This pose was set by hand, by dragging the model over a photograph, and
     is not to be thrown away.
@@ -235,6 +303,11 @@ class AxisLockConstraint:
     value: float = 0.0
     sigma: float = 0.01
     type: str = "axis_lock"
+    source: str = "constraint"
+    """``"constraint"`` when someone typed it, ``"nominal"`` when it was
+    generated from a point's nominal XYZ. The solve treats the two identically;
+    this only keeps the UI from showing a drawing's worth of generated locks in
+    a panel meant for the handful a person entered by hand."""
 
 
 @dataclass
@@ -258,15 +331,127 @@ class Settings:
     """Expected click accuracy for tie points, in pixels."""
     sigma_line_px: float = 2.0
     """Expected accuracy of control line endpoints, in pixels."""
+    sigma_anchor_px: float = 2.0
+    """Floor on a known-object anchor mark's accuracy, in pixels.
+
+    A *floor*, not an estimate: ``reweight_instances`` raises it per body to
+    whatever that body's own marks turn out to deserve. Keep it near
+    ``sigma_px``, and resist the urge to set it high.
+
+    That is counter-intuitive, because an anchor really is the least reliable
+    thing in the project -- a tie point is a feature you can see and click,
+    while an anchor is a model vertex whose position you have to *judge* from
+    one 2D projection with all three axes guessed at once, and it has no free
+    position to absorb the mistake: the model's geometry is rigid, so whatever
+    you get wrong is pushed into the camera poses instead of staying local.
+
+    But loosening the whole class is the wrong response, and measurably so. On
+    the rig scene with one body deliberately mis-marked, raising this from 1.5
+    to 6.0 made the *other* bodies' baselines worse by 2x (0.54 mm -> 1.08 mm),
+    because it softens the well-marked bodies just as much as the bad one and
+    they are what was holding the solve together. Discrimination is what helps,
+    not blanket distrust: let this stay tight and let the per-body sigma and the
+    outlier cull find the body that actually deserves to be doubted."""
+    anchor_count_ref: float = 6.0
+    """Anchor marks per body beyond which extra ones stop buying linear
+    influence, so a densely marked object cannot outvote the tie-point network
+    that holds the cameras. 0 disables the normalisation."""
+    reweight_instances: bool = True
+    """After a first pass, give each body a sigma measured from its own
+    residuals, so an object that disagrees with the photos declares itself
+    unreliable instead of dragging the cameras over to meet it."""
+    sigma_nominal: float = 0.1
+    """Default tolerance on a point nominal, in the project's nominal units.
+
+    The number that decides whether the drawing bends to the photos or the
+    photos bend to the drawing. Loose enough by default that a nominal places
+    the part without overriding what the images actually show; tighten it per
+    point on the datum features that are supposed to define the frame."""
+    uncertain_factor: float = 3.0
+    """How much looser a mark flagged uncertain is weighted, and how much sooner
+    it is culled. 1.0 makes the flag a label with no effect on the solve."""
+    cull_sigma: float = 5.0
+    """Clicked marks worse than this many sigma after the first pass are dropped
+    from the second. 0 disables culling. Guarded: nothing is dropped that would
+    leave a track, an image or a body without enough marks to stay solvable."""
     huber_f_scale: float = 3.0
     """Robust loss knee, in multiples of sigma. Clicks beyond this get downweighted."""
     solve_principal_point: bool = False
     """Try the 3-vanishing-point orthocenter during initialisation. Noisy; off by default."""
     refine_focal: bool = True
+    edge_refine: bool = False
+    """Allow the image-edge refinement to touch camera poses at all.
+
+    Off, deliberately. Stage one -- projecting the part's wireframe from the
+    pose the nominals already imply -- is pure geometry and cannot be wrong in
+    any way the solve was not already wrong. Stage two looks at the photograph
+    and is a different kind of claim: on a busy background it can find a
+    confident alignment onto the wrong edges, and a wrong answer delivered
+    confidently is worse than no answer. So it is opt-in, per image, and
+    reversible."""
+    edge_sigma_px: float = 1.6
+    """Gaussian blur, in pixels of the *working* image, before the gradient.
+
+    Sets what counts as an edge: too little and every bit of texture is one, too
+    much and a real silhouette softens into nothing."""
+    edge_percentile: float = 92.0
+    """Gradient-magnitude percentile above which a pixel is kept as an edge.
+
+    A percentile rather than an absolute threshold because exposure varies
+    wildly between photographs and an absolute number tuned on one of them is
+    wrong on the next."""
+    edge_truncate_px: float = 24.0
+    """Chamfer distances are clipped here, in working pixels.
+
+    The single most important number for not being dragged onto a background:
+    an unclipped chamfer cost lets one wireframe edge that found nothing pull
+    the whole pose towards whatever distant clutter is nearest. Clipped, an edge
+    with no support simply stops voting."""
+    edge_orientation_bins: int = 8
+    """Separate distance fields, one per edge direction.
+
+    The other defence against clutter. A vertical window frame behind the part
+    is a strong edge, but it is not a *candidate* for a horizontal wireframe
+    edge, and binning by orientation is what lets the cost say so."""
+    edge_soften_px: float = 3.0
+    """Distance at which a chamfer residual stops growing, in working pixels.
+
+    Truncation alone is not enough and the measurement said so. The cost is an
+    RMS, so a handful of samples sitting near the clip dominate it -- on a clean
+    synthetic render at the *correct* pose, 95% of the wireframe lay within a
+    pixel of its edge and the cost still read 7 px, because the remaining 5%
+    (edges the detector never found) were at the cap. The optimiser could then
+    lower the cost by dragging the pose to rescue those few at the expense of
+    the many, which is the opposite of what it is for.
+
+    A saturating residual, ``d / sqrt(1 + (d/soften)^2)``, fixes that properly:
+    a sample that found its edge votes in proportion to how far off it is, and a
+    sample that found nothing contributes an almost constant term with almost no
+    gradient. Set it near the accuracy you expect of the alignment, not near the
+    size of the mistakes you want it to fix."""
+    edge_max_shift_px: float = 40.0
+    """How far a refinement may move the projection of the part's centre, in
+    original image pixels. A correction, not a search: anything larger means the
+    solve was not close to begin with, and sliding onto distant edges is exactly
+    the failure being guarded against."""
+    edge_min_improvement: float = 0.08
+    """Fractional drop in chamfer cost below which a refinement is not worth
+    accepting. Keeps noise-level wobble from being recorded as a change."""
+    edge_max_reproj_worsening_px: float = 0.25
+    """How much a refinement may raise that image's own mark reprojection RMS
+    before it is rejected outright.
+
+    The independent check. Chamfer cost is the thing being minimised, so of
+    course it goes down; the clicked marks in that photo were not part of the
+    objective and have every right to veto the result."""
     gauge_weight: float = 1e-3
     """Weak prior holding the solution near its initialisation in the 7 gauge
     directions. Too small to bias anything, large enough to keep the normal
     equations full rank when the user has supplied no constraints."""
+
+
+UNIT_SCALES: dict[str, float] = {"mm": 0.001, "cm": 0.01, "m": 1.0, "in": 0.0254, "ft": 0.3048}
+"""World metres per unit, for the units a drawing is likely to be dimensioned in."""
 
 
 @dataclass
@@ -279,6 +464,11 @@ class Project:
     templates: dict[str, ObjectTemplate] = field(default_factory=dict)
     instances: list[ObjectInstance] = field(default_factory=list)
     settings: Settings = field(default_factory=Settings)
+    nominal_units: str = "mm"
+    """Units the point nominals are typed in. Drawings are rarely in metres."""
+    nominal_scale: float = 0.001
+    """World metres per nominal unit. Kept explicitly beside ``nominal_units``,
+    the same way a template does, so an odd scale survives a round trip."""
     path: Path | None = None
 
     # ---------------------------------------------------------------- lookups
@@ -289,8 +479,157 @@ class Project:
     def point(self, point_id: str) -> TiePoint | None:
         return next((p for p in self.points if p.id == point_id), None)
 
+    def nominal_constraints(self) -> list["AxisLockConstraint"]:
+        """Every point nominal, expanded into the axis locks it already means.
+
+        Deliberately not a new kind of residual. "This point is at X=120" is
+        exactly what an axis lock says, so expanding nominals into locks means
+        the nominals inherit the whole existing apparatus for free: the datum
+        residuals, the asked-versus-achieved report, the sigmas-off warning, the
+        scale-is-metric detection. A separate parallel implementation would have
+        had to re-earn all of that, and would drift out of step with it.
+
+        Regenerated on demand rather than stored, so editing a nominal cannot
+        leave a stale lock behind.
+        """
+        out: list[AxisLockConstraint] = []
+        for pt in self.points:
+            if not pt.nominal or len(pt.nominal) != 3:
+                continue
+            sigma = pt.nominal_sigma
+            if sigma is None:
+                sigma = self.settings.sigma_nominal
+            sigma_world = max(float(sigma) * self.nominal_scale, 1e-9)
+            for axis in range(3):
+                value = pt.nominal[axis]
+                if value is None:
+                    continue
+                out.append(
+                    AxisLockConstraint(
+                        point=pt.id,
+                        axis=axis,
+                        value=float(value) * self.nominal_scale,
+                        sigma=sigma_world,
+                        source="nominal",
+                    )
+                )
+        return out
+
+    def all_constraints(self) -> list["Constraint"]:
+        """What the solver should actually read: the constraints someone typed,
+        plus the ones the nominals imply. Explicit ones come first so their
+        indices in the report stay stable as nominals come and go."""
+        return list(self.constraints) + self.nominal_constraints()
+
+    def in_part_space(self) -> bool:
+        """True once the nominals pin all seven gauge freedoms.
+
+        Three non-collinear nominal'd points is the real test, but counting
+        them is not enough -- three points in a row leave a rotation about that
+        row free. Collinearity is checked against the nominals themselves,
+        since those are known before anything is solved."""
+        pts = [np.array(p.nominal, dtype=float) for p in self.points if p.nominal]
+        if len(pts) < 3:
+            return False
+        P = np.array(pts) - np.mean(pts, axis=0)
+        return bool(np.linalg.matrix_rank(P, tol=1e-6) >= 2)
+
     def instance(self, instance_id: str) -> ObjectInstance | None:
         return next((o for o in self.instances if o.id == instance_id), None)
+
+    # ------------------------------------------------------------- the part
+
+    def part_instance(self) -> ObjectInstance | None:
+        """The instance designated as the part itself, if any."""
+        return next((o for o in self.instances if o.is_part), None)
+
+    def part_template(self) -> ObjectTemplate | None:
+        inst = self.part_instance()
+        return None if inst is None else self.template_of(inst)
+
+    def pin_part(self) -> ObjectInstance | None:
+        """Hold the part at the origin.
+
+        Called everywhere a pose could have been disturbed -- after loading,
+        before and after a solve -- because the identity is not a starting guess
+        that refinement improves on. It is the definition of the coordinate
+        frame the nominals built, and anything that moved the part off it would
+        be re-expressing the answer in coordinates that are no longer the
+        drawing's.
+        """
+        inst = self.part_instance()
+        if inst is None:
+            return None
+        inst.R = np.eye(3)
+        inst.t = np.zeros(3)
+        inst.locked = True
+        inst.manual = False
+        return inst
+
+    def set_part(self, template_id: str, label: str = "") -> ObjectInstance:
+        """Designate a template as the part, and pin its placement at the origin.
+
+        Reuses the existing part instance when there is one, so swapping the CAD
+        file for a corrected export does not leave two parts behind. Any anchor
+        marks that were made against it are deliberately left alone: they are
+        harmless (the part takes no pose from them) and deleting a user's marks
+        on a flag change would be a nasty surprise.
+        """
+        if template_id not in self.templates:
+            raise KeyError(f"unknown template {template_id!r}")
+        for other in self.instances:
+            other.is_part = False
+        inst = next((o for o in self.instances if o.id == "part"), None)
+        if inst is None:
+            inst = ObjectInstance(id="part", template=template_id)
+            self.instances.append(inst)
+        inst.template = template_id
+        inst.label = label or inst.label or (self.templates[template_id].name or "part")
+        inst.is_part = True
+        self.pin_part()
+        return inst
+
+    def clear_part(self) -> bool:
+        """Stop treating anything as the part. Returns whether something changed.
+
+        The instance goes rather than reverting to an ordinary placed object: a
+        pose of exactly identity is not a placement anybody made, and leaving it
+        in the objects list would read as a body solved at the origin.
+        """
+        inst = self.part_instance()
+        if inst is None:
+            return False
+        self.instances = [o for o in self.instances if o is not inst]
+        for im in self.images:
+            for key in [k for k in im.anchor_obs if split_anchor_key(k)[0] == inst.id]:
+                del im.anchor_obs[key]
+        return True
+
+    def placed_object_instances(self) -> list[ObjectInstance]:
+        """Instances that are placements to be solved -- everything but the part.
+
+        What the solver's object machinery should iterate. The part is not a
+        placement: giving it to ``fit_instances`` would have it looking for
+        anchors that are not there and then clearing the one pose that is known
+        for certain.
+        """
+        return [o for o in self.instances if not o.is_part]
+
+    def part_unit_ratio(self) -> float | None:
+        """How the part model's declared units compare with the nominals'.
+
+        1.0 when they agree. Anything else is reported rather than applied: a
+        model declared in metres against a drawing dimensioned in millimetres is
+        off by exactly 1000, and silently rescaling it would make every residual
+        in the fit report look immaculate while the wireframe landed a thousand
+        times too large in every photograph.
+        """
+        template = self.part_template()
+        if template is None:
+            return None
+        if self.nominal_scale <= 0:
+            return None
+        return float(template.unit_scale) / float(self.nominal_scale)
 
     def template_of(self, instance: ObjectInstance) -> ObjectTemplate | None:
         return self.templates.get(instance.template)
@@ -317,15 +656,39 @@ class Project:
         Keys naming a missing instance, a missing template or a deleted anchor
         are simply absent, which is how stale marks get ignored rather than
         crashing a solve.
+
+        The part is left out. Its pose is not measured from anchors -- it is the
+        origin by definition -- so an anchor mark on the part has nothing to
+        contribute to a placement and would instead be read as evidence about
+        the cameras. The marks are not deleted, only ignored: see
+        :meth:`part_anchor_keys`.
         """
         out: dict[str, np.ndarray] = {}
-        for inst in self.instances:
+        for inst in self.placed_object_instances():
             template = self.template_of(inst)
             if template is None:
                 continue
             for name, xyz in template.anchor_points().items():
                 out[anchor_key(inst.id, name)] = xyz
         return out
+
+    def part_anchor_keys(self) -> set[str]:
+        """Observation keys that name the part.
+
+        Exists so the stale-mark sweep can tell "this anchor's object is gone"
+        from "this anchor belongs to the part and is deliberately inert". The
+        two look identical from ``anchor_world_points`` alone, and treating the
+        second as the first would quietly delete a user's clicks.
+        """
+        inst = self.part_instance()
+        if inst is None:
+            return set()
+        return {
+            key
+            for im in self.images
+            for key in im.anchor_obs
+            if split_anchor_key(key)[0] == inst.id
+        }
 
     def anchor_observations_of(self, key: str) -> list[tuple[ImageView, np.ndarray]]:
         return [
@@ -387,7 +750,7 @@ class Project:
     def prune_stale_anchor_obs(self) -> int:
         """Drop anchor marks whose instance, template or anchor has gone. Returns
         how many were removed."""
-        valid = set(self.anchor_world_points())
+        valid = set(self.anchor_world_points()) | self.part_anchor_keys()
         removed = 0
         for im in self.images:
             stale = [k for k in im.anchor_obs if k not in valid]
@@ -461,6 +824,9 @@ class Project:
                     "R": im.R.tolist() if im.R is not None else None,
                     "t": im.t.tolist() if im.t is not None else None,
                     "notes": im.notes,
+                    "edge_refined": im.edge_refined,
+                    "R_unrefined": im.R_unrefined.tolist() if im.R_unrefined is not None else None,
+                    "t_unrefined": im.t_unrefined.tolist() if im.t_unrefined is not None else None,
                 }
                 for im in self.images
             ],
@@ -469,9 +835,14 @@ class Project:
                     "id": p.id,
                     "label": p.label,
                     "xyz": p.xyz.tolist() if p.xyz is not None else None,
+                    "nominal": p.nominal,
+                    "nominal_sigma": p.nominal_sigma,
+                    "uncertain": p.uncertain,
                 }
                 for p in self.points
             ],
+            "nominal_units": self.nominal_units,
+            "nominal_scale": self.nominal_scale,
             "constraints": [asdict(c) for c in self.constraints],
             "templates": {
                 tid: {
@@ -493,6 +864,7 @@ class Project:
                     "label": o.label,
                     "locked": o.locked,
                     "manual": o.manual,
+                    "is_part": o.is_part,
                     "R": o.R.tolist() if o.R is not None else None,
                     "t": o.t.tolist() if o.t is not None else None,
                 }
@@ -523,22 +895,44 @@ class Project:
                 height=int(raw["height"]),
                 group=raw.get("group", "cam0"),
                 enabled=bool(raw.get("enabled", True)),
-                axis_lines=[AxisLine(axis=int(l["axis"]), p0=list(l["p0"]), p1=list(l["p1"])) for l in raw.get("axis_lines", [])],
+                axis_lines=[
+                    AxisLine(
+                        axis=int(l["axis"]),
+                        p0=list(l["p0"]),
+                        p1=list(l["p1"]),
+                        uncertain=bool(l.get("uncertain", False)),
+                    )
+                    for l in raw.get("axis_lines", [])
+                ],
                 observations={k: list(v) for k, v in raw.get("observations", {}).items()},
                 anchor_obs={k: list(v) for k, v in raw.get("anchor_obs", {}).items()},
                 notes=list(raw.get("notes", [])),
+                edge_refined=bool(raw.get("edge_refined", False)),
             )
             if raw.get("R") is not None:
                 im.R = np.array(raw["R"], dtype=float)
             if raw.get("t") is not None:
                 im.t = np.array(raw["t"], dtype=float)
+            if raw.get("R_unrefined") is not None:
+                im.R_unrefined = np.array(raw["R_unrefined"], dtype=float)
+            if raw.get("t_unrefined") is not None:
+                im.t_unrefined = np.array(raw["t_unrefined"], dtype=float)
             images.append(im)
 
         points = []
         for raw in d.get("points", []):
-            pt = TiePoint(id=raw["id"], label=raw.get("label", ""))
+            pt = TiePoint(
+                id=raw["id"],
+                label=raw.get("label", ""),
+                uncertain=bool(raw.get("uncertain", False)),
+            )
             if raw.get("xyz") is not None:
                 pt.xyz = np.array(raw["xyz"], dtype=float)
+            nominal = raw.get("nominal")
+            if nominal is not None and len(nominal) == 3:
+                pt.nominal = [None if v is None else float(v) for v in nominal]
+            if raw.get("nominal_sigma") is not None:
+                pt.nominal_sigma = float(raw["nominal_sigma"])
             points.append(pt)
 
         constraints: list[Constraint] = []
@@ -599,6 +993,7 @@ class Project:
                 label=raw.get("label", ""),
                 locked=bool(raw.get("locked", False)),
                 manual=bool(raw.get("manual", False)),
+                is_part=bool(raw.get("is_part", False)),
             )
             if raw.get("R") is not None:
                 inst.R = np.array(raw["R"], dtype=float)
@@ -606,7 +1001,18 @@ class Project:
                 inst.t = np.array(raw["t"], dtype=float)
             instances.append(inst)
 
-        return cls(
+        # At most one part, whatever the file says, and pinned at the origin.
+        # A file is user-editable and a second ``is_part`` would otherwise make
+        # every later lookup depend on list order.
+        seen_part = False
+        for inst in instances:
+            if not inst.is_part:
+                continue
+            if seen_part:
+                inst.is_part = False
+            seen_part = True
+
+        project = cls(
             name=d.get("name", "untitled"),
             images=images,
             groups=groups,
@@ -615,8 +1021,12 @@ class Project:
             templates=templates,
             instances=instances,
             settings=settings,
+            nominal_units=d.get("nominal_units", "mm"),
+            nominal_scale=float(d.get("nominal_scale", 0.001)),
             path=path,
         )
+        project.pin_part()
+        return project
 
     def save(self, path: str | Path | None = None) -> Path:
         target = Path(path) if path is not None else self.path

@@ -427,6 +427,206 @@ def test_exports_run():
 # --------------------------------------------------------------------------
 
 
+
+# --------------------------------------------------------------------------
+# part space: what the drawing says, as against what the photographs say
+# --------------------------------------------------------------------------
+
+
+def nominal_a_few(project: Project, truth: dict, which=(0, 8, 16, 24), tol_mm: float = 0.5):
+    """Give some points the coordinates a drawing would state, in millimetres.
+
+    The truth here is in metres, so this also exercises the unit conversion --
+    which is the thing most likely to be silently wrong, because a factor of
+    1000 on the datum leaves every reprojection residual looking perfect.
+    """
+    project.nominal_units, project.nominal_scale = "mm", 0.001
+    ids = [p.id for p in project.points]
+    chosen = []
+    for i in which:
+        pt = project.point(ids[i])
+        pt.nominal = [float(v * 1000.0) for v in truth["points"][i]]
+        pt.nominal_sigma = tol_mm
+        chosen.append(pt.id)
+    return chosen
+
+
+def test_nominals_put_the_solve_into_part_space():
+    """Three or more nominal'd points should stop the frame being arbitrary.
+
+    Without them a solve is correct only up to a similarity: right shape, no
+    opinion about where the origin is or which way is up. The whole value of a
+    nominal is that it removes those seven freedoms using a number you already
+    had on the drawing, rather than a tape measure held up to the scene.
+    """
+    project, truth = build_project()
+    free = solve(build_project()[0])
+    assert free.ok and not free.part_space, free.part_space
+
+    nominal_a_few(project, truth)
+    assert project.in_part_space()
+    report = solve(project)
+    assert report.ok, report.messages
+    assert report.part_space, report.messages
+    assert report.n_nominals == 4, report.n_nominals
+    assert report.scale_is_metric
+
+    # the nominal'd points should land on their nominals, and the free ones
+    # should land near truth in the same frame -- the frame is the point
+    ids = [p.id for p in project.points]
+    solved = {i: project.point(i).xyz for i in ids if project.point(i).xyz is not None}
+    held = [i for i in solved if project.point(i).nominal]
+    for pid in held:
+        want = np.array(project.point(pid).nominal) * project.nominal_scale
+        off_mm = float(np.linalg.norm(solved[pid] - want)) * 1000.0
+        assert off_mm < 2.0, (pid, off_mm)
+
+    kept = [i for i in solved]
+    err = np.array([
+        np.linalg.norm(solved[i] - truth["points"][ids.index(i)]) for i in kept
+    ])
+    extent = float(np.linalg.norm(BOX))
+    assert err.max() < 0.01 * extent, (err.max(), extent)
+
+
+def test_a_nominal_reports_asked_versus_achieved():
+    """A nominal the photographs disagree with has to be visible as a number,
+    not absorbed. Being told the part is 5 mm out is the entire reason to put it
+    into part space in the first place.
+
+    Six nominal'd points, not three, and that is the lesson rather than an
+    arbitrary choice: three points supply nine datum residuals against seven
+    gauge freedoms, so a single wrong nominal is very nearly free -- the frame
+    just shifts to meet it and the residual comes out at a hundredth of a
+    micron. Redundancy is what turns a nominal from a datum into a check."""
+    project, truth = build_project()
+    # 30 mm tolerance, which is about what this scene's photographs can
+    # actually resolve. Tighter than that and the nominals stop being a check
+    # and start being the answer -- see _warn_if_nominals_dictate.
+    held = nominal_a_few(project, truth, which=(0, 4, 8, 12, 16, 20), tol_mm=30.0)
+
+    # Lie about the best-observed of them, deliberately. A point seen in only
+    # two photos sits wherever its two rays cross and fits both exactly no
+    # matter where that is, so a nominal on one cannot be contradicted by
+    # anything -- see the warning in _warn_about_weak_nominals. Picking the
+    # most-seen point is what makes this test a test.
+    seen = {
+        pid: sum(1 for im in project.images if pid in im.observations) for pid in held
+    }
+    target = max(held, key=lambda pid: seen[pid])
+    assert seen[target] >= 4, seen
+    liar = project.point(target)
+    liar.nominal = [liar.nominal[0] + 200.0, liar.nominal[1], liar.nominal[2]]
+
+    honest, truth2 = build_project()
+    nominal_a_few(honest, truth2, which=(0, 4, 8, 12, 16, 20), tol_mm=30.0)
+    clean = solve(honest)
+    report = solve(project)
+    assert report.ok and clean.ok, report.messages
+
+    rows = [c for c in report.constraints if c.source == "nominal"]
+    assert len(rows) == 18, len(rows)
+    applied = [c for c in rows if c.applied]
+    assert applied, "nominals were generated but none reached the solve"
+
+    # Something is wrong, and the datum residuals do register it.
+    worst = max(applied, key=lambda c: abs(c.error))
+    assert worst.sigmas_off > 1.0, worst.sigmas_off
+
+    # and they name the culprit, because this point is seen in enough photos to
+    # resist being moved. That qualifier is the whole point: repeat this with a
+    # two-view point and the largest residual lands somewhere innocent, because
+    # a two-view point simply goes where it is told. Hence the warning.
+    assert worst.points[0] == target, (worst.points, target, seen)
+
+    # Most of the 200 mm stays in the datum residual rather than being absorbed.
+    assert abs(worst.error) > 0.05, worst.error
+
+    # And this is the part that decides where to look: the pixels stay quiet.
+    # A well-observed point does not move far, so the lie never becomes a
+    # reprojection error worth noticing -- under a pixel here, against a scene
+    # RMS of about the same. Diagnosing a bad nominal from the residual view is
+    # therefore hopeless; the constraint table is where it shows.
+    liar_px = report.points[target].rms_px
+    clean_px = clean.points[target].rms_px
+    assert liar_px < 3.0, liar_px
+    assert liar_px < 2.0 * max(clean_px, 0.3), (clean_px, liar_px)
+
+    # the rest of the scene should be largely unharmed
+    assert report.rms_reprojection_px < 2.0 * clean.rms_reprojection_px, (
+        clean.rms_reprojection_px, report.rms_reprojection_px
+    )
+
+
+def test_nominals_survive_a_round_trip():
+    project, truth = build_project()
+    nominal_a_few(project, truth)
+    project.points[1].uncertain = True
+    project.images[0].axis_lines[0].uncertain = True
+
+    back = Project.from_dict(project.to_dict())
+    assert back.nominal_units == "mm" and back.nominal_scale == 0.001
+    for a, b in zip(project.points, back.points):
+        assert a.nominal == b.nominal, (a.id, a.nominal, b.nominal)
+        assert a.nominal_sigma == b.nominal_sigma
+        assert a.uncertain == b.uncertain
+    assert back.images[0].axis_lines[0].uncertain is True
+    assert len(back.nominal_constraints()) == len(project.nominal_constraints()) == 12
+
+
+def test_uncertain_marks_pull_less_and_go_first():
+    """The flag has to do two things that sound contradictory: weigh the mark
+    less, and drop it sooner. Less weight alone would *protect* a bad mark from
+    the cull, since the cull measures in sigma and the flag widens sigma."""
+    base, _truth = build_project()
+    base.settings.cull_sigma = 0.0          # weighting only, so the two are separable
+    confident = solve(base)
+
+    doubted, _truth = build_project()
+    doubted.settings.cull_sigma = 0.0
+    victim = doubted.points[2].id
+    doubted.points[2].uncertain = True
+    flagged = solve(doubted)
+
+    # the doubted point is allowed to sit further out than it was
+    was = confident.points[victim].rms_px
+    now = flagged.points[victim].rms_px
+    assert now > was * 1.05, (was, now)
+
+    # and with culling on, a blunder on an uncertain point goes before the same
+    # blunder on a confident one
+    def cull_count(flag_it):
+        project, _t = build_project()
+        pid = project.points[2].id
+        project.points[2].uncertain = flag_it
+        hit = 0
+        for im in project.images:
+            if pid in im.observations:
+                im.observations[pid] = [im.observations[pid][0] + 11.0, im.observations[pid][1]]
+                hit += 1
+                if hit == 1:
+                    break
+        return solve(project).n_culled
+
+    assert cull_count(True) >= cull_count(False), (cull_count(True), cull_count(False))
+
+
+def test_uncertain_is_off_by_default_and_by_setting():
+    """Nothing changes for a project that does not use the flag, and a project
+    that does can switch its effect off without unflagging everything."""
+    a, _t = build_project()
+    plain = solve(a)
+
+    b, _t = build_project()
+    b.points[2].uncertain = True
+    b.images[0].axis_lines[0].uncertain = True
+    b.settings.uncertain_factor = 1.0
+    same = solve(b)
+
+    assert abs(plain.rms_reprojection_px - same.rms_reprojection_px) < 1e-6
+    assert abs(plain.rms_line_px - same.rms_line_px) < 1e-6
+
+
 def main() -> int:
     tests = [
         test_solve_recovers_ground_truth,
@@ -437,6 +637,11 @@ def main() -> int:
         test_reports_what_is_unsolvable,
         test_project_round_trip,
         test_exports_run,
+        test_nominals_put_the_solve_into_part_space,
+        test_a_nominal_reports_asked_versus_achieved,
+        test_nominals_survive_a_round_trip,
+        test_uncertain_marks_pull_less_and_go_first,
+        test_uncertain_is_off_by_default_and_by_setting,
     ]
     failures = 0
     for fn in tests:

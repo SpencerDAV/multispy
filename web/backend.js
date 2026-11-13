@@ -22,9 +22,18 @@ const Backend = (() => {
     window.MULTISPY_PYODIDE_URL || 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
 
   /* The package, in dependency order. __main__ and server are deliberately
-   * absent: one is a CLI and the other is the transport this replaces. */
-  const MODULES = [
-    '__init__', 'geometry', 'mesh', 'exif', 'project', 'solve', 'export', 'webapp',
+   * absent: one is a CLI and the other is the transport this replaces.
+   *
+   * The build states this list in config.js, because it is the build that
+   * decides which files land in py/. The literal below is only a fallback for
+   * a config.js written before that, and it is a fallback with teeth: when the
+   * two disagree, every module the build shipped but this list omits is simply
+   * never written to the virtual filesystem, and the first import of one takes
+   * the whole page down while the local server -- which never reads this --
+   * carries on working perfectly. */
+  const MODULES = window.MULTISPY_PY_MODULES || [
+    '__init__', 'geometry', 'mesh', 'exif', 'project', 'solve', 'part', 'edgefit',
+    'export', 'webapp',
   ];
 
   let pyodide = null;

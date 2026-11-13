@@ -72,6 +72,10 @@ class ImageReport:
     id: str
     positioned: bool = False
     n_observations: int = 0
+    n_culled: int = 0
+    """Marks in this photo dropped as outliers before the final pass. They are
+    still drawn and still listed in ``residual_lines``, flagged, because the
+    user has to see the bad arrow to know what to go and re-click."""
     rms_px: float = 0.0
     max_px: float = 0.0
     worst_point: str | None = None
@@ -107,6 +111,8 @@ class ConstraintReport:
     index: int
     type: str
     description: str
+    source: str = "constraint"
+    """``"nominal"`` for the datum locks a point's nominal XYZ generated."""
     points: list[str] = field(default_factory=list)
     applied: bool = True
     """False when the constraint's points were not solved, so it did nothing."""
@@ -138,8 +144,17 @@ class InstanceReport:
     """Anchors seen in 2+ photos. Three is the floor for a determined pose: two
     leave the body free to spin about the line joining them."""
     n_observations: int = 0
+    n_culled: int = 0
+    """Anchor marks on this body dropped as outliers before the final pass."""
     rms_px: float = 0.0
     max_px: float = 0.0
+    sigma_px: float = 0.0
+    """The uncertainty this body was actually weighted with in the final pass.
+
+    Starts at ``Settings.sigma_anchor_px`` and is raised to match the body's own
+    residuals whenever they are worse. That is the whole mechanism by which a
+    mis-marked object stops pulling the cameras around: it is not excluded, it
+    simply stops claiming an accuracy it has not demonstrated."""
     shape_rms: float = 0.0
     """How far the triangulated anchors sit from the model's own geometry, in
     world units. This is the diagnostic the free-point workflow cannot give you:
@@ -185,6 +200,8 @@ class SolveReport:
     n_images_positioned: int = 0
     n_points_triangulated: int = 0
     n_observations: int = 0
+    n_culled: int = 0
+    """Clicked marks dropped as outliers between the two bundle passes."""
     rms_reprojection_px: float = 0.0
     rms_line_px: float = 0.0
     init_condition: float = 0.0
@@ -207,6 +224,21 @@ class SolveReport:
     focals: dict[str, float] = field(default_factory=dict)
     scale_is_metric: bool = False
     scale_source: str = "arbitrary"
+    part_space: bool = False
+    """True when point nominals pinned the frame, so the solved coordinates are
+    the part's own coordinates and a CAD model of the part belongs at the
+    identity. Distinct from ``scale_is_metric``: a distance constraint gives
+    real units but leaves the origin and orientation arbitrary."""
+    n_nominals: int = 0
+    """Points carrying a nominal XYZ."""
+    part_fit: dict[str, Any] | None = None
+    """How well the part's own CAD model agrees with the reconstruction, when a
+    part is designated and the solve reached part space.
+
+    Carried in the solve report rather than fetched separately so the agreement
+    is reported at the same moment as the numbers that produced it. ``None``
+    means no part was designated or its model could not be read -- which is not
+    a failed fit and is not reported as one."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -217,12 +249,16 @@ class SolveReport:
             "n_images_positioned": self.n_images_positioned,
             "n_points_triangulated": self.n_points_triangulated,
             "n_observations": self.n_observations,
+            "n_culled": self.n_culled,
             "rms_reprojection_px": self.rms_reprojection_px,
             "rms_line_px": self.rms_line_px,
             "init_condition": self.init_condition,
             "focal_sigma_pct": self.focal_sigma_pct,
             "scale_is_metric": self.scale_is_metric,
             "scale_source": self.scale_source,
+            "part_space": self.part_space,
+            "n_nominals": self.n_nominals,
+            "part_fit": self.part_fit,
             "focals": self.focals,
             "images": {k: vars(v) for k, v in self.images.items()},
             "points": {k: vars(v) for k, v in self.points.items()},
@@ -602,11 +638,95 @@ def _transform_scene(
     # aligned against. The rotation takes no scale factor: the body's own size is
     # CAD truth, and this call is re-expressing the scene *into* those units, not
     # resizing the object.
-    for inst in project.instances:
+    for inst in project.placed_object_instances():
         if not inst.manual or inst.R is None or inst.t is None:
             continue
         inst.R = Rg @ inst.R
         inst.t = scale * (Rg @ inst.t) + tg
+
+
+def align_to_nominals(
+    project: Project,
+    positions: dict[str, np.ndarray],
+    image_ids: list[str],
+    report: SolveReport,
+) -> bool:
+    """Re-express the initialised scene in the frame the nominals state.
+
+    The linear initialisation deliberately normalises the scene to a working
+    scale of about 1, because at that point nothing has said what the real units
+    are. Nominals do say -- and on a machined part they say "0.12 metres across",
+    which leaves the initialisation twenty times too large.
+
+    Handing that to the bundle adjustment as a residual to fix is a bad idea,
+    and measurably so. A nominal with a half-millimetre tolerance evaluated on a
+    scene twenty times too big starts at some thousands of sigma, which dwarfs
+    every reprojection residual in the problem; the optimiser then satisfies the
+    nominals by whatever route is cheapest, and the cheapest route is to collapse
+    the focal length so that projections stop having an opinion. That is not a
+    hypothetical: on a 120 mm plate it drove a 2100 px focal to 1 px and left a
+    362 px reprojection RMS while reporting convergence.
+
+    So the nominals are applied as a *change of coordinates* before the refine,
+    the same way a locked known object is, rather than as a force during it.
+    Afterwards every nominal residual starts near zero and the bundle spends its
+    effort on the photographs, which is what it is for. Nothing about any
+    projection changes -- see :func:`_transform_scene`.
+
+    Returns whether the scene was moved.
+    """
+    nominal = [
+        (p.id, np.array([float(v) for v in p.nominal], dtype=float) * project.nominal_scale)
+        for p in project.points
+        if p.nominal and len(p.nominal) == 3 and all(v is not None for v in p.nominal)
+        and p.id in positions
+    ]
+    if len(nominal) < 2:
+        return False
+
+    source = np.array([positions[pid] for pid, _target in nominal])
+    target = np.array([t for _pid, t in nominal])
+
+    if project.in_part_space() and len(nominal) >= 3:
+        fit = similarity_fit(source, target, allow_scale=True)
+        if fit.degenerate or not (fit.scale > 0) or not np.isfinite(fit.scale):
+            report.messages.append(
+                "the point nominals could not be fitted to the initialisation, so the refinement "
+                "starts from arbitrary coordinates instead of the part's."
+            )
+            return False
+        _transform_scene(project, image_ids, positions, fit.scale, fit.R, fit.t)
+        report.messages.append(
+            f"initialisation re-expressed in part space from {len(nominal)} nominal(s) before "
+            f"refining: scale {fit.scale:.4g}, residual {fit.rms:.4g} in world units. The "
+            "nominals now start satisfied, so the bundle adjustment spends itself on the "
+            "photographs rather than on a change of units."
+        )
+        return True
+
+    # Two nominals, or three in a line: the frame is not pinned but the distance
+    # between them still states the scale, and the scale is the part of the
+    # mismatch that actually destabilises the refine.
+    best = max(
+        (
+            (float(np.linalg.norm(target[i] - target[j])), i, j)
+            for i in range(len(nominal))
+            for j in range(i + 1, len(nominal))
+        ),
+        default=(0.0, 0, 0),
+    )
+    span_target, i, j = best
+    span_source = float(np.linalg.norm(source[i] - source[j]))
+    if span_target <= 1e-12 or span_source <= 1e-12:
+        return False
+    scale = span_target / span_source
+    _transform_scene(project, image_ids, positions, scale, np.eye(3), np.zeros(3))
+    report.messages.append(
+        f"{len(nominal)} nominal(s) is not enough to fix the frame, but the distance between two "
+        f"of them set the scale ({scale:.4g}x) before refining, which is the part of it the bundle "
+        "adjustment handles badly."
+    )
+    return True
 
 
 def fit_instances(
@@ -641,12 +761,12 @@ def fit_instances(
         inst_id, name = split_anchor_key(key)
         by_instance.setdefault(inst_id, []).append((name, local, positions[key]))
 
-    if not project.instances:
+    if not project.placed_object_instances():
         return False, ""
 
     # ---- first pass: a scaled fit per instance
     scaled: dict[str, Any] = {}
-    for inst in project.instances:
+    for inst in project.placed_object_instances():
         rep = report.instances.setdefault(
             inst.id,
             InstanceReport(id=inst.id, template=inst.template, label=inst.label),
@@ -686,7 +806,8 @@ def fit_instances(
 
     if not scaled:
         report.warnings.append(
-            f"{len(project.instances)} known object(s) have no placeable anchors yet. Each needs "
+            f"{len(project.placed_object_instances())} known object(s) have no placeable anchors "
+            "yet. Each needs "
             "3 anchors marked in 2+ photos each before its pose is determined."
         )
         return False, ""
@@ -695,7 +816,7 @@ def fit_instances(
     # we only borrow its size and leave origin and orientation where they were
     locked = [
         inst
-        for inst in project.instances
+        for inst in project.placed_object_instances()
         if inst.locked and inst.R is not None and inst.t is not None and inst.id in scaled
     ]
     description = ""
@@ -773,7 +894,7 @@ def fit_instances(
         description = f"known object geometry ({unit})"
 
     # ---- second pass: the rigid pose each instance actually carries
-    for inst in project.instances:
+    for inst in project.placed_object_instances():
         rep = report.instances.get(inst.id)
         if inst.id not in scaled:
             # Clearing the pose is right for a fit that no longer has the
@@ -822,7 +943,7 @@ def build_rig_report(project: Project, report: SolveReport) -> RigReport:
     rig = RigReport()
     placed = [
         inst
-        for inst in project.instances
+        for inst in project.placed_object_instances()
         if inst.R is not None and inst.t is not None and report.instances.get(inst.id, InstanceReport(id=inst.id)).placed
     ]
     rig.n_instances = len(placed)
@@ -960,7 +1081,7 @@ class _Problem:
         # unknowns, not 36.
         self.instance_ids = [
             inst.id
-            for inst in project.instances
+            for inst in project.placed_object_instances()
             if inst.R is not None and inst.t is not None and inst.id in self.anchor_instances
         ]
         self.instance_slots: dict[str, int] = {}
@@ -1003,7 +1124,7 @@ class _Problem:
         self.n_obs = sum(len(idx) for _, idx, _ in self.obs)
 
         # ---- control lines, as homogeneous image lines plus their world axis
-        self.lines: list[tuple[str, int, np.ndarray, float]] = []
+        self.lines: list[tuple[str, int, np.ndarray, float, Any]] = []
         for iid in image_ids:
             im = project.image(iid)
             for ln in im.axis_lines:
@@ -1012,11 +1133,17 @@ class _Problem:
                 L = ln.length()
                 if L < 1e-6:
                     continue
-                self.lines.append((iid, ln.axis, np.cross(p0, p1), L))
+                self.lines.append((iid, ln.axis, np.cross(p0, p1), L, ln))
 
+        # Held, not recomputed. ``all_constraints()`` builds fresh objects for
+        # the nominals every call, so a second call would produce an equal list
+        # of different objects -- and the report, which matches by identity to
+        # find out which constraints actually reached the solve, would conclude
+        # that none of the nominals had.
+        self.declared = project.all_constraints()
         self.constraints = [
             c
-            for c in project.constraints
+            for c in self.declared
             if (
                 (isinstance(c, AxisLockConstraint) and c.point in self.pt_index)
                 or (
@@ -1026,6 +1153,63 @@ class _Problem:
                 )
             )
         ]
+
+        # ---- per-observation weights, and one sigma per known object
+        #
+        # Culling is done by zeroing a weight, never by removing the mark from
+        # these tables. The parameter layout, the residual offsets and the
+        # Jacobian sparsity then stay byte-for-byte identical between passes, so
+        # a second solve cannot silently shift an index -- and a dropped mark is
+        # still there to be reported back to the user.
+        # A mark flagged uncertain keeps contributing, at a wider sigma. The
+        # flag lives on the point and the line rather than on the observation,
+        # because that is how a person thinks about it: "I could not see that
+        # corner properly" is a fact about the feature, not about one photo of
+        # it. The same array carries both this and the outlier cull, so an
+        # uncertain mark that also turns out to be wrong simply reaches zero.
+        unc = 1.0 / max(float(self.s.uncertain_factor), 1e-6)
+        self.obs_weight = [
+            np.array([unc if self._uncertain_point(pid) else 1.0 for pid in self.obs_pids[iid]])
+            for iid, _idx, _uv in self.obs
+        ]
+        self.obs_confident = [w >= 1.0 for w in self.obs_weight]
+        self.line_weight = np.array(
+            [unc if ln.uncertain else 1.0 for _iid, _axis, _line, _L, ln in self.lines]
+        )
+        self.line_confident = self.line_weight >= 1.0
+        self.line_errs = np.zeros(len(self.lines))
+        """Filled by the first bundle pass; zeros mean nothing has been measured yet."""
+        self.anchor_weight = [np.ones(len(b[3])) for b in self.anchor_blocks]
+        self.anchor_confident = [np.ones(len(b[3]), dtype=bool) for b in self.anchor_blocks]
+        self.sigma_point = float(self.s.sigma_px)
+        self.anchor_sigma = {
+            inst_id: float(self.s.sigma_anchor_px) for inst_id in self.anchor_instances
+        }
+
+        # Marks per body, used to stop a densely marked object outvoting
+        # everything else. One body is 6 unknowns no matter how many anchors
+        # carry it, so N marks contribute 2N residuals against 6 parameters that
+        # cannot flex to absorb them: twenty anchors on one body otherwise swamp
+        # ten tie points. Scaling the residuals by (ref/N)^(1/4) lets a body's
+        # influence grow like sqrt(N) instead of N -- more marks still pin the
+        # pose better, they just stop compounding.
+        counts: dict[str, int] = {}
+        for _iid, inst_id, _local, uv, _keys in self.anchor_blocks:
+            counts[inst_id] = counts.get(inst_id, 0) + len(uv)
+        self.anchor_count_scale = {inst_id: 1.0 for inst_id in self.anchor_instances}
+        ref = float(self.s.anchor_count_ref)
+        if ref > 0:
+            for inst_id, n in counts.items():
+                if n > ref:
+                    self.anchor_count_scale[inst_id] = (ref / n) ** 0.25
+        self.anchor_row_scale = np.array(
+            [
+                self.anchor_count_scale[inst_id]
+                for _iid, inst_id, _local, uv, _keys in self.anchor_blocks
+                for _ in range(2 * len(uv))
+            ],
+            dtype=float,
+        )
 
         # ---- residual layout, as explicit offsets
         #
@@ -1050,6 +1234,10 @@ class _Problem:
         self.depth_weight = 100.0
         """Barrier stiffness for points drifting behind a camera. Scene scale is
         normalised to about 1 by the initialiser, so this is firm but bounded."""
+
+    def _uncertain_point(self, pid: str) -> bool:
+        pt = self.project.point(pid)
+        return bool(pt is not None and pt.uncertain)
 
     # ------------------------------------------------------------------ pack
 
@@ -1127,20 +1315,24 @@ class _Problem:
     def residuals(self, x: np.ndarray) -> np.ndarray:
         poses, cams, X, objects = self.unpack(x)
         out = np.zeros(self.n_residuals)
-        sp = self.s.sigma_px
+        sp = self.sigma_point
         sl = self.s.sigma_line_px
 
         cursor = self.o_reproj
         depth_cursor = self.o_depth
-        for iid, idx, uv in self.obs:
+        for (iid, idx, uv), w in zip(self.obs, self.obs_weight):
             R, t = poses[iid]
             cam = cams[self.group_of_image[iid]]
             pix, z = self._project_block(X[idx], R, t, cam)
             n = len(idx)
-            out[cursor : cursor + 2 * n : 2] = (pix[:, 0] - uv[:, 0]) / sp
-            out[cursor + 1 : cursor + 2 * n : 2] = (pix[:, 1] - uv[:, 1]) / sp
+            out[cursor : cursor + 2 * n : 2] = w * (pix[:, 0] - uv[:, 0]) / sp
+            out[cursor + 1 : cursor + 2 * n : 2] = w * (pix[:, 1] - uv[:, 1]) / sp
             cursor += 2 * n
-            out[depth_cursor : depth_cursor + n] = np.maximum(0.0, self.z_min - z) * self.depth_weight
+            # a culled mark drops its depth barrier too: it is no longer evidence
+            # about where that point is, so it has no business pushing on it
+            out[depth_cursor : depth_cursor + n] = (
+                w * np.maximum(0.0, self.z_min - z) * self.depth_weight
+            )
             depth_cursor += n
 
         # known-object anchors: same reprojection error, but the world point is
@@ -1148,22 +1340,28 @@ class _Problem:
         # parameter, so these residuals refine 6 unknowns per body no matter how
         # many anchors are marked
         cursor = self.o_anchor
-        for iid, inst_id, local, uv, _keys in self.anchor_blocks:
+        for (iid, inst_id, local, uv, _keys), w in zip(self.anchor_blocks, self.anchor_weight):
             R, t = poses[iid]
             R_obj, t_obj = objects[inst_id]
             cam = cams[self.group_of_image[iid]]
             pix, z = self._project_block(local @ R_obj.T + t_obj, R, t, cam)
             n = len(uv)
-            out[cursor : cursor + 2 * n : 2] = (pix[:, 0] - uv[:, 0]) / sp
-            out[cursor + 1 : cursor + 2 * n : 2] = (pix[:, 1] - uv[:, 1]) / sp
+            # this body's own sigma, not the tie-point one: looser to begin with,
+            # and raised further by the second pass if this body's marks have
+            # shown they deserve it
+            sa = self.anchor_sigma[inst_id]
+            out[cursor : cursor + 2 * n : 2] = w * (pix[:, 0] - uv[:, 0]) / sa
+            out[cursor + 1 : cursor + 2 * n : 2] = w * (pix[:, 1] - uv[:, 1]) / sa
             cursor += 2 * n
-            out[depth_cursor : depth_cursor + n] = np.maximum(0.0, self.z_min - z) * self.depth_weight
+            out[depth_cursor : depth_cursor + n] = (
+                w * np.maximum(0.0, self.z_min - z) * self.depth_weight
+            )
             depth_cursor += n
 
         # control lines: the world axis direction must lie in the plane through
         # the camera centre and the drawn image line
         cursor = self.o_lines
-        for iid, axis, line, L in self.lines:
+        for (iid, axis, line, L, _ln), w in zip(self.lines, self.line_weight):
             R, _ = poses[iid]
             cam = cams[self.group_of_image[iid]]
             nrm = cam.K().T @ line
@@ -1173,7 +1371,7 @@ class _Problem:
             else:
                 sin_angle = float((nrm / nn) @ R[:, axis])
                 # (L/2) * sin(angle) is the perpendicular pixel slip at the endpoints
-                out[cursor] = (L / 2.0) * sin_angle / sl
+                out[cursor] = w * (L / 2.0) * sin_angle / sl
             cursor += 1
 
         cursor = self.o_cons
@@ -1213,6 +1411,13 @@ class _Problem:
         # control lines. Constraints, the depth barrier and the gauge prior keep
         # their full weight.
         out[: self.o_cons] = _huberize(out[: self.o_cons], self.s.huber_f_scale)
+        # Per-body count normalisation goes on *after* the kernel, deliberately:
+        # the kernel asks "is this mark an outlier for its class?", which must be
+        # judged against that class's sigma, while this asks "how much should one
+        # body's evidence count?". Folding them together would let a densely
+        # marked body hide its own blunders under the knee.
+        if self.r_anchor:
+            out[self.o_anchor : self.o_anchor + self.r_anchor] *= self.anchor_row_scale
         return out
 
     # -------------------------------------------------------------- sparsity
@@ -1259,7 +1464,7 @@ class _Problem:
                 depth_row += 1
 
         row = self.o_lines
-        for iid, _axis, _line, _L in self.lines:
+        for iid, _axis, _line, _L, _ln in self.lines:
             k = self.img_index[iid]
             S[row, 6 * k : 6 * k + 3] = 1  # rotation only; translation cannot tilt a direction
             for pos in self.group_slots[self.group_of_image[iid]].values():
@@ -1318,17 +1523,257 @@ class _Problem:
             self.fixed_instances[inst_id] = (R_obj.copy(), t_obj.copy())
 
 
-def bundle_adjust(
-    project: Project,
-    intrinsics: dict[str, Intrinsics],
-    image_ids: list[str],
-    point_ids: list[str],
+def _line_errors(problem: _Problem, x: np.ndarray) -> np.ndarray:
+    """Each control line's endpoint slip in pixels: how far the drawn segment
+    misses the direction the solved rotation says that axis points."""
+    poses, cams, _X, _objects = problem.unpack(x)
+    out = np.zeros(len(problem.lines))
+    for i, (iid, axis, line, L, _ln) in enumerate(problem.lines):
+        R, _t = poses[iid]
+        nrm = cams[problem.group_of_image[iid]].K().T @ line
+        nn = np.linalg.norm(nrm)
+        out[i] = 0.0 if nn < 1e-12 else abs((L / 2.0) * float((nrm / nn) @ R[:, axis]))
+    return out
+
+
+def _observation_errors(
+    problem: _Problem, x: np.ndarray
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Reprojection error in pixels for every clicked mark, block by block.
+
+    Deliberately routed through the problem's own ``_project_block`` rather than
+    the generic projector: it is the same code path the residuals use, distortion
+    and depth clamp included, so a mark can never be judged an outlier by a
+    camera model slightly different from the one that placed it.
+    """
+    poses, cams, X, objects = problem.unpack(x)
+
+    point_errs = []
+    for iid, idx, uv in problem.obs:
+        R, t = poses[iid]
+        pix, _z = problem._project_block(X[idx], R, t, cams[problem.group_of_image[iid]])
+        point_errs.append(np.linalg.norm(pix - uv, axis=1))
+
+    anchor_errs = []
+    for iid, inst_id, local, uv, _keys in problem.anchor_blocks:
+        R, t = poses[iid]
+        R_obj, t_obj = objects[inst_id]
+        pix, _z = problem._project_block(
+            local @ R_obj.T + t_obj, R, t, cams[problem.group_of_image[iid]]
+        )
+        anchor_errs.append(np.linalg.norm(pix - uv, axis=1))
+
+    return point_errs, anchor_errs
+
+
+def _robust_scale(errs: np.ndarray, floor: float) -> float:
+    """A sigma read off the data itself, never below the stated click accuracy.
+
+    Median-based rather than RMS. The point of measuring is to find out how well
+    this set of marks agrees; letting one 40-pixel blunder inflate the estimate
+    would excuse exactly the mark we want to catch. The 0.8493 converts the
+    median of a 2D radial error back to a per-axis sigma (a Rayleigh
+    distribution's median is 1.177 sigma).
+
+    The floor matters as much as the estimate: a body whose three marks happen
+    to agree to a quarter pixel has not earned a quarter-pixel sigma, it has had
+    good luck. Settings state what a click is worth; the data is only allowed to
+    argue that it is worth less.
+    """
+    if errs.size == 0:
+        return float(floor)
+    return max(float(floor), 0.8493 * float(np.median(errs)))
+
+
+def _reweight_instances(
+    problem: _Problem, anchor_errs: list[np.ndarray], report: SolveReport
+) -> bool:
+    """Give every known object a sigma taken from its own residuals.
+
+    This is the answer to "a badly placed object makes the whole solve worse".
+    A body cannot flex: its anchors are nailed to the model's geometry, so marks
+    that disagree with the photos have nowhere to put that disagreement except
+    the camera poses. Measuring the disagreement and widening that body's sigma
+    by exactly as much lets it keep the influence it has earned and no more --
+    the cameras stop being dragged over to meet a body that was never marked
+    that well, while a crisply marked body loses nothing.
+    """
+    s = problem.s
+    by_instance: dict[str, list[np.ndarray]] = {}
+    for (_iid, inst_id, _local, _uv, _keys), errs in zip(problem.anchor_blocks, anchor_errs):
+        by_instance.setdefault(inst_id, []).append(errs)
+
+    changed = False
+    for inst_id, parts in sorted(by_instance.items()):
+        sigma = _robust_scale(np.concatenate(parts), s.sigma_anchor_px)
+        if sigma > problem.anchor_sigma[inst_id] * 1.01:
+            changed = True
+        problem.anchor_sigma[inst_id] = sigma
+        rep = report.instances.setdefault(inst_id, InstanceReport(id=inst_id))
+        rep.sigma_px = sigma
+        if sigma > s.sigma_anchor_px * 1.5:
+            rep.notes.append(
+                f"weighted at {sigma:.1f} px rather than the {s.sigma_anchor_px:g} px a body "
+                "normally gets, because its own anchor marks disagree by that much. It still "
+                "contributes, it just no longer claims an accuracy it has not shown"
+            )
+    return changed
+
+
+def _cull_outliers(
+    problem: _Problem,
+    point_errs: list[np.ndarray],
+    anchor_errs: list[np.ndarray],
     report: SolveReport,
-    max_iterations: int = 200,
-) -> tuple[_Problem, np.ndarray]:
-    problem = _Problem(project, intrinsics, image_ids, point_ids)
-    x0 = problem.pack()
-    result = least_squares(
+) -> bool:
+    """Drop the marks the robust kernel can only soften.
+
+    Huber bends a gross blunder's pull down to a constant, which is not the same
+    as removing it: a mark 80 px out still tugs forever with the force of one at
+    the knee. Past some point that is not noise to be down-weighted, it is a
+    click on the wrong corner, and the honest thing is to take it out and say so.
+
+    Guarded, because culling can starve the thing it is trying to clean: a track
+    needs 2 views, an image needs 2 marks, a body needs 3 anchors. Worst marks go
+    first, each one re-checked against what its removal would leave behind, and
+    the whole pass is capped at a fifth of the data -- if more than that looks
+    like an outlier the problem is not the marks, and quietly deleting them would
+    only hide it.
+    """
+    s = problem.s
+    # The scale is read off the *confident* marks only. Including the uncertain
+    # ones would let them widen the very threshold they are supposed to be
+    # judged against more harshly, which is backwards.
+    confident = [
+        e[c] for e, c in zip(point_errs, problem.obs_confident) if c.any()
+    ]
+    flat = np.concatenate(confident) if confident else np.zeros(0)
+    point_sigma = _robust_scale(flat, s.sigma_px)
+
+    # A mark flagged uncertain is held to a tighter threshold, which is what
+    # "more likely to be dropped" has to mean in practice: it is already
+    # down-weighted, so judging it at the same number of sigma as a confident
+    # mark would make the flag *protect* it from the cull.
+    factor = max(float(s.uncertain_factor), 1.0)
+    doubt_sigma = max(s.cull_sigma / factor, 2.0)
+
+    track_count: dict[str, int] = {}
+    image_count: dict[str, int] = {}
+    inst_count: dict[str, int] = {}
+    axis_count: dict[tuple[str, int], int] = {}
+    candidates: list[tuple[float, str, int, int, str, str, float]] = []
+
+    for b, ((iid, _idx, _uv), errs) in enumerate(zip(problem.obs, point_errs)):
+        sure = problem.obs_confident[b]
+        for j, (pid, e) in enumerate(zip(problem.obs_pids[iid], errs)):
+            track_count[pid] = track_count.get(pid, 0) + 1
+            image_count[iid] = image_count.get(iid, 0) + 1
+            limit = (s.cull_sigma if sure[j] else doubt_sigma) * point_sigma
+            if e > limit:
+                candidates.append((float(e / point_sigma), "point", b, j, iid, pid, float(e)))
+
+    for b, ((iid, inst_id, _l, _uv, keys), errs) in enumerate(
+        zip(problem.anchor_blocks, anchor_errs)
+    ):
+        sigma = problem.anchor_sigma[inst_id]
+        for j, (key, e) in enumerate(zip(keys, errs)):
+            image_count[iid] = image_count.get(iid, 0) + 1
+            inst_count[inst_id] = inst_count.get(inst_id, 0) + 1
+            if e > s.cull_sigma * sigma:
+                candidates.append((float(e / sigma), "anchor", b, j, iid, key, float(e)))
+
+    sure_lines = problem.line_errs[problem.line_confident] if len(problem.lines) else np.zeros(0)
+    line_sigma = _robust_scale(sure_lines, s.sigma_line_px)
+    for i, (iid, axis, _line, _L, _ln) in enumerate(problem.lines):
+        axis_count[(iid, axis)] = axis_count.get((iid, axis), 0) + 1
+        limit = (s.cull_sigma if problem.line_confident[i] else doubt_sigma) * line_sigma
+        if problem.line_errs[i] > limit:
+            candidates.append(
+                (
+                    float(problem.line_errs[i] / line_sigma),
+                    "line",
+                    i,
+                    axis,
+                    iid,
+                    f"{AXIS_NAMES[axis]} line",
+                    float(problem.line_errs[i]),
+                )
+            )
+
+    if not candidates:
+        return False
+
+    candidates.sort(key=lambda c: -c[0])
+    budget = max(1, int(0.2 * (problem.n_obs + problem.n_anchor_obs + len(problem.lines))))
+    dropped: list[tuple[str, str, float, float]] = []
+    starved = 0
+
+    for n_sigma, kind, b, j, iid, label, err in candidates:
+        if len(dropped) >= budget:
+            break
+        if kind != "line" and image_count.get(iid, 0) <= 2:
+            starved += 1
+            continue
+        if kind == "line":
+            # a vanishing point needs two lines; dropping to one leaves that
+            # axis of this photo's rotation resting on a single drag
+            if axis_count.get((iid, j), 0) <= 2:
+                starved += 1
+                continue
+            axis_count[(iid, j)] -= 1
+            problem.line_weight[b] = 0.0
+            report.images.setdefault(iid, ImageReport(id=iid)).n_culled += 1
+            dropped.append((iid, label, err, n_sigma))
+            continue
+        if kind == "point":
+            if track_count.get(label, 0) <= 2:
+                starved += 1
+                continue
+            track_count[label] -= 1
+            problem.obs_weight[b][j] = 0.0
+        else:
+            inst_id = problem.anchor_blocks[b][1]
+            if inst_count.get(inst_id, 0) <= 3:
+                starved += 1
+                continue
+            inst_count[inst_id] -= 1
+            problem.anchor_weight[b][j] = 0.0
+            report.instances.setdefault(inst_id, InstanceReport(id=inst_id)).n_culled += 1
+        image_count[iid] -= 1
+        report.images.setdefault(iid, ImageReport(id=iid)).n_culled += 1
+        dropped.append((iid, label, err, n_sigma))
+
+    if not dropped:
+        if starved:
+            report.warnings.append(
+                f"{starved} mark(s) look like outliers but could not be dropped without leaving "
+                "a point, a photo or an object with too few marks to solve. Mark more features "
+                "in those photos, or re-click the bad ones -- the solve is carrying them."
+            )
+        return False
+
+    report.n_culled = len(dropped)
+    worst = sorted(dropped, key=lambda d: -d[2])[:4]
+    listed = ", ".join(f"{label} in {iid} ({err:.0f} px)" for iid, label, err, _n in worst)
+    report.messages.append(
+        f"dropped {len(dropped)} mark(s) beyond {s.cull_sigma:g} sigma and re-solved without "
+        f"them; worst: {listed}"
+    )
+    report.warnings.append(
+        f"{len(dropped)} mark(s) disagreed with everything else badly enough to be left out of "
+        "the final solve. They are still drawn in the residual view so you can see them -- "
+        "check each is on the feature you meant, then re-solve."
+    )
+    if starved:
+        report.warnings.append(
+            f"a further {starved} mark(s) look just as bad but were kept, because dropping them "
+            "would leave a point, a photo or an object with too few marks to solve at all."
+        )
+    return True
+
+
+def _solve_once(problem: _Problem, x0: np.ndarray, max_iterations: int):
+    return least_squares(
         problem.residuals,
         x0,
         jac_sparsity=problem.jac_sparsity(),
@@ -1339,11 +1784,57 @@ def bundle_adjust(
         max_nfev=max_iterations,
         verbose=0,
     )
-    problem.write_back(result.x)
+
+
+def bundle_adjust(
+    project: Project,
+    intrinsics: dict[str, Intrinsics],
+    image_ids: list[str],
+    point_ids: list[str],
+    report: SolveReport,
+    max_iterations: int = 200,
+) -> tuple[_Problem, np.ndarray]:
+    """Refine everything jointly, then do it again knowing what went wrong.
+
+    Two passes rather than one, because the weights that matter can only be
+    measured from a solution: how well each body's marks actually agree, and
+    which individual clicks are blunders rather than noise. The first pass is
+    the measurement, the second is the answer. Both start from the same
+    initialisation as far as the gauge prior is concerned, so it still pulls
+    towards where the linear stage put things rather than towards pass one's
+    mistakes.
+    """
+    problem = _Problem(project, intrinsics, image_ids, point_ids)
+    x0 = problem.pack()
+
+    result = _solve_once(problem, x0, max_iterations)
     outcome = "converged" if result.status > 0 else "hit the iteration limit"
     report.messages.append(
         f"bundle adjustment: {result.nfev} evaluations, cost {result.cost:.4g}, {outcome}"
     )
+
+    s = project.settings
+    changed = False
+    if s.reweight_instances or s.cull_sigma > 0:
+        point_errs, anchor_errs = _observation_errors(problem, result.x)
+        problem.line_errs = _line_errors(problem, result.x)
+        if s.reweight_instances and problem.anchor_blocks:
+            changed |= _reweight_instances(problem, anchor_errs, report)
+        if s.cull_sigma > 0:
+            changed |= _cull_outliers(problem, point_errs, anchor_errs, report)
+
+    if changed:
+        # warm-started from the first pass: the reweighting is a correction to a
+        # solution that is already close, not a fresh problem
+        second = _solve_once(problem, result.x, max_iterations)
+        outcome = "converged" if second.status > 0 else "hit the iteration limit"
+        report.messages.append(
+            f"second pass after reweighting: {second.nfev} evaluations, "
+            f"cost {second.cost:.4g}, {outcome}"
+        )
+        result = second
+
+    problem.write_back(result.x)
     return problem, result.x
 
 
@@ -1371,19 +1862,29 @@ def _fill_statistics(
     per_point: dict[str, list[float]] = {}
     per_instance: dict[str, list[float]] = {}
 
-    def record(iid: str, label: str, observed: np.ndarray, reprojected: np.ndarray) -> float | None:
+    def record(
+        iid: str,
+        label: str,
+        observed: np.ndarray,
+        reprojected: np.ndarray,
+        used: bool = True,
+    ) -> float | None:
         """One observation's error, folded into every table that wants it.
 
         Anchor marks go through here on equal terms with tie points: they are
         clicks in that photo, so they belong in that photo's RMS, and a
         mis-marked body corner should raise the same alarm a mis-clicked tie
         point does.
+
+        A culled mark is still drawn and still listed, flagged -- the user has to
+        see the 40-pixel arrow to know what to go and re-click, and a cull that
+        hides its own evidence is just data loss. It is kept out of every summary
+        statistic though, so the RMS describes the fit that was actually used
+        rather than one the solver had already stopped believing.
         """
         err = float(np.linalg.norm(reprojected - observed))
         if not np.isfinite(err):
             return None
-        per_image.setdefault(iid, []).append((label, err))
-        sq_all.append(err**2)
         report.residual_lines.append(
             {
                 "image": iid,
@@ -1391,26 +1892,31 @@ def _fill_statistics(
                 "observed": [float(observed[0]), float(observed[1])],
                 "reprojected": [float(reprojected[0]), float(reprojected[1])],
                 "error_px": err,
+                "culled": not used,
             }
         )
+        if not used:
+            return None
+        per_image.setdefault(iid, []).append((label, err))
+        sq_all.append(err**2)
         return err
 
-    for iid, idx, uv in problem.obs:
+    for (iid, idx, uv), w in zip(problem.obs, problem.obs_weight):
         R, t = poses[iid]
         cam = cams[problem.group_of_image[iid]]
         proj = project_points(R, t, cam, X[idx])
-        for pid, observed, reprojected in zip(problem.obs_pids[iid], uv, proj):
-            err = record(iid, pid, observed, reprojected)
+        for pid, observed, reprojected, keep in zip(problem.obs_pids[iid], uv, proj, w > 0):
+            err = record(iid, pid, observed, reprojected, bool(keep))
             if err is not None:
                 per_point.setdefault(pid, []).append(err)
 
-    for iid, inst_id, local, uv, keys in problem.anchor_blocks:
+    for (iid, inst_id, local, uv, keys), w in zip(problem.anchor_blocks, problem.anchor_weight):
         R, t = poses[iid]
         cam = cams[problem.group_of_image[iid]]
         R_obj, t_obj = objects[inst_id]
         proj = project_points(R, t, cam, local @ R_obj.T + t_obj)
-        for key, observed, reprojected in zip(keys, uv, proj):
-            err = record(iid, key, observed, reprojected)
+        for key, observed, reprojected, keep in zip(keys, uv, proj, w > 0):
+            err = record(iid, key, observed, reprojected, bool(keep))
             if err is not None:
                 per_instance.setdefault(inst_id, []).append(err)
 
@@ -1432,9 +1938,14 @@ def _fill_statistics(
         rep.n_observations = len(arr)
         rep.rms_px = float(np.sqrt(np.mean(arr**2)))
         rep.max_px = float(arr.max())
+        # what this body was actually weighted with, which is the number that
+        # explains why it did or did not move the cameras
+        rep.sigma_px = float(
+            problem.anchor_sigma.get(inst_id, project.settings.sigma_anchor_px)
+        )
 
     per_image_lines: dict[str, list[float]] = {}
-    for iid, axis, line, L in problem.lines:
+    for (iid, axis, line, L, _ln), w in zip(problem.lines, problem.line_weight):
         R, _ = poses[iid]
         cam = cams[problem.group_of_image[iid]]
         nrm = cam.K().T @ line
@@ -1442,6 +1953,8 @@ def _fill_statistics(
         if nn < 1e-12:
             continue
         err = abs((L / 2.0) * float((nrm / nn) @ R[:, axis]))
+        if w <= 0.0:
+            continue   # culled: reported as a count, kept out of the RMS
         per_image_lines.setdefault(iid, []).append(err)
         line_sq_all.append(err**2)
     for iid, errs in per_image_lines.items():
@@ -1462,6 +1975,68 @@ def _fill_statistics(
     report.n_images_positioned = sum(1 for r in report.images.values() if r.positioned)
     report.n_points_triangulated = sum(1 for r in report.points.values() if r.triangulated)
     report.focals = {gid: float(cams[gid].f) for gid in cams}
+
+
+def _warn_about_weak_nominals(project: Project, report: SolveReport) -> None:
+    """A nominal on a two-view point is an assertion, not a measurement.
+
+    Two rays cross at exactly one place, so a point seen in two photos fits
+    both of them perfectly wherever it is put -- there is no redundancy left to
+    disagree with a nominal. Hand such a point a wrong coordinate and it goes
+    there quietly: the reprojection error stays near zero, the datum residual
+    stays near zero, and nothing anywhere says the drawing was wrong.
+
+    Three views is where a nominal starts being checkable, and the difference
+    is worth saying out loud, because the two cases look identical in every
+    number the report otherwise prints.
+    """
+    weak = []
+    for pt in project.points:
+        if not pt.nominal:
+            continue
+        rep = report.points.get(pt.id)
+        if rep is not None and rep.triangulated and rep.n_observations < 3:
+            weak.append(pt.id)
+    if not weak:
+        return
+    report.warnings.append(
+        f"{len(weak)} nominal'd point(s) are marked in only two photos "
+        f"({', '.join(sorted(weak)[:6])}): two rays cross in exactly one place, so these points "
+        "fit their photos perfectly wherever the nominal puts them. Their nominals steer the "
+        "solve but cannot be checked by it -- mark them in a third photo to make the deviation "
+        "readout mean something."
+    )
+
+
+def _warn_if_nominals_dictate(report: SolveReport) -> None:
+    """Say so when the nominals are not being checked, only obeyed.
+
+    A nominal with a tolerance far tighter than the photographs can argue with
+    does not measure anything: the solve simply bends the weakly-determined
+    point positions until every datum is satisfied exactly, and asked-versus-
+    achieved reads zero no matter how wrong the drawing is. That looks like a
+    perfect result and is actually the absence of one.
+
+    The signature is unmistakable once you look for it -- every nominal landing
+    at a tiny fraction of its own stated tolerance, across more of them than the
+    seven gauge freedoms could absorb. Three nominal'd points can legitimately
+    come out near-perfect (nine residuals against seven freedoms leaves almost
+    nothing to disagree with); five or more cannot, unless the tolerance is
+    doing the talking.
+    """
+    rows = [c for c in report.constraints if c.source == "nominal" and c.applied]
+    if len(rows) < 15:        # fewer than five nominal'd points: see above
+        return
+    worst = max((c.sigmas_off for c in rows), default=0.0)
+    if worst >= 0.1:
+        return
+    report.warnings.append(
+        f"all {len(rows) // 3} point nominals were met to under a tenth of their stated "
+        "tolerance. That is tighter than the photographs can argue with, so the nominals are "
+        "setting these coordinates rather than being checked against them -- the deviation "
+        "readout will show zero however wrong the drawing is. Loosen the tolerance to roughly "
+        "what the reconstruction can actually resolve if you want it to measure anything."
+    )
 
 
 def _describe_constraint(c: Constraint) -> str:
@@ -1541,11 +2116,12 @@ def _fill_constraint_statistics(
     applied = {id(c) for c in problem.constraints}
     violations: list[float] = []
 
-    for index, c in enumerate(project.constraints):
+    for index, c in enumerate(problem.declared):
         is_lock = isinstance(c, AxisLockConstraint)
         rep = ConstraintReport(
             index=index,
             type="axis_lock" if is_lock else "distance",
+            source=getattr(c, "source", "constraint"),
             description=_describe_constraint(c),
             points=[c.point] if is_lock else [c.point_a, c.point_b],
             target=float(c.value),
@@ -1582,6 +2158,11 @@ def _fill_constraint_statistics(
 def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     """Run the whole pipeline and return a report suitable for the UI."""
     report = SolveReport()
+
+    # Before anything else, because the part's identity pose is the definition
+    # of the frame the nominals build rather than a value to be refined, and a
+    # project reopened from a hand-edited file could carry anything here.
+    project.pin_part()
 
     report.stage = "calibrating images from control lines"
     intrinsics = calibrate_all(project, report)
@@ -1653,7 +2234,14 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     # starting, because that is the only moment the two sources of scale can be
     # compared without one having already been dragged towards the other.
     if metric_from_objects:
-        report.datum_scale, _n_pairs = stated_scale(project.constraints, positions.get)
+        report.datum_scale, _n_pairs = stated_scale(project.all_constraints(), positions.get)
+
+    # Last word on the frame, deliberately after the objects have had theirs:
+    # where both a known object and a drawing are present, the drawing is what
+    # the part's coordinates are defined by. The disagreement between them is
+    # not hidden -- ``datum_scale``, measured just above, is exactly that.
+    report.stage = "putting the initialisation in part space"
+    align_to_nominals(project, positions, main, report)
 
     point_ids = [tid for tid in keep_tracks if tid not in valid_anchors]
     for pid in point_ids:
@@ -1670,6 +2258,23 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     report.stage = "done"
     _fill_statistics(project, problem, x_final, report)
     _fill_constraint_statistics(project, problem, x_final, report)
+
+    _warn_if_nominals_dictate(report)
+    _warn_about_weak_nominals(project, report)
+    report.n_nominals = sum(1 for pt in project.points if pt.nominal)
+    report.part_space = project.in_part_space()
+    if report.part_space:
+        report.messages.append(
+            f"in part space: {report.n_nominals} point nominal(s) fix the origin, orientation "
+            "and scale, so these coordinates are the part's own. A CAD model of the part goes "
+            "in at the identity."
+        )
+    elif report.n_nominals:
+        report.warnings.append(
+            f"{report.n_nominals} point(s) carry a nominal, which is not enough to define part "
+            "space -- that needs three or more that do not lie in a straight line. The nominals "
+            "still constrain the solve, but the frame is not the part's."
+        )
 
     from_constraints = constraints_imply_scale(problem.constraints)
     report.scale_is_metric = bool(metric_from_objects) or from_constraints
@@ -1716,7 +2321,11 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
                 f"{off * 100:.2f}% -- two independent measurements, so this is a real check."
             )
 
-    hand = [inst for inst in project.instances if inst.manual and inst.R is not None]
+    hand = [
+        inst
+        for inst in project.placed_object_instances()
+        if inst.manual and inst.R is not None
+    ]
     if hand and not report.scale_is_metric:
         report.warnings.append(
             f"{len(hand)} object(s) are placed by hand in a scene with no real units. A CAD model "
@@ -1743,5 +2352,18 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
         )
 
     report.rig = build_rig_report(project, report)
+
+    # The part's fit, last, because it reads the solved point positions. Any
+    # failure to read the model is reported inside the fit report rather than
+    # thrown: a missing OBJ file is not a reason to lose a solve that worked.
+    project.pin_part()
+    if project.part_instance() is not None:
+        from .part import part_fit
+
+        fit = part_fit(project)
+        report.part_fit = fit.to_dict()
+        report.messages.extend(fit.messages)
+        report.warnings.extend(fit.warnings)
+
     report.ok = True
     return report
