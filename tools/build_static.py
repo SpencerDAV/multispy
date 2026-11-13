@@ -50,6 +50,7 @@ PY_MODULES = (
     "edgefit",
     "uncertainty",
     "sensors",
+    "calibfile",
     "export",
     "webapp",
 )

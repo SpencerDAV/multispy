@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import exif, export, uncertainty
+from . import calibfile, exif, export, sensors, uncertainty
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
 from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
 from .part import PartFitReport, part_fit, place_part
@@ -56,6 +56,7 @@ SHARED_ROUTES = frozenset(
         "/api/edge_refine",
         "/api/edge_revert",
         "/api/origin_uncertainty",
+        "/api/check_calibration",
     }
 )
 """Routes :meth:`Workspace.handle` answers, and both front ends therefore share.
@@ -584,6 +585,33 @@ class Workspace:
             project.origin_uncertainty = result.to_dict()
             self.save()
             return {"project": project_payload(self.project), "uncertainty": result.to_dict()}
+
+        # Reading a sensor calibration file and judging it. Takes the file's text
+        # rather than a path, because the browser build has no filesystem to hand
+        # one over from, and the text is what an upload already produces.
+        #
+        # Deliberately read-only: it does not touch the project. Turning imported
+        # poses into nominals and then judging the fit by how well those nominals
+        # were met would be circular -- the trap uncertainty.py's docstring names
+        # -- so looking at the file and believing it are separate actions.
+        if route == "/api/check_calibration":
+            project = Project.from_dict(body["project"], path=self.project.path)
+            imported = calibfile.read_export(body.get("text") or "")
+            s = project.settings
+            report = sensors.diagnose(
+                imported.sensors,
+                tol=float(s.sensor_tol),
+                warn=float(s.sensor_warn),
+                units=project.nominal_units,
+                depth_axis=(
+                    int(body["depth_axis"]) if body.get("depth_axis") is not None else None
+                ),
+            )
+            return {
+                "import": imported.to_dict(),
+                "report": report.to_dict(),
+                "grade": report.grade(float(s.sensor_tol), float(s.sensor_warn)),
+            }
 
         if route == "/api/rig":
             project = Project.from_dict(body["project"], path=self.project.path)
