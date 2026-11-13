@@ -375,6 +375,22 @@ class Settings:
     is always drawn beside the sphere for that reason."""
     origin_warn: float = 20.0
     """Over this, the sphere reads red. Between the two, amber."""
+    sensor_tol: float = 10.0
+    """How far a calibrated sensor may aim from the working volume the other
+    sensors agree on and still count as agreeing, in nominal units.
+
+    Loose on purpose, and chosen by the person inspecting the cell rather than
+    here. It is the floor on the consensus threshold as well as the pass mark:
+    :func:`multispy.sensors.robust_scale` will not let a cluster of sensors that
+    happen to agree to a millimetre convict every honest sensor outside it, so
+    this number is what the file is actually held to when it is unusually
+    self-consistent."""
+    sensor_warn: float = 50.0
+    """Past this a sensor's transform counts as badly wrong rather than drifted,
+    in nominal units. It also picks which description a failing sensor gets: a
+    miss inside this, at a small implied aim angle, reads as a mechanical nudge,
+    while one far outside it reads as a transform calibrated against the wrong
+    nominal feature."""
     uncertain_factor: float = 3.0
     """How much looser a mark flagged uncertain is weighted, and how much sooner
     it is culled. 1.0 makes the flag a label with no effect on the solve."""
