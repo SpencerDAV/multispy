@@ -367,6 +367,14 @@ class Settings:
     photos bend to the drawing. Loose enough by default that a nominal places
     the part without overriding what the images actually show; tighten it per
     point on the datum features that are supposed to define the frame."""
+    origin_good: float = 5.0
+    """At or under this, the origin's confidence sphere reads green, in nominal
+    units. A default, not a standard: the only right value is the tolerance the
+    part is actually inspected to, and anyone reading the colour without
+    setting this is reading my guess, not their requirement. The figure itself
+    is always drawn beside the sphere for that reason."""
+    origin_warn: float = 20.0
+    """Over this, the sphere reads red. Between the two, amber."""
     uncertain_factor: float = 3.0
     """How much looser a mark flagged uncertain is weighted, and how much sooner
     it is culled. 1.0 makes the flag a label with no effect on the solve."""
@@ -469,6 +477,12 @@ class Project:
     nominal_scale: float = 0.001
     """World metres per nominal unit. Kept explicitly beside ``nominal_units``,
     the same way a template does, so an odd scale survives a round trip."""
+    origin_uncertainty: dict[str, Any] | None = None
+    """Last measured spread of the part-space origin, as
+    ``uncertainty.OriginUncertainty.to_dict()``. Stored rather than recomputed
+    because it costs a few dozen re-solves, and carries the fingerprint of the
+    data it was measured on so a later edit shows as stale instead of silently
+    describing a project that no longer exists."""
     path: Path | None = None
 
     # ---------------------------------------------------------------- lookups
@@ -808,6 +822,7 @@ class Project:
         return {
             "version": FORMAT_VERSION,
             "name": self.name,
+            "origin_uncertainty": self.origin_uncertainty,
             "settings": asdict(self.settings),
             "groups": {gid: asdict(g) for gid, g in self.groups.items()},
             "images": [
@@ -1023,6 +1038,7 @@ class Project:
             settings=settings,
             nominal_units=d.get("nominal_units", "mm"),
             nominal_scale=float(d.get("nominal_scale", 0.001)),
+            origin_uncertainty=d.get("origin_uncertainty") or None,
             path=path,
         )
         project.pin_part()

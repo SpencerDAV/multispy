@@ -193,10 +193,47 @@ const Viewer3D = (() => {
    * in the drawing's own units. Seeing the triad sit on the datum corner of
    * the solved point cloud from any angle is the check the photographs can
    * only make one at a time. */
+  const GRADE_COLOR = { good: '#43d17a', warn: '#e8c33a', bad: '#e2553d', unknown: '#9aa0a6' };
+
+  /** The origin's confidence sphere, as three great circles.
+   *
+   *  Wireframe rather than a shaded ball because this renderer has no depth
+   *  buffer: a filled sphere would have to be sorted against the point cloud
+   *  it is meant to sit among, and would hide the very axes it is annotating.
+   *  Three circles read as a sphere and leave everything inside visible. */
+  function drawSphere(ctx, P, r, color, dashed) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    if (dashed) ctx.setLineDash([4, 4]);
+    for (let plane = 0; plane < 3; plane++) {
+      const a = plane, b = (plane + 1) % 3;
+      let prev = null;
+      ctx.beginPath();
+      for (let i = 0; i <= 72; i++) {
+        const th = (i / 72) * Math.PI * 2;
+        const w = [0, 0, 0];
+        w[a] = r * Math.cos(th);
+        w[b] = r * Math.sin(th);
+        const q = P.project(w);
+        if (!q) { prev = null; continue; }
+        if (prev) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
+        prev = q;
+      }
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
   function drawPartOrigin(ctx, P, origin) {
     const len = origin.len;
     const o = P.project([0, 0, 0]);
     if (!o) return;
+
+    if (origin.sphere && origin.sphere.r > 0) {
+      const col = GRADE_COLOR[origin.sphere.grade] || GRADE_COLOR.unknown;
+      drawSphere(ctx, P, origin.sphere.r, origin.sphere.stale ? col + '88' : col,
+                 origin.sphere.stale);
+    }
 
     for (let a = 0; a < 3; a++) {
       const end = [0, 0, 0];
@@ -214,13 +251,19 @@ const Viewer3D = (() => {
       ctx.fillText('XYZ'[a], e.x + 4, e.y - 4);
     }
 
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 1.5;
+    // As on the photographs: true-to-scale sphere, grade on the marker, since
+    // a millimetre sphere in a metre scene is smaller than the dot itself.
+    const grade = origin.sphere && GRADE_COLOR[origin.sphere.grade];
+    ctx.strokeStyle = grade || '#ffffff';
+    ctx.lineWidth = grade ? 2.5 : 1.5;
     ctx.beginPath();
     ctx.arc(o.x, o.y, 5, 0, Math.PI * 2);
     ctx.stroke();
     ctx.font = '11px sans-serif';
-    const caption = `0,0,0 · ${origin.L} ${origin.units} axes`;
+    const caption = origin.sphere
+      ? `0,0,0 · ${origin.L} ${origin.units} axes · ±${origin.sphere.label}`
+        + (origin.sphere.stale ? ' (stale)' : '')
+      : `0,0,0 · ${origin.L} ${origin.units} axes`;
     ctx.lineWidth = 3;
     ctx.strokeStyle = '#0b0d10cc';
     ctx.strokeText(caption, o.x + 9, o.y + 16);
@@ -514,6 +557,8 @@ const Viewer3D = (() => {
       `${(scene.cameras || []).length} photo camera(s)`,
       `${(scene.objects || []).filter((o) => o.placed).length} placed object(s)`,
       ...(scene.origin ? ["0,0,0 is the drawing's own origin"] : []),
+      ...(scene.origin && scene.origin.sphere
+          ? ['the sphere is where the origin sits 95% of the time'] : []),
       'click a camera to jump to that photo',
     ];
     ctx.font = '11px sans-serif';

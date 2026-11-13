@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import exif, export
+from . import exif, export, uncertainty
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
 from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
 from .part import PartFitReport, part_fit, place_part
@@ -55,6 +55,7 @@ SHARED_ROUTES = frozenset(
         "/api/place_part",
         "/api/edge_refine",
         "/api/edge_revert",
+        "/api/origin_uncertainty",
     }
 )
 """Routes :meth:`Workspace.handle` answers, and both front ends therefore share.
@@ -217,6 +218,12 @@ def project_payload(project: Project) -> dict:
     """The project as the client holds it, plus where its photos actually are."""
     data = project.to_dict()
     data["_path"] = str(project.path) if project.path else None
+    # Whether the stored origin sphere still describes this data. Computed here
+    # rather than in the client so the digest has exactly one implementation.
+    stored = project.origin_uncertainty
+    data["_origin_stale"] = bool(
+        stored and stored.get("fingerprint") != uncertainty.fingerprint(project)
+    )
     data["_images_meta"] = {}
     for im in project.images:
         path = project.resolve_path(im)
@@ -565,6 +572,18 @@ class Workspace:
                 "template": template.id,
                 "mesh": mesh_payload(path, self.mesh_cache, template.crease_angle),
             }
+
+        # The origin's confidence sphere. Its own route, and never folded into
+        # /api/solve, because it costs tens of re-solves: a solve that silently
+        # got 40x slower would be a worse bargain than an estimate you ask for.
+        if route == "/api/origin_uncertainty":
+            project = self.adopt(body["project"])
+            n = int(body.get("n") or uncertainty.DEFAULT_SAMPLES)
+            n = max(1, min(n, 512))
+            result = uncertainty.origin_uncertainty(project, n=n, seed=int(body.get("seed") or 0))
+            project.origin_uncertainty = result.to_dict()
+            self.save()
+            return {"project": project_payload(self.project), "uncertainty": result.to_dict()}
 
         if route == "/api/rig":
             project = Project.from_dict(body["project"], path=self.project.path)

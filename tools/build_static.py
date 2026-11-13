@@ -48,6 +48,7 @@ PY_MODULES = (
     "solve",
     "part",
     "edgefit",
+    "uncertainty",
     "export",
     "webapp",
 )

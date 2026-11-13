@@ -527,6 +527,41 @@ the length you read on a photograph. Turn it off and the gizmo comes back: that
 one marks the solved frame, which is worth seeing in a project with no nominals
 and worth nothing more than that.
 
+### How well is the origin actually known?
+
+The origin is not a feature anyone clicked. It is wherever the nominal'd points
+say it is, which makes it an *extrapolation* from the datum triangle — and
+extrapolations get worse with distance. Three datum points spanning a metre,
+carrying an origin a metre and a half beyond them, hand any angular error in
+that triangle straight to the origin with a lever on it.
+
+No number already in the solve report says so. The reprojection RMS does not,
+because the marks are as well fitted as ever. The asked-versus-achieved datum
+table does not either, because the fit puts the origin at (0,0,0) in its own
+frame *by construction*, however poor the data is. A project can show a perfect
+datum table and still not know where its origin is to a centimetre.
+
+So press **measure** in the Points panel, beside the "In part space" note. It
+re-solves the project a few dozen times with every mark and control-line
+endpoint jittered by its stated sigma, and watches where the origin lands
+relative to the scene. What comes back is a sphere you can see: on the
+photographs as a circle around the triad, in the 3D view as three great
+circles, labelled with its radius. The origin is inside it 95% of the time.
+
+| | |
+|---|---|
+| **green / amber / red** | Against `origin_good` and `origin_warn`, set in the same panel, in your nominal units. The defaults — 5 and 20 — are a guess, not a standard. Set them to the tolerance the part is actually inspected to, or read the figure and ignore the colour. |
+| **samples** | Each is a full re-solve, so this is the cost knob. 32 lands within about ±10% run to run, 64 within ±3%. Fewer than 8 refuses to grade at all. |
+| **the ellipsoid** | Printed when the scatter is more than 2:1, which it usually is: error along the lever is far worse than across it. The sphere is the 95% ball, not a ball drawn around the long axis, so a very elongated scatter makes it a loose summary and the per-axis sigmas are the better read. |
+| **(stale)** | The marks or nominals have changed since the measurement. The circle goes dashed and the figure describes the old data until you measure again. |
+
+Two honest limits. It measures *click noise only* — a nominal that is simply
+wrong, or a datum point clicked on the wrong feature in every photograph, moves
+the origin without widening this sphere at all. And nominals derived from the
+solve they then anchor are self-consistent by construction, so they inflate
+nothing here while validating nothing either. Read it as a floor on the
+uncertainty, never a ceiling.
+
 **Residuals** draws observed → reprojected vectors at **×10**, since a good fit
 is otherwise invisible.
 

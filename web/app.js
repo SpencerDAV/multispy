@@ -561,6 +561,7 @@ function projectPayload() {
   const copy = JSON.parse(JSON.stringify(state.project));
   delete copy._path;
   delete copy._images_meta;
+  delete copy._origin_stale;
   return copy;
 }
 
@@ -1851,6 +1852,43 @@ function partOriginAxis() {
   return { L, len: L * unit, units: nominalUnits() };
 }
 
+/* The origin's confidence sphere, or null if it has never been measured.
+ *
+ * The radius is a measurement and the colour is a judgement, so they are kept
+ * apart: the figure is always drawn, and the thresholds that colour it are the
+ * project's own. A green sphere against someone else's default thresholds
+ * would be the most misleading thing this overlay could show. */
+function originSphere() {
+  const u = state.project.origin_uncertainty;
+  if (!u || !u.n || !(u.radius > 0)) return null;
+  const st = state.project.settings || {};
+  const good = Number.isFinite(st.origin_good) ? st.origin_good : 5;
+  const warn = Number.isFinite(st.origin_warn) ? st.origin_warn : 20;
+  const thin = u.n < 8;
+  const grade = thin ? 'unknown' : (u.radius <= good ? 'good' : (u.radius <= warn ? 'warn' : 'bad'));
+  return {
+    radius: u.radius,                       // nominal units
+    world: u.radius * nominalScale(),       // metres, for drawing
+    grade,
+    stale: !!state.project._origin_stale,
+    n: u.n,
+    sigma: u.sigma || [],
+    anisotropy: u.anisotropy || 1,
+    sigma_px: u.sigma_px || 0,
+    units: u.units || nominalUnits(),
+  };
+}
+
+const GRADE_COLOR = { good: '#43d17a', warn: '#e8c33a', bad: '#e2553d', unknown: '#9aa0a6' };
+
+/* Enough digits to be read, never more than the estimate has. A sphere
+ * measured from a few dozen re-solves is good to a couple of significant
+ * figures, so printing 18.0271 would be inventing confidence. */
+function fmtRadius(v) {
+  const a = Math.abs(v);
+  return a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2);
+}
+
 function drawPartOrigin(im, z) {
   if (!im.R) return;
   if (!partSpaceState().ok) return;
@@ -1912,13 +1950,43 @@ function drawPartOrigin(im, z) {
     ctx.fillText(AXIS_NAME[a], e.x + 4 / z, e.y - 4 / z);
   }
 
-  ctx.strokeStyle = '#ffffff';
-  ctx.lineWidth = 1.5 / z;
+  // The confidence sphere reads as a circle from any camera. Its pixel radius
+  // is measured by projecting a point one radius to the camera's right rather
+  // than by reaching for the focal length: that way it stays right under
+  // whatever projection model the image actually carries.
+  const sph = originSphere();
+  if (sph) {
+    const right = [im.R[0][0], im.R[0][1], im.R[0][2]];
+    const edge = projectWorld(im, right.map((c) => c * sph.world));
+    if (edge) {
+      const rpx = Math.hypot(edge.x - o.x, edge.y - o.y);
+      const col = GRADE_COLOR[sph.grade] || GRADE_COLOR.unknown;
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, rpx, 0, Math.PI * 2);
+      ctx.fillStyle = col + '22';
+      ctx.fill();
+      ctx.strokeStyle = sph.stale ? col + '77' : col;
+      ctx.lineWidth = 2 / z;
+      if (sph.stale) ctx.setLineDash([5 / z, 4 / z]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // The sphere is drawn true to scale, which on a cell-sized scene is a couple
+  // of pixels: millimetres against metres. So the grade rides on the origin
+  // marker, which is always visible, and the circle is what you see once you
+  // zoom in far enough for it to mean something.
+  ctx.strokeStyle = sph ? (GRADE_COLOR[sph.grade] || GRADE_COLOR.unknown) : '#ffffff';
+  ctx.lineWidth = (sph ? 2.5 : 1.5) / z;
   ctx.beginPath();
   ctx.arc(o.x, o.y, 5 / z, 0, Math.PI * 2);
   ctx.stroke();
   ctx.font = `${11 / z}px sans-serif`;
-  const caption = `0,0,0 · ${L} ${nominalUnits()} axes`;
+  const caption = sph
+    ? `0,0,0 · ${L} ${nominalUnits()} axes · ±${fmtRadius(sph.radius)} ${sph.units}`
+      + (sph.stale ? ' (stale)' : '')
+    : `0,0,0 · ${L} ${nominalUnits()} axes`;
   ctx.lineWidth = 3 / z;
   ctx.strokeStyle = '#000000aa';
   ctx.strokeText(caption, o.x + 9 / z, o.y + 15 / z);
@@ -3214,6 +3282,98 @@ function initSectionFolding() {
   }
 }
 
+/* The origin's confidence, in the panel where the nominals that produce it
+ * live. Deliberately verbose about where the number comes from: a coloured dot
+ * invites being read as a verdict on the whole solve, when it is one quantity
+ * -- how far the origin wanders under click noise -- and blind to every
+ * systematic error in the project. */
+function originPanelHtml() {
+  const sph = originSphere();
+  const st = state.project.settings || {};
+  const u = nominalUnits();
+  const samples = state.originSamples || 32;
+
+  let head;
+  if (!sph) {
+    head = `<div class="note">The origin is extrapolated from the nominal'd points, so its `
+         + `error is not the reprojection RMS. Measure it to find out how far it moves when `
+         + `the marks are jittered.</div>`;
+  } else {
+    const col = GRADE_COLOR[sph.grade] || GRADE_COLOR.unknown;
+    const aniso = sph.anisotropy >= 2
+      ? ` The scatter is ${sph.anisotropy.toFixed(1)}:1, so the sphere is a loose summary of `
+        + `an ellipsoid ${sph.sigma.map((v) => fmtRadius(v)).join(' / ')} ${sph.units} across.`
+      : '';
+    head = `<div class="row" style="align-items:center;gap:6px">`
+         +   `<span style="width:10px;height:10px;border-radius:50%;background:${col};`
+         +     `display:inline-block;flex:none"></span>`
+         +   `<b>origin ±${fmtRadius(sph.radius)} ${escapeHtml(sph.units)}</b>`
+         +   `<span style="color:var(--text-dim)">95%, ${sph.n} samples</span>`
+         + `</div>`
+         + `<div class="note">`
+         +   (sph.stale
+               ? 'Marks or nominals have changed since this was measured — it describes the old data. '
+               : '')
+         +   `Click noise only, at ±${sph.sigma_px || st.sigma_px || 1.5} px: a floor on the `
+         +   `uncertainty, not a ceiling. A nominal that is simply wrong does not show up here.`
+         +   aniso
+         + `</div>`;
+  }
+
+  return `<div style="margin-bottom:7px">${head}`
+       + `<div class="row"><span class="k">samples</span>`
+       +   `<input type="number" id="originsamples" min="8" max="512" step="8" `
+       +   `value="${samples}" style="width:62px" title="Each one is a full re-solve">`
+       +   `<button class="smallbtn" id="measureorigin">measure</button></div>`
+       + `<div class="row"><span class="k">green ≤</span>`
+       +   `<input type="number" id="origingood" step="any" value="${st.origin_good ?? 5}" `
+       +   `style="width:62px"><span class="k">amber ≤</span>`
+       +   `<input type="number" id="originwarn" step="any" value="${st.origin_warn ?? 20}" `
+       +   `style="width:62px"><span class="k">${escapeHtml(u)}</span></div>`
+       + `</div>`;
+}
+
+function wireOriginPanel() {
+  const btn = $('measureorigin');
+  if (!btn) return;
+  const n = $('originsamples');
+  n.onchange = () => { state.originSamples = Math.max(8, Math.min(512, parseInt(n.value, 10) || 32)); };
+  for (const [id, key] of [['origingood', 'origin_good'], ['originwarn', 'origin_warn']]) {
+    const el = $(id);
+    if (!el) continue;
+    el.onchange = () => {
+      const v = parseFloat(el.value);
+      if (!Number.isFinite(v) || v < 0) return;
+      state.project.settings[key] = v;
+      markDirty();
+      renderPanels();
+      render();
+      if (Viewer3D.isOn()) Viewer3D.render();
+    };
+  }
+  btn.onclick = async () => {
+    const count = Math.max(8, Math.min(512, parseInt(n.value, 10) || 32));
+    state.originSamples = count;
+    btn.disabled = true;
+    setStatus(`measuring the origin — ${count} re-solves…`);
+    try {
+      const data = await api('/api/origin_uncertainty', { project: projectPayload(), n: count });
+      adopt(data);
+      const got = originSphere();
+      setStatus(got
+        ? `origin ±${fmtRadius(got.radius)} ${got.units} (95%, ${got.n} samples)`
+        : 'the origin could not be measured', got ? 'ok' : 'warn');
+    } catch (err) {
+      setStatus(`could not measure the origin: ${err.message || err}`, 'warn');
+    } finally {
+      btn.disabled = false;
+      renderPanels();
+      render();
+      if (Viewer3D.isOn()) Viewer3D.render();
+    }
+  };
+}
+
 function renderPointsPanel() {
   const im = currentImage();
   const el = $('ptpanel');
@@ -3229,6 +3389,7 @@ function renderPointsPanel() {
       : `<div class="note">${ps.n} nominal'd point(s). Three or more, not in a straight line, `
         + `put the solve into the part's own frame.</div>`;
   }
+  if (ps.ok) html += originPanelHtml();
   html += `<div style="display:flex;gap:5px;margin-bottom:6px">`
            + `<button class="smallbtn" id="newpt">new point (N)</button>`
            + `<button class="smallbtn" id="nextmissing">next missing (Tab)</button></div>`
@@ -3324,6 +3485,7 @@ function renderPointsPanel() {
   }
   el.innerHTML = html;
 
+  wireOriginPanel();
   $('newpt').onclick = () => { newPoint(); setMode('points'); renderPanels(); render(); };
   $('nextmissing').onclick = () => { if (state.activePoint) advanceToMissing(state.activePoint); };
   $('autoadv').onchange = (e) => { state.autoAdvance = e.target.checked; };
@@ -4545,6 +4707,12 @@ function buildScene() {
    * while the Origin toggle is on, so one checkbox governs both views. */
   const ps = partSpaceState();
   const origin = state.showOrigin && ps.ok ? partOriginAxis() : null;
+  if (origin) {
+    const sph = originSphere();
+    // metres, like everything else the viewer is handed
+    if (sph) origin.sphere = { r: sph.world, grade: sph.grade, stale: sph.stale,
+                               label: `${fmtRadius(sph.radius)} ${sph.units}` };
+  }
 
   return { points, cameras, objects, center, extent, origin };
 }
