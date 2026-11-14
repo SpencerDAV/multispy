@@ -1238,11 +1238,39 @@ class _Problem:
         self.o_cons = self.o_lines + self.r_lines
         self.o_depth = self.o_cons + self.r_constraints
         self.o_gauge = self.o_depth + self.r_depth
-        self.n_residuals = self.o_gauge + self.r_gauge
+        self.r_focal = len(self.group_ids)
+        self.o_focal = self.o_gauge + self.r_gauge
+        self.n_residuals = self.o_focal + self.r_focal
         self.z_min = 1e-3
         self.depth_weight = 100.0
         """Barrier stiffness for points drifting behind a camera. Scene scale is
         normalised to about 1 by the initialiser, so this is firm but bounded."""
+
+        # ---- the wall around the focal
+        #
+        # ``self.fixed[gid].f`` is the focal the control lines just measured --
+        # this runs after ``calibrate_all`` and before the bundle has touched
+        # anything -- so the window is centred on an independent measurement
+        # made from different evidence, not on a guess.
+        #
+        # Multiplicative, because a focal length is a scale: half and double are
+        # the same distance away, and a ratio window cannot reach zero or go
+        # negative however hard the optimiser pushes. See
+        # ``Settings.focal_bound_factor`` for what a real refinement costs
+        # against what a collapse costs.
+        self.focal_bounds: dict[str, tuple[float, float]] = {}
+        k = float(self.s.focal_bound_factor)
+        if k > 1.0:
+            for gid in self.group_ids:
+                f_measured = float(self.fixed[gid].f)
+                if np.isfinite(f_measured) and f_measured > 0:
+                    self.focal_bounds[gid] = (f_measured / k, f_measured * k)
+        self.focal_barrier_weight = 1e3
+        """Stiffness of the focal wall, in residual units per unit of relative
+        excursion. Large because nothing legitimate is ever outside the window,
+        and because the trap on the far side is worth ~1e5 of cost: a soft wall
+        would only make the collapse expensive, and expensive is not the same as
+        unreachable."""
 
     def _uncertain_point(self, pid: str) -> bool:
         pt = self.project.point(pid)
@@ -1281,10 +1309,29 @@ class _Problem:
         return so3_exp(x[pos : pos + 3]), x[pos + 3 : pos + 6]
 
     def intrinsics_at(self, x: np.ndarray, gid: str) -> Intrinsics:
+        """The group's intrinsics as the parameter vector currently states them,
+        with the focal clamped into its window.
+
+        The clamp is here, in the single place every consumer of the focal goes
+        through -- reprojections, anchors, control lines, ``write_back`` -- so
+        there is no route by which a focal outside the window can reach a
+        projection, be reported, or be saved to the project file.
+
+        Clamping *and* penalising, rather than either alone, is the same bargain
+        ``_project_block`` strikes with depth. The penalty alone would only make
+        the collapse expensive, and the optimiser demonstrably pays far more
+        than that to reach it. The clamp alone would leave the parameter free to
+        wander off with nothing to bring it back. Together there is no gradient
+        to be had outside the window and a force pushing back in, so the trap is
+        not merely costly, it is unreachable."""
         base = self.fixed[gid]
         slots = self.group_slots[gid]
+        f = x[slots["f"]] if "f" in slots else base.f
+        bounds = self.focal_bounds.get(gid)
+        if bounds is not None:
+            f = min(max(f, bounds[0]), bounds[1])
         return Intrinsics(
-            f=x[slots["f"]] if "f" in slots else base.f,
+            f=f,
             cx=x[slots["cx"]] if "cx" in slots else base.cx,
             cy=x[slots["cy"]] if "cy" in slots else base.cy,
             k1=x[slots["k1"]] if "k1" in slots else base.k1,
@@ -1427,6 +1474,25 @@ class _Problem:
         # marked body hide its own blunders under the knee.
         if self.r_anchor:
             out[self.o_anchor : self.o_anchor + self.r_anchor] *= self.anchor_row_scale
+
+        # The focal wall. One row per group, zero while the focal is inside its
+        # window, and growing with the excursion once it is outside. Deliberately
+        # after the robust kernel: a Huber knee on this row would cap the very
+        # force that has to be uncapped, which is how the collapse won in the
+        # first place -- 68 tie points each softened to a bounded pull, against
+        # one body with an unbounded gain to chase.
+        cursor = self.o_focal
+        for gid in self.group_ids:
+            bounds = self.focal_bounds.get(gid)
+            slots = self.group_slots[gid]
+            if bounds is None or "f" not in slots:
+                out[cursor] = 0.0
+            else:
+                lo, hi = bounds
+                f = x[slots["f"]]
+                excursion = max(0.0, lo - f) + max(0.0, f - hi)
+                out[cursor] = self.focal_barrier_weight * excursion / max(hi, 1.0)
+            cursor += 1
         return out
 
     # -------------------------------------------------------------- sparsity
@@ -1509,6 +1575,12 @@ class _Problem:
             for i in range(6):
                 S[row + i, pos + i] = 1
             row += 6
+
+        row = self.o_focal
+        for gid in self.group_ids:
+            slots = self.group_slots[gid]
+            S[row, slots["f"] if "f" in slots else 0] = 1  # placeholder when locked
+            row += 1
 
         return S.tocsr()
 

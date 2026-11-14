@@ -454,6 +454,35 @@ class Settings:
     solve_principal_point: bool = False
     """Try the 3-vanishing-point orthocenter during initialisation. Noisy; off by default."""
     refine_focal: bool = True
+    focal_bound_factor: float = 1.5
+    """How far the bundle may move the focal length from the value the control
+    lines measured, as a multiplying factor either way. Anything at or below 1
+    removes the bound entirely -- to hold the focal still, set ``lock_focal`` on
+    the camera group, which says so plainly and does not pretend to refine.
+
+    A bound rather than a prior, because the focal does not need steering inside
+    this window -- it needs a wall around a trap outside it. The focal is the one
+    parameter shared by every image in a group, so a single badly marked known
+    object can buy itself a cheap fit by shrinking it, and the cost lands on all
+    nine photographs at once. Measured on the cell this was found on: a known
+    object whose anchors were clicked onto the wrong features, already
+    down-weighted to 569 px by ``reweight_instances``, still dragged a 2786 px
+    focal to 1.6 px and reported convergence at a cost of 1.04e5 -- while the
+    same solve with the focal held still finished at 3557. The collapse is not a
+    cheaper answer the solver preferred, it is a local minimum it fell into and
+    could not climb back out of, which is why tapering the body's weight cannot
+    stop it and a wall can. A synthetic version of the same body takes the focal
+    to 0.016 px, and to *negative* values on another seed: a camera turned
+    inside out.
+
+    1.5 is deliberately generous. The legitimate refinement on that cell moved
+    the focal by 1% (2786 -> 2757), which is 0.4 of the control lines' own
+    stated uncertainty, and EXIF agreed with the lines to 0.35%; a bundle that
+    wants to move it by half has not refined a calibration, it has lost one.
+    The number is a setting because control lines can be genuinely poor -- see
+    the warning ``calibrate_all`` raises past 8% -- and someone in that position
+    may need the room. Widen it before suspecting it, and prefer
+    ``lock_focal`` if the focal is known."""
     edge_refine: bool = False
     """Allow the image-edge refinement to touch camera poses at all.
 
