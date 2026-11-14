@@ -5329,22 +5329,60 @@ function autoAnchors(tid, want = 8) {
   const mesh = meshFor(tid);
   const picks = (mesh && mesh.picks) || [];
   if (!t || !picks.length) return 0;
-  const pool = picks.slice().sort(
-    (a, b) => (PICK_RANK[a.kind] ?? 9) - (PICK_RANK[b.kind] ?? 9) || b.score - a.score);
+  t.anchors = t.anchors || [];
   const dist = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
-  const chosen = [pool[0]];
-  while (chosen.length < want && chosen.length < pool.length) {
+
+  /* Idempotent, because this button invites a second press and used to reward
+   * one with a second copy of every anchor. The copies took fresh names, so
+   * nothing on screen looked wrong -- the list simply grew, and every anchor
+   * the user then snapped was recorded against each copy at the identical
+   * pixel. Measured on a nine-photograph cell: a template pressed four times
+   * reached 32 anchors at 8 distinct positions, so each click voted four times.
+   * That is past what the (ref/N)^0.25 count normalisation softens, and out of
+   * reach of the outlier cull, which can drop one copy of a bad click and
+   * leave three. Worse, it is invisible in every readout -- the body's shape
+   * error and implied scale are unchanged by duplication, because they are
+   * properties of the marks. So a position the model has already given is not
+   * offered twice. */
+  const span = picks.length > 1
+    ? Math.max(...picks.map((a) => Math.max(...picks.map((b) => dist(a.xyz, b.xyz)))))
+    : 1;
+  const same = Math.max(span * 1e-4, 1e-9);
+  const held = t.anchors.map((a) => a.xyz);
+  const pool = picks
+    .filter((c) => !held.some((h) => dist(c.xyz, h) <= same))
+    .sort((a, b) => (PICK_RANK[a.kind] ?? 9) - (PICK_RANK[b.kind] ?? 9) || b.score - a.score);
+
+  /* Spread is measured against the anchors already on the template as well as
+   * the ones being added, so topping a part back up after deleting a few puts
+   * the new ones in the gaps rather than wherever the part is emptiest. */
+  const chosen = [];
+  while (held.length + chosen.length < want && chosen.length < pool.length) {
+    const against = held.concat(chosen.map((c) => c.xyz));
     let best = null, bestScore = -Infinity;
     for (const c of pool) {
       if (chosen.includes(c)) continue;
-      const near = Math.min(...chosen.map((k) => dist(c.xyz, k.xyz)));
+      const near = against.length
+        ? Math.min(...against.map((k) => dist(c.xyz, k)))
+        : Infinity;
       const s = near * (PICK_WEIGHT[c.kind] ?? 0.7);
       if (s > bestScore) { bestScore = s; best = c; }
     }
     if (!best) break;
     chosen.push(best);
   }
-  t.anchors = t.anchors || [];
+
+  if (!chosen.length) {
+    setStatus(
+      held.length
+        ? `this model's ${held.length} anchor(s) already are the points it offers — `
+          + 'delete one to have it picked again, or add your own in the 3D view (D)'
+        : 'this model offers no anchor points to take',
+      'warn'
+    );
+    return 0;
+  }
+
   const used = new Set(t.anchors.map((a) => a.name));
   let i = 1;
   for (const c of chosen) {
