@@ -1550,6 +1550,22 @@ def nominal_candidates(
                     if verdict
                     else "withheld: no verdict was reached for this sensor"
                 )
+
+            # An off-centre band cannot be carried by one symmetric sigma, so it
+            # is said here rather than quietly averaged away. See
+            # asymmetric_limits.
+            skew = asymmetric_limits(feature)
+            if skew:
+                parts = ", ".join(
+                    f"{'XYZ'[axis]} +{usl:g}/{lsl:g} (centred {(usl + lsl) / 2.0:+.2f})"
+                    for axis, usl, lsl in skew
+                )
+                note += (
+                    f". Note the spec band is not centred on the nominal: {parts}. The "
+                    f"tolerance offered here is that band's half-width; the offset it implies "
+                    f"is not applied, because moving the nominal would rewrite the figure the "
+                    f"drawing states"
+                )
             out.append(
                 NominalCandidate(
                     feature=feature.name,
@@ -1569,14 +1585,52 @@ def nominal_candidates(
 def _tightest_limit(feature: FeatureClaim) -> float | None:
     """The feature's own tolerance, from the file's spec limits.
 
-    Half-limits, because ``nominal_sigma`` is a one-sided tolerance while the
-    file states an upper and a lower. Returns ``None`` rather than a default when
-    the file states nothing -- ``Settings.sigma_nominal`` is then the honest
-    fallback, and inventing a tolerance here would dress a guess as a measurement.
+    One number, because ``nominal_sigma`` is a single symmetric tolerance while
+    the file states an upper and a lower limit per axis. The tightest axis wins,
+    since the point is held to all of them at once. ``None`` rather than a
+    default when the file states nothing -- ``Settings.sigma_nominal`` is then
+    the honest fallback, and inventing a tolerance here would dress a guess as a
+    measurement.
+
+    An asymmetric band is summarised by its *half-width*, not by its tighter
+    side. Taking the tighter side reads "+0.50 / -3.50" as a half-millimetre
+    tolerance when the band it describes is four millimetres wide, and that is
+    not conservatism, it is a different claim about the part. Measured on the
+    cell this was found on: RH_CP_58 is the one asymmetric feature in a
+    22-feature file, it was imported at 0.5 mm, and the point marked on it then
+    read 6.5 sigma out of a tolerance it had never actually been given -- while
+    the photographs agreed with the drawing to 1.84 mm on the one axis that
+    feature measures.
+
+    What this still cannot express, and what the caller should know: a band
+    centred away from the nominal. "+0.50 / -3.50" says the feature is expected
+    1.5 mm below its nominal, and a symmetric sigma about the nominal cannot say
+    that. Shifting the nominal to suit would be worse -- it would silently
+    rewrite the drawing's own number -- so the asymmetry is reported instead.
     """
     halves: list[float] = []
     for usl, lsl in feature.limits:
-        for value in (usl, lsl):
-            if value is not None and abs(float(value)) > 1e-9:
-                halves.append(abs(float(value)))
+        stated = [abs(float(v)) for v in (usl, lsl) if v is not None and abs(float(v)) > 1e-9]
+        if not stated:
+            continue
+        # Both sides stated: the half-width of the band they bound. One side
+        # only: that side is all the file offers, so it stands alone.
+        halves.append(sum(stated) / 2.0 if len(stated) == 2 else stated[0])
     return min(halves) if halves else None
+
+
+def asymmetric_limits(feature: FeatureClaim) -> list[tuple[int, float, float]]:
+    """Axes whose spec band is not centred on the nominal, as ``(axis, usl, lsl)``.
+
+    Separate from :func:`_tightest_limit` because it is a different question. The
+    tolerance asks "how much may this move"; this asks "is it expected to sit
+    somewhere other than where the drawing says", which no single ``nominal_sigma``
+    can carry and which therefore has to be said in words.
+    """
+    out: list[tuple[int, float, float]] = []
+    for axis, (usl, lsl) in enumerate(feature.limits):
+        if usl is None or lsl is None:
+            continue
+        if abs(abs(float(usl)) - abs(float(lsl))) > 1e-9:
+            out.append((axis, float(usl), float(lsl)))
+    return out

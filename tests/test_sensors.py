@@ -774,6 +774,66 @@ def test_a_candidates_tolerance_comes_from_the_file_not_from_a_default():
     )
 
 
+def test_an_asymmetric_band_is_its_half_width_not_its_tighter_side():
+    """A band of "+0.50 / -3.50" is four millimetres wide. Reading it as a
+    half-millimetre tolerance is not caution, it is a different claim.
+
+    Found on a real export: RH_CP_58 was the one asymmetric feature in a
+    22-feature file, came in at 0.5 mm, and the point marked on it then read
+    6.5 sigma out of a tolerance the drawing had never given it -- while the
+    photographs agreed with that drawing to 1.84 mm on the single axis the
+    feature actually measures. The symmetric cases have to stay exactly as they
+    were, which is most of the value of pinning this down.
+    """
+    centre = np.array([5000.0, 0.0, 600.0])
+    cell = healthy_cell(4)
+    cell.sensor("ASYM", centre, features=[centre])
+    imp = cell.read()
+    feature = imp.sensors[0].features[0]
+
+    # symmetric, as the fixture writes it: unchanged by this
+    assert feature.limits[0] == (5.0, -5.0), feature.limits[0]
+    cands = nominal_candidates(imp.sensors, diagnose(imp.sensors, tol=TOL, warn=WARN))
+    assert next(c for c in cands if c.serial == "ASYM").sigma == 5.0
+
+    # the same band pushed off centre: +0.5 / -3.5 is 2.0 either side of its own
+    # middle, not 0.5
+    feature.limits = ((None, None), (0.5, -3.5), (None, None))
+    got = nominal_candidates(
+        [imp.sensors[0]], diagnose([imp.sensors[0]], tol=TOL, warn=WARN)
+    )[0]
+    assert got.sigma == 2.0, f"an asymmetric band came back as {got.sigma}"
+
+    # and the offset it implies has to be said, since one symmetric sigma about
+    # the nominal cannot carry it
+    assert "not centred" in got.note, got.note
+    assert "-1.50" in got.note, got.note
+
+    # one side stated and the other blank is not a band, so it stands alone
+    feature.limits = ((None, None), (None, -3.5), (None, None))
+    lone = nominal_candidates(
+        [imp.sensors[0]], diagnose([imp.sensors[0]], tol=TOL, warn=WARN)
+    )[0]
+    assert lone.sigma == 3.5, f"a one-sided limit came back as {lone.sigma}"
+    assert "not centred" not in lone.note, lone.note
+
+
+def test_a_symmetric_band_is_unchanged_whatever_its_sign_order():
+    """The fix above must not disturb the ordinary case, which is all the others."""
+    centre = np.array([5000.0, 0.0, 600.0])
+    cell = healthy_cell(4)
+    cell.sensor("SYM", centre, features=[centre])
+    imp = cell.read()
+    feature = imp.sensors[0].features[0]
+    for band in ((4.0, -4.0), (-4.0, 4.0)):
+        feature.limits = ((8.0, -8.0), band, (None, None))
+        got = nominal_candidates(
+            [imp.sensors[0]], diagnose([imp.sensors[0]], tol=TOL, warn=WARN)
+        )[0]
+        assert got.sigma == 4.0, (band, got.sigma)
+        assert "not centred" not in got.note, got.note
+
+
 def test_the_pick_list_and_its_provenance_round_trip():
     cell = healthy_cell(4)
     imp = cell.read()
