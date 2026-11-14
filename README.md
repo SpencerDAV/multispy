@@ -608,7 +608,9 @@ space — which is exactly when you want it.
 | | |
 |---|---|
 | **spread** | Largest pair ratio over smallest. 1.0 is a set that agrees with itself. This is the headline because it owes nothing to a fit: no rotation and no origin were chosen before computing it, so nothing can absorb the error. |
-| **rms**, **worst sigma** | The similarity fit's residual, per point, against that point's own stated tolerance. In sigmas because one calibration file's tolerances run 0.5 mm to 8 mm, and a fixed millimetre threshold would excuse the tight features or condemn the loose ones. |
+| **rms**, **worst sigma** | The similarity fit's residual, per point, against the tolerance in force. In sigmas because one calibration file's tolerances run 0.5 mm to 8 mm, and a fixed millimetre threshold would excuse the tight features or condemn the loose ones. |
+| **precision** | The finest agreement these photographs could show at that point — each view constrains it across its own ray by about `rms_px / focal` radians at that view's depth, summed over the views that see it. The tolerance in force is the **larger** of this and the drawing's. Without it, any feature toleranced finer than the camera can resolve reads as contradicted for ever: `RH_CP_58` is held to 0.5 mm, nine phone photographs place a point to about 2 mm, and a perfectly correct link came back at 20 sigma. It takes the baseline into account and not just the pixel error, because a point in two nearly-parallel views is barely placed along the viewing direction however sharp its marks are — the first version of this floor assumed otherwise and convicted a two-view point for weak geometry. |
+| **suspect** | The one point whose removal turns a failing set consistent, when there is exactly one. A similarity fit splits one bad link's error across every point, so the residuals name nobody; refitting without each in turn does. Silent when nothing single explains it — two bad links, or a swap, which is two by definition — and silent at three points, where dropping one leaves two and any two points fit each other. |
 | **consistent / suspect / contradicted** | Worst point within 3× its tolerance, within 5×, or beyond. |
 | **untestable** | A real answer, not a failure. Fewer than three nominal'd points, a set too near collinear, too few of them placeable from the photographs alone, or a solve that failed. |
 | **reproj** | The nominal-free re-solve's own RMS. Read it first: if the photographs do not agree with each other, their disagreement with the drawing says nothing yet about the links. |
@@ -618,13 +620,18 @@ the spread — about 6% — while the shape residual goes to forty times toleran
 A swap across its 120 mm length moves the spread by a factor of 37. Either
 number alone has a blind spot the other covers.
 
-Three limits worth stating. It cannot say **which** point is wrong, only that
-the set disagrees — with one bad link among four, the fit spreads the residual
-over all four. It cannot see an error that **preserves shape**: a whole set
-shifted together, or nominals taken from the solve they then anchor. And below
-three points it declines rather than passes, because two points and a free scale
-fit each other whatever they are, and a pass there would be the pass somebody
-quotes.
+Three limits worth stating. It cannot see an error that **preserves shape**: a
+whole set shifted together, or nominals taken from the solve they then anchor.
+Below three points it declines rather than passes, because two points and a free
+scale fit each other whatever they are, and a pass there would be the pass
+somebody quotes. And naming a suspect is a place to look, not a verdict — one
+link wrong badly enough drags its neighbours, so confirm it against the
+photographs before acting on it.
+
+Read the **magnitude**, not only the colour. A swapped feature puts the residual
+a hundredfold or more above the precision figure; a few times above it is a
+marking or a geometry problem instead — a point in too few views, or in views
+too close together — and the report says which of the two it is looking at.
 
 ### Is the sensor calibration file telling the truth?
 

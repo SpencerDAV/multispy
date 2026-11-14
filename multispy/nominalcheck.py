@@ -87,12 +87,67 @@ solves carry.
 
 DEFAULT_TOL_SIGMAS = 3.0
 DEFAULT_WARN_SIGMAS = 5.0
-"""How far off a point may sit, in multiples of its own stated tolerance.
+"""How far off a point may sit, in multiples of the tolerance in force.
 
 In sigmas rather than millimetres because the tolerances in one calibration
 file span 0.5 mm to 8 mm, and a fixed millimetre threshold would either excuse
 the tight features or condemn the loose ones.
 """
+
+
+def point_precision(
+    rays: list[np.ndarray], depths: list[float], focal_px: float, rms_px: float, scale: float
+) -> float:
+    """How finely these photographs could place one point, in nominal units.
+
+    A stated tolerance is what the *part* is held to. It is not what the
+    photographs can see, and grading on the stated figure alone was wrong in a
+    way that took a real cell to notice: RH_CP_58 is toleranced to 0.5 mm, nine
+    phone photographs of a 2.5 m cell place a point to about 2 mm at best, so a
+    correct link read as 20 sigma and the verdict said "contradicted" for ever.
+    Every feature toleranced finer than the camera can resolve would have done
+    the same, and a check that cannot return a pass for correct input is not a
+    check -- it is a light that is always on.
+
+    So the tolerance in force is the *larger* of what the drawing asks and what
+    the photographs can deliver, and this is the second of those. Each view
+    constrains the point across its own ray and not along it, by about
+    ``rms_px / focal`` radians at that view's depth. Summing those constraints
+    gives the usual information matrix, and the square root of its inverse's
+    largest eigenvalue is the worst direction the point is pinned in.
+
+    Taking the baseline into account rather than assuming it is what makes this
+    worth the arithmetic. A point in two nearly-parallel views is barely placed
+    along the viewing direction however sharp the marks are, and a floor derived
+    from pixel error alone would have called that precision and then convicted
+    the point for not having it -- which is exactly what happened to a two-view
+    point on the first attempt at this function.
+
+    What it still does not include: the error in the camera poses themselves. It
+    is the precision of the triangulation given the cameras, so it remains a
+    floor, and ``uncertainty.py``'s Monte Carlo is the honest way to the rest.
+    """
+    if focal_px <= 0 or scale <= 0 or len(rays) < 2:
+        return float("inf")
+    H = np.zeros((3, 3))
+    for d, z in zip(rays, depths):
+        n = float(np.linalg.norm(d))
+        if n <= 1e-12 or z <= 0:
+            continue
+        u = np.asarray(d, dtype=float) / n
+        across = (abs(rms_px) / focal_px) * float(z)      # world units across the ray
+        if across <= 1e-12:
+            continue
+        H += (np.eye(3) - np.outer(u, u)) / (across * across)
+    try:
+        cov = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        return float("inf")
+    w = np.linalg.eigvalsh(cov)
+    worst = float(np.sqrt(max(w.max(), 0.0)))
+    if not np.isfinite(worst):
+        return float("inf")
+    return worst / scale
 
 
 @dataclass
@@ -113,6 +168,16 @@ class PointShape:
     """True when the file stated no tolerance and ``Settings.sigma_nominal``
     was used. These are the points that act as rigid anchors in a solve, so a
     large residual on one of them matters more than its size suggests."""
+    floor: float = 0.0
+    """The finest agreement the photographs could show at this point's depth,
+    in nominal units. See :func:`precision_floor`."""
+    sigma_used: float = 0.0
+    """``max(sigma, floor)`` -- the tolerance this point is actually graded
+    against, and what ``sigmas`` divides by. Reported next to both so a reader
+    can see which of the two is doing the work."""
+    floor_governs: bool = False
+    """True when the floor is the larger of the two, i.e. the drawing asks for
+    finer agreement than these photographs can demonstrate either way."""
     residual: list[float] = field(default_factory=list)
     """Where the shape fit puts it, minus where the nominal says, nominal units."""
     deviation: float = 0.0
@@ -178,6 +243,27 @@ class ShapeReport:
     collinearity: float = 0.0
     """Second singular value over the first for the nominal'd set. See
     ``COLLINEAR_LIMIT``."""
+    suspect: str = ""
+    """The one point whose removal turns a failing set consistent, if there is
+    exactly one.
+
+    The limitation this answers is in the module docstring: a similarity fit
+    splits one bad link's error over every point, so the residuals name nobody.
+    Refitting without each point in turn does name somebody, and costs nothing
+    worth counting -- the re-solve is already done and what is left is a 3x3
+    SVD per point. Empty when no single removal helps, when more than one does
+    (two bad links, or one so bad it has dragged a neighbour past the line), or
+    when there are only ``MIN_POINTS`` to begin with and dropping one would
+    leave too few to judge."""
+    suspect_rms: float = 0.0
+    """The fit's RMS once ``suspect`` is left out, for comparison with ``rms``."""
+    precision: float = 0.0
+    """Median precision floor over the compared points, in nominal units: about
+    the finest disagreement these photographs could have shown. Read it beside
+    ``rms`` -- an RMS near this figure is as close to the drawing as the camera
+    can testify, and no amount of re-marking will drive it lower."""
+    n_floored: int = 0
+    """Compared points whose stated tolerance was finer than that floor."""
     reproj_px: float = 0.0
     """Reprojection RMS of the nominal-free re-solve. Read it first: if the
     photographs do not agree with each other, a disagreement with the drawing
@@ -318,21 +404,85 @@ def check_nominal_shape(
     report.scale = median
     report.spread = float(ratios.max() / ratios.min()) if ratios.min() > 1e-18 else float("inf")
 
+    # How finely could these photographs tell the difference? Each point's own
+    # depth in the cameras that see it, against the error the re-solve actually
+    # achieved. Taken from the trial solve, because that is the reconstruction
+    # the residuals below were measured against.
+    rays: dict[str, list[np.ndarray]] = {}
+    depths: dict[str, list[float]] = {}
+    for im in trial.images:
+        if im.R is None or im.t is None:
+            continue
+        R, t = np.asarray(im.R, dtype=float), np.asarray(im.t, dtype=float)
+        centre = -R.T @ t
+        for r in usable:
+            X = got.get(r.id)
+            if X is None or r.id not in im.observations:
+                continue
+            z = float((R @ X + t)[2])
+            if z > 0:
+                rays.setdefault(r.id, []).append(np.asarray(X, dtype=float) - centre)
+                depths.setdefault(r.id, []).append(z)
+
+    focal = 0.0
+    for grp in trial.groups.values():
+        focal = max(focal, float(grp.f or 0.0))
+
     fit = similarity_fit(A, B, allow_scale=True)
     placed = fit.scale * (A @ fit.R.T) + fit.t
     for r, got_xyz in zip(usable, placed):
         d = got_xyz - np.array(r.nominal)
         r.residual = [float(v) for v in d]
         r.deviation = float(np.linalg.norm(d))
-        r.sigmas = r.deviation / r.sigma if r.sigma > 1e-12 else float("inf")
+        r.floor = point_precision(rays.get(r.id, []), depths.get(r.id, []), focal,
+                                  float(solved.rms_reprojection_px), scale_mm)
+        r.sigma_used = max(r.sigma, r.floor)
+        r.floor_governs = r.floor > r.sigma
+        r.sigmas = r.deviation / r.sigma_used if r.sigma_used > 1e-12 else float("inf")
 
     report.rms = float(np.sqrt(np.mean([r.deviation ** 2 for r in usable])))
     report.worst_sigmas = max(r.sigmas for r in usable)
+    report.precision = float(np.median([r.floor for r in usable]))
+    report.n_floored = sum(1 for r in usable if r.floor_governs)
     report.points = rows
     report.pairs = pairs
     report.n_compared = len(usable)
     report.ok = True
     report.verdict = _verdict(report.worst_sigmas, tol_sigmas, warn_sigmas)
+
+    # Which single point, if any, is the one the set disagrees with. Only worth
+    # asking when dropping one still leaves enough to judge: at MIN_POINTS a
+    # removal leaves two, and two points agree with each other whatever they
+    # are, so every candidate would "fix" it and the answer would be noise.
+    if report.verdict != "consistent" and len(usable) > MIN_POINTS:
+        cleared: list[tuple[float, str]] = []
+        for k, cand in enumerate(usable):
+            keep = [r for j, r in enumerate(usable) if j != k]
+            Ak = np.array([got[r.id] for r in keep])
+            Bk = np.array([r.nominal for r in keep])
+            fk = similarity_fit(Ak, Bk, allow_scale=True)
+            place_k = fk.scale * (Ak @ fk.R.T) + fk.t
+            devs = [float(np.linalg.norm(pl - np.array(r.nominal)))
+                    for pl, r in zip(place_k, keep)]
+            worst_k = max(d / r.sigma_used if r.sigma_used > 1e-12 else float("inf")
+                          for d, r in zip(devs, keep))
+            if _verdict(worst_k, tol_sigmas, warn_sigmas) == "consistent":
+                cleared.append((float(np.sqrt(np.mean([d * d for d in devs]))), cand.id))
+        if len(cleared) == 1:
+            report.suspect_rms, report.suspect = cleared[0]
+            report.messages.append(
+                f"leaving {report.suspect} out makes the rest consistent, at "
+                f"{report.suspect_rms:.1f} {units} RMS against {report.rms:.1f} for all "
+                f"{len(usable)}. That is where to look first -- though a set of four with "
+                f"one link wrong can also read this way about the point the wrong one was "
+                f"dragging, so confirm it against the photographs rather than acting on it."
+            )
+        elif len(cleared) > 1:
+            report.messages.append(
+                f"no single point accounts for the disagreement -- dropping any one of "
+                f"{', '.join(c for _, c in cleared)} would clear it, which usually means "
+                f"more than one link is wrong."
+            )
 
     worst = max(usable, key=lambda r: r.sigmas)
     report.messages.append(
@@ -346,13 +496,35 @@ def check_nominal_shape(
         f"{worst.id} at {worst.deviation:.1f} {units} = {worst.sigmas:.1f}x its "
         f"{worst.sigma:g} {units} tolerance."
     )
-    if report.verdict != "consistent":
+    # Said only when the disagreement dwarfs what the photographs could resolve.
+    # Written for a set that was out by half a metre, where it was the plain
+    # truth; left ungated it also fired on a set out by 7 mm against a 1.6 mm
+    # precision, where "no rigid motion repairs this" is technically so and
+    # wildly the wrong emphasis -- that is a marking or a weak-geometry problem,
+    # not a mislabelled feature.
+    if report.verdict != "consistent" and report.precision > 0             and report.rms > 20.0 * report.precision:
         report.messages.append(
             "a set this far out of shape is not a marking-precision problem: no rotation, "
             "translation or scale takes one of these shapes to the other, so at least one "
             "point is linked to a feature that is not the one under it. Check the pairs "
             "the drawing puts closest together against the pairs the photographs do, and "
             "the left/right sides first."
+        )
+    elif report.verdict != "consistent":
+        report.messages.append(
+            f"the disagreement is {report.rms / max(report.precision, 1e-9):.0f}x what these "
+            f"photographs can resolve, not the hundredfold a swapped feature gives. Suspect "
+            f"the marks or the geometry behind the worst point before suspecting its link: "
+            f"a point in few views, or in views close together, is weakly placed and will "
+            f"sit out of shape without anything being mislabelled."
+        )
+    if report.n_floored:
+        report.messages.append(
+            f"{report.n_floored} point(s) are graded against what these photographs can "
+            f"resolve ({report.precision:.1f} {units} median) rather than the finer figure "
+            f"the drawing states, because no marking could demonstrate agreement closer "
+            f"than that either way. An RMS near {report.precision:.1f} {units} is as close "
+            f"to the drawing as this camera can testify."
         )
     if len(usable) == MIN_POINTS:
         report.warnings.append(
@@ -361,11 +533,19 @@ def check_nominal_shape(
         )
     defaulted = [r for r in usable if r.sigma_defaulted]
     if defaulted:
+        # Careful what this now claims. Since grading moved to the larger of the
+        # stated tolerance and the precision floor, an untoleranced point is
+        # almost always judged against the floor, not against sigma_nominal --
+        # so saying it is "judged against the default" contradicts the table
+        # directly above it. What remains true, and is the part worth saying, is
+        # that the default still governs these points in an ORDINARY solve,
+        # where it makes them rigid anchors.
         report.warnings.append(
             f"{len(defaulted)} compared point(s) have no stated tolerance "
-            f"({', '.join(r.id for r in defaulted)}) and are being judged against the "
-            f"{default_sigma:g} {units} default. That default also makes them rigid "
-            f"anchors in an ordinary solve, so a wrong link on one of these does more "
-            f"damage than a wrong link anywhere else."
+            f"({', '.join(r.id for r in defaulted)}), so they are judged here against what "
+            f"the photographs resolve. In an ordinary solve they fall back to the "
+            f"{default_sigma:g} {units} default instead, which makes them near-rigid "
+            f"anchors on the frame -- so a wrong link on one of these does more damage "
+            f"there than a wrong link anywhere else."
         )
     return report

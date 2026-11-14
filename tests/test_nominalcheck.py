@@ -36,6 +36,22 @@ What is being defended here:
   copy that leaked back would silently strip the nominals off the caller's
   project.
 
+* **A tolerance finer than the camera does not convict.** Grading against the
+  stated figure alone made a correct link on a 0.5 mm feature read as 20 sigma,
+  because nine phone photographs cannot place a point that finely. The verdict
+  is taken against the larger of the drawing's tolerance and the reconstruction's
+  own precision -- and the floor that makes that work must never be loose enough
+  to excuse a real swap, which is asserted directly.
+
+* **The precision follows the geometry, not just the pixels.** A point in two
+  views is barely placed along the viewing direction however sharp its marks
+  are. If that stops being true the floor is back to convicting weak geometry
+  for being weak.
+
+* **Drop-one-out names a single wrong link**, and stays silent when it cannot
+  mean anything -- at exactly three points a removal leaves two, and two points
+  agree with each other whatever they are.
+
 Run directly for a readable report::
 
     .venv\\Scripts\\python.exe tests\\test_nominalcheck.py
@@ -234,6 +250,121 @@ def test_it_does_not_modify_the_project() -> None:
     assert before == after, (
         "check_nominal_shape changed the project it was given -- it strips every "
         "nominal to do its work, so a leak here deletes the caller's nominals"
+    )
+
+
+def test_a_tolerance_finer_than_the_camera_does_not_convict() -> None:
+    """The bug this grading was changed to fix.
+
+    The plate's nominals are right. Tightening what the drawing *asks* cannot
+    make them wrong, because the photographs place these points to about 0.7 mm
+    and nothing stated below that is a claim either way.
+    """
+    for tol in (0.5, 0.05, 0.001):
+        r = check_nominal_shape(fixture(nominal_sigma=tol))
+        assert r.ok, r.reason
+        assert r.verdict == "consistent", (
+            f"a correct set with a {tol} mm stated tolerance came back {r.verdict!r} "
+            f"(rms {r.rms:.3f} mm against a precision floor of {r.precision:.3f} mm) -- "
+            f"grading is demanding more than the camera can show"
+        )
+    assert r.n_floored == r.n_compared, "the floor should be governing every point at 0.001 mm"
+
+
+def test_the_precision_floor_cannot_whitewash_a_swap() -> None:
+    """The floor must excuse only what no camera could resolve.
+
+    The other half of the fix above, and the more important half: a floor loose
+    enough to pass a swapped link would have turned the whole check off while
+    leaving it looking like it worked.
+    """
+    for tol in (0.5, 0.001):
+        for a, b in ((0, 1), (0, 4)):
+            r = check_nominal_shape(swapped(a, b, nominal_sigma=tol))
+            assert r.ok, r.reason
+            assert r.verdict == "contradicted", (
+                f"p{a}<->p{b} at stated {tol} mm came back {r.verdict!r} -- the precision "
+                f"floor ({r.precision:.3f} mm) is excusing a {r.rms:.1f} mm swap"
+            )
+            assert r.rms > 10.0 * r.precision, (
+                f"a swap left {r.rms:.2f} mm against a {r.precision:.2f} mm floor; if those "
+                f"ever come close the floor is too loose to separate them"
+            )
+
+
+def test_precision_tracks_how_many_views_place_the_point() -> None:
+    """Two views place a point far worse than seven, at identical pixel error.
+
+    Asserted because the first version of this floor used pixel error and depth
+    alone, which is blind to the baseline -- it called a two-view point precise
+    and then convicted it for not being.
+    """
+    r = check_nominal_shape(fixture())
+    assert r.ok, r.reason
+    project = fixture()
+    seen = {}
+    for im in project.images:
+        for pid in im.observations:
+            seen[pid] = seen.get(pid, 0) + 1
+    rows = [(seen.get(q.id, 0), q.floor, q.id) for q in r.points if q.positioned]
+    fewest = min(rows)
+    most = max(rows)
+    assert fewest[0] <= 2 and most[0] >= 5, (
+        f"the fixture no longer spans few-view and many-view points: {rows}"
+    )
+    assert fewest[1] > 2.0 * most[1], (
+        f"{fewest[2]} is in {fewest[0]} view(s) and {most[2]} in {most[0]}, yet their "
+        f"precision floors are {fewest[1]:.3f} and {most[1]:.3f} mm -- the floor is not "
+        f"seeing the baseline"
+    )
+
+
+def test_drop_one_out_names_a_single_wrong_link() -> None:
+    """One displaced nominal, and the report should say which one.
+
+    A displacement rather than a swap, because a swap makes two links wrong at
+    once and the honest answer there is that no single removal explains it --
+    which the next assertion covers.
+    """
+    placeable = [q.id for q in check_nominal_shape(fixture()).points if q.positioned]
+    for target in placeable[:3]:
+        project = fixture()
+        q = next(x for x in project.points if x.id == target)
+        q.nominal = [q.nominal[0] + 40.0, q.nominal[1], q.nominal[2]]
+        r = check_nominal_shape(project)
+        assert r.verdict != "consistent", f"a 40 mm displacement on {target} went unnoticed"
+        assert r.suspect == target, (
+            f"displaced {target} and the report named {r.suspect or 'nobody'}"
+        )
+        assert r.suspect_rms < r.rms, (
+            f"{target} was named but leaving it out did not improve the fit "
+            f"({r.suspect_rms:.2f} vs {r.rms:.2f} mm)"
+        )
+
+    # a swap is two wrong links, and should not be pinned on one point
+    r = check_nominal_shape(swapped(0, 1))
+    assert r.suspect == "", (
+        f"a swap makes two links wrong, but the report pinned it on {r.suspect}"
+    )
+
+
+def test_drop_one_out_stays_silent_at_three_points() -> None:
+    """At MIN_POINTS a removal leaves two, which agree whatever they are."""
+    placeable = [q.id for q in check_nominal_shape(fixture()).points if q.positioned]
+    project = fixture()
+    keep = set(placeable[:MIN_POINTS])
+    for x in project.points:
+        if x.nominal and x.id not in keep:
+            x.nominal = None
+    q = next(x for x in project.points if x.id == placeable[0])
+    q.nominal = [q.nominal[0] + 40.0, q.nominal[1], q.nominal[2]]
+
+    r = check_nominal_shape(project)
+    assert r.n_compared == MIN_POINTS, f"expected {MIN_POINTS} compared, got {r.n_compared}"
+    assert r.verdict != "consistent", "the displacement should still be caught"
+    assert r.suspect == "", (
+        f"named {r.suspect} from a set of three -- dropping one leaves two, and any two "
+        f"points fit each other, so every candidate would have 'cleared' it"
     )
 
 

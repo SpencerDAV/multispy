@@ -430,7 +430,8 @@ class Mesh:
         return len(seen)
 
     def display_payload(self, max_edges: int = 6000, max_corners: int = 400,
-                        angle_deg: float = FEATURE_ANGLE_DEG) -> dict:
+                        angle_deg: float = FEATURE_ANGLE_DEG,
+                        max_faces: int = 9000) -> dict:
         """Wireframe and pickable corners, trimmed to something a browser can
         orbit at 60 fps.
 
@@ -453,11 +454,32 @@ class Mesh:
             lengths = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
             edges = edges[np.argsort(-lengths)[:max_edges]]
 
+        # Faces as well as edges, for the shaded overlay. A wireframe is
+        # genuinely ambiguous -- a box drawn in lines reads as either of two
+        # orientations and the eye picks whichever it saw last, which is how a
+        # body ends up placed half a turn out behind a respectable residual.
+        # Filled faces settle it, so the faces have to reach the browser.
+        #
+        # Thinned by area rather than by length, and for the same reason the
+        # edges are thinned longest-first: the big facets are the ones that
+        # carry the silhouette and the shading, and a few thousand of them read
+        # the same as a hundred thousand. A part whose surface is finely
+        # tessellated loses its small facets here and keeps its shape.
+        faces = self.faces
+        if len(faces) > max_faces:
+            tri = self.vertices[faces]
+            area = np.linalg.norm(
+                np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1
+            )
+            faces = faces[np.argsort(-area)[:max_faces]]
+
         picks = self.anchor_candidates(max_candidates=max_corners)
         lo, hi = self.bounds()
         return {
             "vertices": self.vertices.round(6).tolist(),
             "edges": edges.tolist(),
+            "faces": faces.tolist(),
+            "n_faces_sent": int(len(faces)),
             "picks": [p.to_dict() for p in picks],
             "pick_counts": {
                 kind: sum(1 for p in picks if p.kind == kind)

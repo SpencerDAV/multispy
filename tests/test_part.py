@@ -69,6 +69,7 @@ from multispy.project import (
     AxisLine,
     CameraGroup,
     ImageView,
+    ObjectInstance,
     ObjectTemplate,
     Project,
     TiePoint,
@@ -889,6 +890,93 @@ def test_a_pose_with_nothing_to_align_to_is_refused():
 # --------------------------------------------------------------------------
 
 
+def test_a_hand_placed_pose_does_not_drift_on_re_solving() -> None:
+    """Press Solve twice and a hand-placed body must not have moved.
+
+    It used to move by the whole part-space offset, every time, and never say so.
+    A solve re-expresses the scene in the frame the nominals state and carries
+    hand-placed bodies along, because nothing downstream rebuilds them -- but a
+    pose loaded from the project file is already in that frame, so applying the
+    transform again displaces it, and again on the next solve. On a real cell
+    that was 2.9 metres per press, marching a fixture clean off the scene while
+    every number in the report stayed healthy, because a manual pose has no
+    residual to be wrong in.
+
+    Asserted over several solves rather than one: a single-solve test would have
+    passed against a bug that only compounds, and the thing that makes this
+    failure so hard to see from the inside is precisely that each step looks
+    small next to the scene.
+    """
+    project, _ = build_part_project()
+    report = solve(project)
+    assert report.ok, f"the fixture failed to solve: {report.stage}"
+    assert project.in_part_space(), "this test needs part space to be reached"
+
+    inst = next((i for i in project.instances if not i.is_part), None)
+    if inst is None:
+        inst = ObjectInstance(id="hand0", template="tpl0", label="hand placed")
+        project.instances.append(inst)
+    inst.R = np.eye(3)
+    inst.t = np.array([0.05, -0.02, 0.01], dtype=float)
+    inst.manual = True
+    inst.locked = False
+    inst.pose_in_part_space = True          # set in the frame it is written in
+    placed = np.array(inst.t, dtype=float).copy()
+
+    moved = []
+    for k in range(1, 4):
+        solve(project)
+        now = next(i for i in project.instances if i.id == inst.id)
+        assert now.t is not None, f"the hand-placed pose was cleared on solve {k}"
+        moved.append(float(np.linalg.norm(np.array(now.t, dtype=float) - placed)))
+
+    assert max(moved) < 1e-6, (
+        f"a hand-placed pose moved {['%.4f' % v for v in moved]} m over three solves; "
+        f"it must not move at all"
+    )
+
+
+def test_an_unaligned_hand_pose_is_still_carried_into_part_space() -> None:
+    """The other half: a pose set before the frame existed must still follow it.
+
+    The fix must not become "never transform a manual pose". A body placed
+    against an arbitrary frame has to be carried when the nominals finally give
+    the scene real coordinates, or it detaches from the photographs it was
+    aligned against -- which is what the carry-along was written for.
+    """
+    project, _ = build_part_project()
+    for pt in project.points:
+        pt.nominal = None
+    report = solve(project)
+    assert report.ok
+    assert not project.in_part_space(), "expected an unaligned scene with no nominals"
+
+    inst = next((i for i in project.instances if not i.is_part), None)
+    if inst is None:
+        inst = ObjectInstance(id="hand1", template="tpl0", label="hand placed")
+        project.instances.append(inst)
+    inst.R = np.eye(3)
+    inst.t = np.array([0.05, -0.02, 0.01], dtype=float)
+    inst.manual = True
+    inst.pose_in_part_space = False          # placed before any frame was stated
+    before = np.array(inst.t, dtype=float).copy()
+
+    # now give the drawing back and let the solve put the scene in part space
+    rebuilt, _ = build_part_project()
+    nominals = {p.id: p.nominal for p in rebuilt.points}
+    for pt in project.points:
+        pt.nominal = nominals.get(pt.id)
+    solve(project)
+
+    now = next(i for i in project.instances if i.id == inst.id)
+    assert project.in_part_space(), "the scene did not reach part space"
+    assert now.pose_in_part_space, "the pose was carried but not marked as carried"
+    assert float(np.linalg.norm(np.array(now.t, dtype=float) - before)) > 1e-6, (
+        "a pose placed against an unaligned scene was left behind when the scene "
+        "was re-expressed in part space"
+    )
+
+
 def main() -> int:
     tests = [
         test_the_solve_reaches_part_space,
@@ -909,6 +997,8 @@ def main() -> int:
         test_stage_one_refuses_outside_part_space,
         test_clearing_the_part_leaves_no_phantom_object,
         test_the_part_survives_a_round_trip,
+        test_a_hand_placed_pose_does_not_drift_on_re_solving,
+        test_an_unaligned_hand_pose_is_still_carried_into_part_space,
         test_the_edge_detector_finds_the_part,
         test_stage_two_is_off_unless_asked,
         test_stage_two_does_not_make_a_good_pose_worse,

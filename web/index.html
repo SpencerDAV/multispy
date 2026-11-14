@@ -427,6 +427,9 @@
     <label class="toggle" title="Show reprojection error vectors (R)">
       <input type="checkbox" id="showresid" checked> Residuals
     </label>
+    <label class="toggle" title="Where the solve expects points this photo has no mark for (E)">
+      <input type="checkbox" id="showexpected" checked> Expected
+    </label>
     <label class="toggle" title="Overlay the solved ground plane grid">
       <input type="checkbox" id="showgrid"> Grid
     </label>
@@ -437,9 +440,14 @@
     <label class="toggle" title="Overlay each placed object's model, projected through this camera (M)">
       <input type="checkbox" id="showmodels" checked> Models
     </label>
+    <label class="toggle" title="Fill the model's faces instead of only its edges, so which way round it sits is not a guess (H)">
+      <input type="checkbox" id="showshaded"> Shaded
+    </label>
 
     <button class="action" id="btn-3d" title="Orbit the solved scene (D)">3D</button>
     <button class="action" id="btn-help" title="Tutorial and reference (?)">Help</button>
+    <button class="action" id="btn-undo" title="Undo (Ctrl+Z)" disabled>&#8630;</button>
+    <button class="action" id="btn-redo" title="Redo (Ctrl+Shift+Z)" disabled>&#8631;</button>
     <button class="action" id="btn-save" title="Ctrl+S">Save</button>
     <button class="action" id="btn-export">Export</button>
     <button class="action primary" id="btn-solve" title="Enter">Solve</button>

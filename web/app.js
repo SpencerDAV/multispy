@@ -38,6 +38,11 @@ const state = {
   axisKey: null,   // 'x' | 'y' | 'z' while held, to turn about that world axis
   showVP: true,
   showResid: true,
+  showExpected: true,
+  showShaded: false,
+  undoBase: null,
+  undoRestoring: false,
+  dragUndoDone: false,
   showGrid: false,
   showOrigin: true,
   showModels: true,
@@ -537,7 +542,122 @@ function dialogOpen() {
   return !!host && !host.hidden;
 }
 
+/* ------------------------------------------------------------------- undo
+ *
+ * Whole-project snapshots, not a log of reversible operations. The operations
+ * here are not reversible in any useful sense -- a solve rewrites every pose and
+ * every triangulated point at once, placing an object rewrites its anchors, and
+ * an edge refinement rewrites poses it kept the originals of separately. Writing
+ * an inverse for each would be a second implementation of every edit, drifting
+ * out of step with the first. A snapshot is the project, which is the one thing
+ * every edit already agrees on how to serialise.
+ *
+ * Cheap enough to be worth it: the project is marks, lines, nominals, instances
+ * and settings -- tens of kilobytes. Meshes are not in it; a template carries a
+ * path, not geometry, so a forty-thousand-vertex model costs nothing here.
+ *
+ * `markDirty` is the hook because every edit already calls it, so nothing can
+ * add an edit and forget to make it undoable. It fires AFTER the change, which
+ * is what makes this work: the snapshot standing in `undoBase` at that moment is
+ * the state before it.
+ */
+const UNDO_LIMIT = 60;
+const undoStack = [];
+const redoStack = [];
+
+function snapshotProject() {
+  try {
+    return JSON.stringify(state.project);
+  } catch (err) {
+    return null;                       // never let a snapshot failure stop an edit
+  }
+}
+
+function updateUndoUi() {
+  const u = $('btn-undo'), r = $('btn-redo');
+  if (u) {
+    u.disabled = !undoStack.length;
+    u.title = undoStack.length ? `Undo (Ctrl+Z) — ${undoStack.length} step(s)` : 'Nothing to undo';
+  }
+  if (r) {
+    r.disabled = !redoStack.length;
+    r.title = redoStack.length ? `Redo (Ctrl+Shift+Z) — ${redoStack.length} step(s)` : 'Nothing to redo';
+  }
+}
+
+function pushUndo() {
+  const snap = snapshotProject();
+  if (snap === null) return;
+  // One step per drag, not one per pointermove: dragging a mark fires markDirty
+  // on every mouse event, and sixty undos that each move a point two pixels is
+  // the same as no undo at all.
+  if (state.drag && state.dragUndoDone) { state.undoBase = snap; return; }
+  if (state.undoBase !== null && state.undoBase !== undefined
+      && state.undoBase !== snap) {
+    undoStack.push(state.undoBase);
+    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+    redoStack.length = 0;
+  }
+  if (state.drag) state.dragUndoDone = true;
+  state.undoBase = snap;
+  updateUndoUi();
+}
+
+/** Snapshot before something that replaces the project wholesale.
+ *
+ *  A solve does not go through `markDirty` -- it adopts a project the server
+ *  built -- and a solve that makes things worse is exactly what someone reaches
+ *  for undo after. */
+function pushUndoBefore(label) {
+  const snap = snapshotProject();
+  if (snap === null) return;
+  undoStack.push(snap);
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  state.undoBase = snap;
+  state.undoLabel = label || '';
+  updateUndoUi();
+}
+
+function applySnapshot(snap) {
+  const restoring = JSON.parse(snap);
+  state.undoRestoring = true;
+  try {
+    adopt({ project: restoring });
+    state.undoBase = snapshotProject();
+    state.dirty = true;
+    $('dirty').textContent = 'unsaved changes';
+    $('dirty').className = 'dirty';
+  } finally {
+    state.undoRestoring = false;
+  }
+  buildFilmstrip();
+  renderPanels();
+  render();
+  if (Viewer3D.isOn()) Viewer3D.render();
+  updateUndoUi();
+}
+
+function doUndo() {
+  if (!undoStack.length) { setStatus('nothing to undo'); return; }
+  const now = snapshotProject();
+  const snap = undoStack.pop();
+  if (now !== null) redoStack.push(now);
+  applySnapshot(snap);
+  setStatus(`undone — ${undoStack.length} step(s) left`, 'ok');
+}
+
+function doRedo() {
+  if (!redoStack.length) { setStatus('nothing to redo'); return; }
+  const now = snapshotProject();
+  const snap = redoStack.pop();
+  if (now !== null) undoStack.push(now);
+  applySnapshot(snap);
+  setStatus(`redone — ${redoStack.length} step(s) left`, 'ok');
+}
+
 function markDirty() {
+  if (!state.undoRestoring) pushUndo();
   state.dirty = true;
   $('dirty').textContent = 'unsaved changes';
   $('dirty').className = 'dirty';
@@ -589,6 +709,12 @@ function adopt(data) {
     state.activeTemplate = ids.length ? ids[0] : null;
   }
   ensureMeshes();
+
+  // The baseline the first edit will be pushed onto. Without it the first edit
+  // of a session had nothing to compare against and silently produced no undo
+  // step -- the one edit most likely to be the mistake you want back.
+  state.undoBase = snapshotProject();
+  if (typeof updateUndoUi === 'function') updateUndoUi();
 }
 
 /** Fetch geometry for any template we do not have yet.
@@ -778,6 +904,11 @@ async function newStaticProject(name) {
 async function solveNow() {
   try {
     setStatus('solving…');
+    // A solve replaces every pose and every triangulated point at once, and it
+    // adopts the server's project rather than going through markDirty, so this
+    // is the only place it can be made undoable. It is also the edit most worth
+    // undoing: one bad object can take a healthy solve down with it.
+    pushUndoBefore('solve');
     $('btn-solve').disabled = true;
     const data = await api('/api/solve', { project: projectPayload(), bundle: true, save: true });
     adopt(data);
@@ -1317,9 +1448,11 @@ function render() {
   if (state.showGrid) drawGrid(im, z);
   if (state.showOrigin) drawPartOrigin(im, z);
   if (state.showVP) drawVanishingRays(im, z);
+  if (state.showModels && state.showShaded) drawObjectShaded(im, z);
   if (state.showModels) drawObjectModels(im, z);
   drawControlLines(im, z);
   if (state.showResid) drawResiduals(im, z);
+  if (state.showExpected) drawExpected(im, z);
   drawObservations(im, z);
   drawAnchors(im, z);
   if (state.drag && state.drag.kind === 'newline') drawPendingLine(z);
@@ -1477,6 +1610,78 @@ function drawVanishingRays(im, z) {
   }
 }
 
+/* Where the solve expects a point this photograph has no mark for.
+ *
+ * A point triangulated from other views has a position, and that position
+ * projects into every camera -- including the ones nobody has clicked it in.
+ * Drawing the prediction is what turns a count of marks into something a person
+ * can check: the ghost lands on the feature, or it does not, and when it does
+ * not either the correspondence is wrong or the point is not in this view at
+ * all. It costs no extra solve. The camera, the intrinsics and the point are
+ * already in hand, and this is the same projection the residual vectors use.
+ *
+ * Grey and dashed because nothing here was observed. A solid ring in this tool
+ * means somebody clicked that spot; a prediction borrowing the same mark would
+ * be claiming evidence it does not have.
+ *
+ * Two things it cannot know, both worth holding in mind before trusting a ghost
+ * that looks wrong. It cannot know occlusion -- a point on the far side of the
+ * part projects onto the near side just as confidently, and a bare tie point has
+ * no surface to be hidden by, so blank metal under a ghost is not by itself a
+ * verdict. And it is only ever as good as the solve behind it: a photograph
+ * whose pose is wrong puts every ghost in the wrong place at once, which is its
+ * own useful signal and reads quite differently from one ghost out on its own.
+ */
+function drawExpected(im, z) {
+  if (!im.R || !im.t) return;
+
+  // Marked in at least two photographs, or there is no triangulation behind the
+  // position -- a single ray fixes a direction and no depth, so the solver's
+  // gauge is what decided where that point sits, and projecting it would dress
+  // an arbitrary choice up as a prediction.
+  const seen = {};
+  for (const other of state.project.images) {
+    for (const pid of Object.keys(other.observations)) seen[pid] = (seen[pid] || 0) + 1;
+  }
+
+  for (const pt of state.project.points) {
+    if (!pt.xyz || pt.xyz.length !== 3) continue;
+    if (im.observations[pt.id]) continue;
+    if ((seen[pt.id] || 0) < 2) continue;
+    const q = projectWorld(im, pt.xyz);
+    if (!q) continue;                                   // behind this camera
+    const slack = 14 / z;
+    if (q.x < -slack || q.x > im.width + slack
+        || q.y < -slack || q.y > im.height + slack) continue;
+
+    const active = pt.id === state.activePoint;
+    const color = active ? '#c3ccd8' : '#79838f';
+    const r = (active ? 8 : 6) / z;
+
+    ctx.setLineDash([3.4 / z, 2.9 / z]);
+    ctx.beginPath();
+    ctx.arc(q.x, q.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = (active ? 2.2 : 1.5) / z;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // a thin cross rather than a filled centre: the dot is what a real mark has
+    const tick = 2.6 / z;
+    ctx.beginPath();
+    ctx.moveTo(q.x - tick, q.y); ctx.lineTo(q.x + tick, q.y);
+    ctx.moveTo(q.x, q.y - tick); ctx.lineTo(q.x, q.y + tick);
+    ctx.lineWidth = 1.1 / z;
+    ctx.stroke();
+
+    if (active || z > 0.25) {
+      ctx.fillStyle = color;
+      ctx.font = `${11 / z}px sans-serif`;
+      ctx.fillText((pt.label || pt.id) + ' ?', q.x + r + 4 / z, q.y - r);
+    }
+  }
+}
+
 function drawObservations(im, z) {
   const pointErr = {};
   if (state.report && state.report.residual_lines) {
@@ -1555,6 +1760,94 @@ function edgesByLength(mesh) {
  * number can: if the model's wireframe lands on the real object in the
  * photograph, the pose is right. A residual table cannot tell you that a body
  * was placed 180 degrees out, and this picture can. */
+/* The model as a solid, not an outline.
+ *
+ * A wireframe of anything boxy is genuinely ambiguous -- the Necker cube is the
+ * textbook case and a sensor body is a Necker cube with mounting holes. Two
+ * orientations project to the same lines and the eye picks whichever it saw
+ * last, so a body placed half a turn out looks placed, which is how one ends up
+ * fitted that way behind a residual that raised no objection. Filling the faces
+ * removes the choice: the near surface hides the far one and there is only one
+ * reading left.
+ *
+ * Painter's algorithm, back to front by face depth, because canvas 2d has no
+ * depth buffer. That is wrong for faces that interpenetrate or that pierce one
+ * another, which a single rigid body's own facets do not do -- and two bodies
+ * that overlap are drawn in separate passes, so one will win wholesale. Worth
+ * knowing before reading an overlap as geometry.
+ *
+ * Drawn under the wireframe deliberately. The lines are the feature edges, which
+ * is what you actually aim a corner at, and burying them under fill would trade
+ * one kind of unreadable for another. The fill is kept translucent for the same
+ * reason: this is an overlay on a photograph, and a model you cannot see the
+ * part through tells you nothing about whether it lines up.
+ */
+function drawObjectShaded(im, z) {
+  if (!im.R || !im.t) return;
+  const placed = instanceList().filter(isPlaced);
+  if (!placed.length) return;
+
+  const R = im.R;
+  const light = [0.35, -0.5, -0.79];            // over the viewer's shoulder
+
+  for (const inst of placed) {
+    const template = templateOf(inst);
+    const mesh = template && meshFor(inst.template);
+    if (!mesh || !mesh.faces || !mesh.faces.length) continue;
+
+    const world = mesh.vertices.map((v) => objectToWorld(inst, template, v));
+    const screen = world.map((X) => projectWorld(im, X));
+
+    // depth in THIS camera, so the sort is per view and not per scene
+    const depth = world.map((X) =>
+      R[2][0] * X[0] + R[2][1] * X[1] + R[2][2] * X[2] + im.t[2]);
+
+    const faces = [];
+    for (let i = 0; i < mesh.faces.length; i++) {
+      const f = mesh.faces[i];
+      const a = screen[f[0]], b = screen[f[1]], c = screen[f[2]];
+      if (!a || !b || !c) continue;                       // crosses behind the camera
+      // Back faces, by screen winding. Also throws away degenerate slivers,
+      // whose normals are noise and whose shading would flicker.
+      const area2 = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+      if (area2 >= 0) continue;
+      const wa = world[f[0]], wb = world[f[1]], wc = world[f[2]];
+      const ux = wb[0] - wa[0], uy = wb[1] - wa[1], uz = wb[2] - wa[2];
+      const vx = wc[0] - wa[0], vy = wc[1] - wa[1], vz = wc[2] - wa[2];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      nx /= nl; ny /= nl; nz /= nl;
+      const lam = Math.abs(nx * light[0] + ny * light[1] + nz * light[2]);
+      faces.push({
+        a, b, c,
+        d: (depth[f[0]] + depth[f[1]] + depth[f[2]]) / 3,
+        shade: 0.32 + 0.68 * lam,
+      });
+    }
+    if (!faces.length) continue;
+    faces.sort((p, q) => q.d - p.d);                      // far first
+
+    const selected = inst.id === state.activeInstance;
+    const base = inst.is_part ? [255, 184, 108]
+      : selected ? [255, 210, 74]
+      : inst.locked ? [154, 255, 200]
+      : [127, 212, 255];
+    const alpha = selected || inst.is_part ? 0.5 : 0.34;
+
+    for (const f of faces) {
+      const t = f.shade;
+      ctx.fillStyle = `rgba(${Math.round(base[0] * t)},${Math.round(base[1] * t)},`
+                    + `${Math.round(base[2] * t)},${alpha})`;
+      ctx.beginPath();
+      ctx.moveTo(f.a.x, f.a.y);
+      ctx.lineTo(f.b.x, f.b.y);
+      ctx.lineTo(f.c.x, f.c.y);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+}
+
 function drawObjectModels(im, z) {
   if (!im.R || !im.t) return;
   const placed = instanceList().filter(isPlaced);
@@ -2311,6 +2604,7 @@ canvas.addEventListener('contextmenu', (ev) => {
 });
 
 canvas.addEventListener('mousedown', (ev) => {
+  state.dragUndoDone = false;
   // Going back to the photo means the panels are finished with. The canvas
   // cannot take focus itself, so without this a control clicked earlier keeps
   // it indefinitely -- and a focused text field goes on eating shortcuts.
@@ -2567,6 +2861,12 @@ window.addEventListener('keydown', (ev) => {
   const k = ev.key.toLowerCase();
 
   if (k === ' ') { state.spaceDown = true; canvas.style.cursor = 'grab'; ev.preventDefault(); return; }
+  if ((ev.ctrlKey || ev.metaKey) && k === 'z') {
+    ev.preventDefault();
+    if (ev.shiftKey) doRedo(); else doUndo();
+    return;
+  }
+  if ((ev.ctrlKey || ev.metaKey) && k === 'y') { ev.preventDefault(); doRedo(); return; }
   if (ev.ctrlKey && k === 's') { ev.preventDefault(); saveNow(); return; }
   if (k === 'enter') { ev.preventDefault(); solveNow(); return; }
   if (k === '?' || (k === '/' && ev.shiftKey)) { ev.preventDefault(); openDocs(); return; }
@@ -2629,10 +2929,12 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'n') { newPoint(); renderPanels(); render(); return; }
   if (k === 'v') { $('showvp').click(); return; }
   if (k === 'r') { $('showresid').click(); return; }
+  if (k === 'e') { $('showexpected').click(); return; }
   // G used to toggle the grid and now opens pose mode, so this was dead and
   // misleading. The grid keeps its checkbox; a second binding for it would
   // only be another key to collide with.
   if (k === 'm') { $('showmodels').click(); return; }
+  if (k === 'h') { $('showshaded').click(); return; }
   if (k === 'f') { fitView(); render(); return; }
   if (k === 'tab') {
     ev.preventDefault();
@@ -3370,18 +3672,28 @@ function shapeCheckHtml() {
   html += `</div>`;
   if (r.ok) {
     html += `<div class="note">Shape fit leaves ${r.rms.toFixed(1)} ${escapeHtml(r.units)} RMS, `
-          + `worst ${r.worst_sigmas.toFixed(1)}× its own tolerance. The nominal-free `
-          + `re-solve ran at ${r.reproj_px.toFixed(2)} px — read that first.</div>`;
+          + `worst ${r.worst_sigmas.toFixed(1)}× the tolerance in force. These photographs `
+          + `resolve about ${(r.precision || 0).toFixed(1)} ${escapeHtml(r.units)}, so an RMS `
+          + `near that is as close as the camera can testify. The nominal-free re-solve ran `
+          + `at ${r.reproj_px.toFixed(2)} px — read that first.</div>`;
+    if (r.suspect) {
+      html += `<div class="note bad">Leaving <b>${escapeHtml(r.suspect)}</b> out makes the rest `
+            + `consistent (${r.suspect_rms.toFixed(1)} ${escapeHtml(r.units)} RMS against `
+            + `${r.rms.toFixed(1)}). Look there first, then confirm it against the photographs.`
+            + `</div>`;
+    }
     const rows = (r.points || []).filter((q) => q.positioned)
       .sort((a, b) => b.sigmas - a.sigmas);
     if (rows.length) {
       html += `<table class="obs"><tr><th>point</th><th>from</th><th>off</th><th>×tol</th></tr>`
+            + ``
             + rows.map((q) =>
                 `<tr><td>${escapeHtml(q.id)}</td>`
               + `<td>${escapeHtml(q.source || 'typed')}</td>`
               + `<td>${q.deviation.toFixed(1)}</td>`
               + `<td>${q.sigmas > 999 ? '&gt;999' : q.sigmas.toFixed(1)}`
-              + `${q.sigma_defaulted ? ' <span style="color:var(--text-dim)">(default)</span>' : ''}`
+              + `${q.floor_governs ? ' <span style="color:var(--text-dim)">(res)</span>'
+                   : q.sigma_defaulted ? ' <span style="color:var(--text-dim)">(default)</span>' : ''}`
               + `</td></tr>`).join('')
             + `</table>`;
     }
@@ -5097,10 +5409,14 @@ for (const b of $('modes').children) b.onclick = () => setMode(b.dataset.mode);
 for (const b of $('axes').children) b.onclick = () => setAxis(+b.dataset.axis);
 $('btn-help').onclick = () => openDocs();
 $('btn-save').onclick = saveNow;
+$('btn-undo').onclick = doUndo;
+$('btn-redo').onclick = doRedo;
+$('showshaded').onchange = (e) => { state.showShaded = e.target.checked; render(); };
 $('btn-solve').onclick = solveNow;
 $('btn-export').onclick = exportNow;
 $('showvp').onchange = (e) => { state.showVP = e.target.checked; render(); };
 $('showresid').onchange = (e) => { state.showResid = e.target.checked; updateHint(); render(); };
+$('showexpected').onchange = (e) => { state.showExpected = e.target.checked; render(); };
 $('showgrid').onchange = (e) => { state.showGrid = e.target.checked; render(); };
 /* Ticked on by default, because once a project is in part space the origin is
  * the thing worth looking at -- and in a project with no nominals it draws
