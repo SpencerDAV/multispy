@@ -641,8 +641,17 @@ def _transform_scene(
     for inst in project.placed_object_instances():
         if not inst.manual or inst.R is None or inst.t is None:
             continue
+        # ...but only once. A pose already in part space came out of a previous
+        # solve in this very frame; transforming it again moves it by the whole
+        # part-space offset, and again on the next solve, and again -- 2.9 metres
+        # a time on the cell this was found on, with nothing in the report to say
+        # so, because a manual pose has no residual. See
+        # ObjectInstance.pose_in_part_space.
+        if inst.pose_in_part_space:
+            continue
         inst.R = Rg @ inst.R
         inst.t = scale * (Rg @ inst.t) + tg
+        inst.pose_in_part_space = True
 
 
 def align_to_nominals(

@@ -301,6 +301,26 @@ class ObjectInstance:
     body needs a flag of its own. The pose still moves with the scene when the
     coordinates are re-expressed, and anchors still override it: three anchors
     in two photos measure the pose far better than an eye can judge it."""
+    pose_in_part_space: bool = False
+    """This pose is already expressed in part space, so re-expressing the scene
+    must leave it alone.
+
+    The bug this exists to stop, which cost a real placement three metres: when a
+    solve re-expresses the scene in part space it carries hand-placed bodies
+    along, because nothing downstream reconstructs them. Every other pose in the
+    scene is rebuilt from scratch each solve and so is correctly in the *old*
+    frame when that transform is applied -- but a manual pose is loaded from the
+    project file, where the previous solve already left it in part space. Apply
+    the transform again and it moves by the whole part-space offset. Solve again
+    and it moves again. Measured on this cell: 2.9 metres per solve, cumulative,
+    marching a fixture clean off the scene while the solve reported nothing wrong
+    because a manual pose has no residual to report.
+
+    So the frame a pose is in has to be recorded rather than assumed. False means
+    the pose predates this flag or was set against an unaligned scene, and must
+    be carried; True means it is already in part space and must not be touched.
+    Set when the transform is applied, and set by the front end when a body is
+    dragged in a project that is already in part space."""
     calibrated: str = ""
     """This pose came out of a sensor calibration file, and this says which one.
 
@@ -937,6 +957,7 @@ class Project:
                     "label": o.label,
                     "locked": o.locked,
                     "manual": o.manual,
+                    "pose_in_part_space": o.pose_in_part_space,
                     "calibrated": o.calibrated,
                     "is_part": o.is_part,
                     "R": o.R.tolist() if o.R is not None else None,
@@ -1068,6 +1089,7 @@ class Project:
                 label=raw.get("label", ""),
                 locked=bool(raw.get("locked", False)),
                 manual=bool(raw.get("manual", False)),
+                pose_in_part_space=bool(raw.get("pose_in_part_space", False)),
                 calibrated=str(raw.get("calibrated", "") or ""),
                 is_part=bool(raw.get("is_part", False)),
             )

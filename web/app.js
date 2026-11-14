@@ -280,6 +280,7 @@ function ensurePose(inst, im) {
   inst.R = pose.R;
   inst.t = pose.t;
   inst.manual = true;
+  inst.pose_in_part_space = partSpaceState().ok;
   return true;
 }
 
@@ -321,6 +322,7 @@ function bringIntoView(inst, im) {
   const pivot = pivotWorld(inst);
   for (let k = 0; k < 3; k++) inst.t[k] += C[k] + fwd[k] * depth - pivot[k];
   inst.manual = true;
+  inst.pose_in_part_space = partSpaceState().ok;
   markDirty();
   return true;
 }
@@ -415,6 +417,7 @@ function rotateSteps(inst, axisKey, deg) {
   if (!axis) return;
   rotateInPlace(inst, axis, (deg * Math.PI) / 180);
   inst.manual = true;
+  inst.pose_in_part_space = partSpaceState().ok;
   markDirty();
 }
 
@@ -2160,6 +2163,7 @@ function clearPose(inst) {
   inst.R = null;
   inst.t = null;
   inst.manual = false;
+  inst.pose_in_part_space = false;
   markDirty();
   renderPanels();
   render();
@@ -2483,6 +2487,7 @@ window.addEventListener('mousemove', (ev) => {
         nudgeInPlane(inst, im, dx, dy);
       }
       inst.manual = true;
+      inst.pose_in_part_space = partSpaceState().ok;
       d.last = p;
     }
   } else if (d.kind === 'moveline') {
@@ -4146,6 +4151,7 @@ function wireObjectsPanel(el) {
       dir[axis] = 1;
       rotateInPlace(inst, dir, (e.shiftKey ? -1 : 1) * Math.PI / 2);
       inst.manual = true;
+      inst.pose_in_part_space = partSpaceState().ok;
       markDirty();
       renderPanels();
       render();
