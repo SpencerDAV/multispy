@@ -2,6 +2,14 @@
 # folder on first run, so it is never something to track.
 projects/
 
+# Briefs written to hand one working session over to the next. They describe a
+# moment -- this branch, these marks, this number to beat -- so they are stale
+# within days and read as instructions to somebody who is no longer there. The
+# durable version of anything in them belongs in a docstring next to the code it
+# explains, or in a commit message. A pattern rather than two names because the
+# habit keeps producing them.
+*-HANDOFF.md
+
 # Generated demo scenes. Both are rebuilt in one command, so the photos do not
 # belong in history:
 #   .venv\Scripts\python.exe demo\make_demo.py
