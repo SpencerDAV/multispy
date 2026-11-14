@@ -546,6 +546,62 @@ def test_two_anchors_is_not_a_placement():
     assert sum(1 for r in report.instances.values() if r.placed) >= 4
 
 
+def test_a_body_that_loses_its_anchors_loses_the_pose_they_gave_it():
+    """A fitted pose is a claim about where its anchors put the body. Delete the
+    anchors and the claim has nothing behind it, so it must not be left standing.
+
+    Worth testing the all-bodies case specifically: ``fit_instances`` clears
+    unbacked poses in a pass it used to return before reaching, so clearing
+    *every* body's marks -- which is what someone does on deciding the objects
+    are costing more than they give -- left all of them placed at coordinates
+    the next solve no longer used. One body losing its marks was already covered
+    by the normal path; all of them was not.
+    """
+    project, _truth = build_rig_project()
+    first = solve(project)
+    assert first.ok, first.messages
+    assert sum(1 for r in first.instances.values() if r.placed) >= 4
+    assert all(
+        inst.R is not None and inst.t is not None
+        for inst in project.placed_object_instances()
+    )
+
+    for im in project.images:
+        im.anchor_obs = {}
+    report = solve(project)
+
+    assert all(
+        inst.R is None and inst.t is None
+        for inst in project.placed_object_instances()
+    ), [(i.id, i.t) for i in project.placed_object_instances()]
+    assert not any(r.placed for r in report.instances.values())
+    assert any("no longer had anchors behind them" in m for m in report.messages), report.messages
+    # and it must not be silent about it in the other direction either
+    assert any("no placeable anchors" in w for w in report.warnings), report.warnings
+
+
+def test_a_hand_placed_body_keeps_its_pose_when_the_anchors_go():
+    """The exception to the rule above, and the reason it is a rule and not a
+    sweep: a pose set by eye is the user's own work and nothing recreates it."""
+    project, truth = build_rig_project()
+    R0, t0 = truth["bodies"][0]
+    for im in project.images:
+        im.anchor_obs = {}
+    inst = project.instance("obj0")
+    inst.R, inst.t = R0.copy(), t0.copy()
+    inst.manual = True
+
+    solve(project)
+    assert inst.R is not None and inst.t is not None, "a hand placement was thrown away"
+    assert np.allclose(inst.t, t0), (inst.t, t0)
+    # every other body, which was fitted rather than placed, is cleared
+    assert all(
+        o.R is None and o.t is None
+        for o in project.placed_object_instances()
+        if o.id != "obj0"
+    )
+
+
 def test_constraints_report_asked_vs_achieved():
     """A stated figure is the one number the user asserts rather than clicks, so
     the solve has to say whether it was met."""
@@ -839,6 +895,8 @@ def main() -> int:
         test_rig_report_lists_the_layout,
         test_without_optical_frame_it_says_so,
         test_two_anchors_is_not_a_placement,
+        test_a_body_that_loses_its_anchors_loses_the_pose_they_gave_it,
+        test_a_hand_placed_body_keeps_its_pose_when_the_anchors_go,
         test_constraints_report_asked_vs_achieved,
         test_constraint_naming_an_unsolved_point_is_reported_not_silent,
         test_units_error_shows_up_as_scale_disagreement,

@@ -738,6 +738,34 @@ def align_to_nominals(
     return True
 
 
+def _clear_unbacked_poses(project: Project) -> int:
+    """Drop the pose of any body whose anchors no longer support one.
+
+    A fitted pose is a derived quantity: it means "this is where the anchors put
+    the body". Once those anchors are gone -- deleted, or the template's anchor
+    they named removed -- the pose is a claim with nothing behind it, and keeping
+    it is worse than having none, because the body is still drawn, still at
+    coordinates from a frame that has since moved on. The case this was found on:
+    three bodies had every anchor mark removed, the scene's scale went back to
+    the drawing's from the objects' own, and the three stale poses stayed exactly
+    where the old scale had put them, with ``pose_in_part_space`` set so that
+    even ``_transform_scene`` would not carry them along.
+
+    A hand placement is the exception and is kept: nobody else made it and no
+    later stage recreates it. So is a locked body's, which is the world frame.
+    """
+    cleared = 0
+    for inst in project.placed_object_instances():
+        if inst.locked or inst.manual:
+            continue
+        if inst.R is None and inst.t is None:
+            continue
+        inst.R, inst.t = None, None
+        inst.pose_in_part_space = False
+        cleared += 1
+    return cleared
+
+
 def fit_instances(
     project: Project,
     positions: dict[str, np.ndarray],
@@ -814,11 +842,22 @@ def fit_instances(
             )
 
     if not scaled:
+        # Same rule the second pass applies below, which this return used to skip
+        # entirely -- so removing the last anchor from every body left all their
+        # poses standing. See _clear_unbacked_poses.
+        stale = _clear_unbacked_poses(project)
         report.warnings.append(
             f"{len(project.placed_object_instances())} known object(s) have no placeable anchors "
             "yet. Each needs "
             "3 anchors marked in 2+ photos each before its pose is determined."
         )
+        if stale:
+            report.messages.append(
+                f"cleared {stale} pose(s) that no longer had anchors behind them. A fitted pose "
+                "is only ever a statement about where its anchors put the body; with those gone "
+                "it would have gone on being drawn at coordinates this solve no longer uses. "
+                "Hand-placed and locked bodies keep theirs."
+            )
         return False, ""
 
     # ---- choose the gauge: a locked object defines the frame outright, otherwise
