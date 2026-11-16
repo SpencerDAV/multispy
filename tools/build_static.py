@@ -53,6 +53,7 @@ PY_MODULES = (
     "calibfile",
     "sensorcheck",
     "nominalcheck",
+    "viewpoint",
     "export",
     "webapp",
 )

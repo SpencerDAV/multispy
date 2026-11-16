@@ -658,6 +658,10 @@ function doRedo() {
 
 function markDirty() {
   if (!state.undoRestoring) pushUndo();
+  // A viewpoint reading describes the marks and poses it ran against. Keeping it
+  // across an edit would show a true statement about a project that no longer
+  // exists, so it goes rather than ages.
+  state.viewpoints = null;
   state.dirty = true;
   $('dirty').textContent = 'unsaved changes';
   $('dirty').className = 'dirty';
@@ -689,6 +693,7 @@ function projectPayload() {
 }
 
 function adopt(data) {
+  state.viewpoints = null;   // new poses, so the apportionment above them is void
   state.project = data.project;
   state.meta = data.project._images_meta || {};
   if (data.report !== undefined) state.report = data.report;
@@ -3180,6 +3185,7 @@ function renderPanels() {
   renderPartPanel();
   renderObjectsPanel();
   renderPointsPanel();
+  renderViewpointPanel();
   renderConstraintsPanel();
   renderImageListPanel();
   updateHint();
@@ -3702,6 +3708,200 @@ function shapeCheckHtml() {
   }
   for (const w of (r.warnings || [])) html += `<div class="note bad">${escapeHtml(w)}</div>`;
   return html;
+}
+
+/* Where the information along the origin's worst direction comes from.
+ *
+ * The companion to the sphere above. That one says how big the uncertainty is;
+ * this one says which photographs are holding it up, which photograph has the
+ * most left to click, and what viewpoint is missing from the set entirely.
+ *
+ * A reading, never a setting. Nothing here changes a weight, and the panel says
+ * so where the camera aims differ enough for the thought to occur: a camera
+ * pointed down the weak direction is already discounted for it by the Jacobian,
+ * and it is the best witness in the set for the two directions across it, so
+ * down-weighting it by aim would suppress both. See multispy/viewpoint.py.
+ *
+ * Cleared by markDirty() and adopt(), because every figure is read off the poses
+ * and marks as they stood when it ran. An edit makes it a true statement about a
+ * project that no longer exists, which is the worst kind. */
+const VIEWPOINT_COLOR = { 'viewpoint-limited': 'warn', 'evidence-limited': 'unknown' };
+
+/* A direction as something you can stand in: nearest axis, and how far off it. */
+function axisHint(v) {
+  if (!v || v.length !== 3) return '';
+  let k = 0;
+  for (let i = 1; i < 3; i++) if (Math.abs(v[i]) > Math.abs(v[k])) k = i;
+  const deg = Math.acos(Math.min(1, Math.abs(v[k]))) * 180 / Math.PI;
+  return `${v[k] < 0 ? '-' : '+'}${'XYZ'[k]}, ${deg.toFixed(0)}&deg; off it`;
+}
+
+function vec3(v, dp) {
+  return `[${v.map((q) => q.toFixed(dp === undefined ? 3 : dp)).join(', ')}]`;
+}
+
+function viewpointPanelHtml() {
+  const r = state.viewpoints;
+  if (!r) {
+    return `<div class="note">Which photographs supply the information along the direction `
+         + `the origin is least sure of &mdash; and where a camera would supply more. No `
+         + `re-solve: it reads the poses as they stand, so it is instant. Measure the origin `
+         + `first, in <b>Tie points</b> above; without that it falls back to the direction `
+         + `the <i>marks</i> are weakest in, which is a related but different question.</div>`;
+  }
+  if (!r.ok) {
+    return `<div class="note">${escapeHtml(r.reason || 'nothing to report')}</div>`;
+  }
+  const col = GRADE_COLOR[VIEWPOINT_COLOR[r.verdict] || 'unknown'] || GRADE_COLOR.unknown;
+  let html = `<div class="row" style="align-items:center;gap:6px">`
+           +   `<span style="width:10px;height:10px;border-radius:50%;background:${col};`
+           +     `display:inline-block;flex:none"></span>`
+           +   `<b>${escapeHtml(r.verdict)}</b>`
+           +   `<span style="color:var(--text-dim)">${r.anisotropy.toFixed(2)}&times; worst `
+           +     `to best</span></div>`;
+
+  html += `<div class="row"><span class="k">weak direction</span>`
+        +   `<span class="v">${vec3(r.weak)}</span></div>`
+        + `<div class="row"><span class="k"></span>`
+        +   `<span class="v" style="color:var(--text-dim)">${axisHint(r.weak)}</span></div>`;
+  if (r.weak_sigma > 0) {
+    html += `<div class="row"><span class="k">its sigma</span>`
+          +   `<span class="v">${r.weak_sigma.toFixed(2)} ${escapeHtml(r.units)}</span></div>`;
+  }
+  if (r.source === 'geometry') {
+    html += `<div class="note">Read from the marks, not from a measured origin. Measure the `
+          + `origin and look again.</div>`;
+  }
+  if (r.stale) {
+    html += `<div class="note bad">The stored origin measurement was taken against different `
+          + `marks, lines or nominals, so this direction may have moved. Re-measure before `
+          + `standing anywhere on it.</div>`;
+  }
+
+  const cams = r.cameras || [];
+  if (cams.length) {
+    html += `<table class="obs"><tr><th>image</th><th>marks</th><th>|cos|</th><th>share</th>`
+          + `<th>/mark</th><th>left</th><th>+if&nbsp;marked</th></tr>`
+          + cams.map((c) => {
+              const hot = c.image === r.best_per_mark;
+              const left = c.image === r.most_left_to_click;
+              return `<tr><td>${escapeHtml(c.image)}`
+                   + `${hot ? ' <span style="color:var(--text-dim)">(best/mark)</span>' : ''}`
+                   + `</td>`
+                   + `<td>${c.marks}</td>`
+                   + `<td>${c.cos_weak.toFixed(2)}</td>`
+                   + `<td>${(100 * c.share).toFixed(1)}%</td>`
+                   + `<td>${(100 * c.share_per_mark).toFixed(2)}%</td>`
+                   + `<td>${c.unmarked_in_frame || ''}</td>`
+                   + `<td${left ? ' style="font-weight:600"' : ''}>`
+                   + `${c.gain_if_marked ? (100 * c.gain_if_marked).toFixed(1) + '%' : ''}`
+                   + `</td></tr>`;
+            }).join('')
+          + `</table>`;
+    html += `<div class="note"><b>|cos|</b> is how squarely each camera looks down the weak `
+          + `direction &mdash; near 1 and it can say almost nothing about that direction, `
+          + `near 0 and it is looking straight across it. <b>share</b> is how much of the `
+          + `information along it that camera actually supplies, and <b>/mark</b> is what one `
+          + `more mark there is worth. Distance counts as much as aim: information falls off `
+          + `as its square, so a close photo beats a well-aimed far one.</div>`;
+    const best = cams.find((c) => c.image === r.most_left_to_click);
+    if (best && best.gain_if_marked > 0.02) {
+      html += `<div class="note good">Cheapest gain available, and it needs no new photograph: `
+            + `<b>${escapeHtml(best.image)}</b> has ${best.unmarked_in_frame} positioned `
+            + `point(s) inside the frame that are not marked in it, worth about `
+            + `${(100 * best.gain_if_marked).toFixed(0)}% more information along the weak `
+            + `direction. Occlusion is not modelled, so some may be behind the part.</div>`;
+    }
+  }
+
+  const s = r.suggestion;
+  if (s) {
+    html += `<div class="row" style="margin-top:6px"><span class="k">a missing vantage</span>`
+          +   `<span class="v">${s.nearest_existing_deg.toFixed(0)}&deg; from the nearest `
+          +     `line of sight you have</span></div>`
+          + `<div class="row"><span class="k">face</span>`
+          +   `<span class="v">${vec3(s.bearing)} <span style="color:var(--text-dim)">`
+          +   `(${axisHint(s.bearing)})</span></span></div>`
+          + `<div class="row"><span class="k">stand at</span>`
+          +   `<span class="v">${vec3(s.position, 0)} ${escapeHtml(r.units)}</span></div>`
+          + `<div class="row"><span class="k">or opposite</span>`
+          +   `<span class="v" style="color:var(--text-dim)">${vec3(s.position_opposite, 0)}`
+          +   `</span></div>`;
+    let worth = `about ${(100 * s.gain).toFixed(0)}% more information along the weak `
+              + `direction, assuming it marks ${s.marks_assumed} points`;
+    if (r.weak_sigma > 0 && s.sigma_factor > 0) {
+      worth += ` &mdash; which is ${r.weak_sigma.toFixed(1)} to `
+             + `${(r.weak_sigma * s.sigma_factor).toFixed(1)} ${escapeHtml(r.units)} along that `
+             + `one direction, indicative only`;
+    } else {
+      // Information is a ratio and says nothing about millimetres on its own.
+      // Without a measured origin there is nothing to scale, so the percentage
+      // has to be left as a percentage rather than dressed up as an improvement.
+      worth += `, which cannot be put in ${escapeHtml(r.units)} until the origin has been `
+             + `measured &mdash; a ratio of information is not a distance`;
+    }
+    html += `<div class="note">Both positions see the same slice: a camera and its opposite `
+          + `pin a point identically, so take whichever is not a wall. Worth ${worth}. The `
+          + `standoff is the closest one already in the set, because a distance one `
+          + `photograph was taken from is a distance that can be stood at.</div>`;
+    // A large gain and "no viewpoint will help much" are both true at once, and
+    // read together they look like a contradiction. They are answers about
+    // different things: the gain is information along one direction, and the
+    // verdict is about the shape of the whole ellipsoid, which a single
+    // direction barely moves when the three are already close to equal. Said
+    // here because the percentage is the number someone would act on.
+    if (r.verdict === 'evidence-limited' && s.gain > 0.25) {
+      html += `<div class="note">That percentage is larger than it sounds. It is information `
+            + `along one direction, and this error is nearly spherical &mdash; sharpening the `
+            + `weakest of three near-equal axes moves the containment radius very little. `
+            + `Worth taking if you are standing there anyway; not worth a trip.</div>`;
+    }
+  }
+
+  for (const n of (r.notes || [])) html += `<div class="note">${escapeHtml(n)}</div>`;
+  return html;
+}
+
+function renderViewpointPanel() {
+  const el = $('vppanel');
+  if (!el) return;
+  const r = state.viewpoints;
+  const badge = $('vpcount');
+  if (badge) badge.textContent = r && r.ok ? r.verdict : '';
+  el.innerHTML = `<div class="row"><span class="k">information along the weak axis</span>`
+               +   `<button class="smallbtn" id="checkviewpoints">read viewpoints</button>`
+               + `</div>`
+               + viewpointPanelHtml();
+  // Wired here and not from the init pass: this panel rebuilds its own button on
+  // every render, so a handler attached once would be thrown away on the first
+  // redraw after it.
+  wireViewpointPanel();
+}
+
+function wireViewpointPanel() {
+  const btn = $('checkviewpoints');
+  if (!btn) return;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    setStatus('apportioning the information along the weak direction…');
+    try {
+      const data = await api('/api/viewpoints', { project: projectPayload() });
+      const r = data.viewpoints;
+      state.viewpoints = r;
+      setStatus(
+        r.ok
+          ? `${r.verdict}: ${r.anisotropy.toFixed(2)}x worst to best, best per mark `
+            + `${r.best_per_mark}, most left to click ${r.most_left_to_click}`
+          : `viewpoints: ${r.reason}`,
+        r.ok && r.verdict === 'viewpoint-limited' ? 'warn' : 'ok');
+    } catch (err) {
+      setStatus(`could not read the viewpoints: ${err.message || err}`, 'warn');
+    } finally {
+      btn.disabled = false;
+      renderPanels();
+      render();
+    }
+  };
 }
 
 function wireShapeCheck() {

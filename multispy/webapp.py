@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import calibfile, exif, export, nominalcheck, sensorcheck, sensors, uncertainty
+from . import calibfile, exif, export, nominalcheck, sensorcheck, sensors, uncertainty, viewpoint
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
 from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
 from .part import PartFitReport, part_fit, place_part
@@ -59,6 +59,7 @@ SHARED_ROUTES = frozenset(
         "/api/check_calibration",
         "/api/check_sensors_in_photos",
         "/api/check_nominal_shape",
+        "/api/viewpoints",
         "/api/use_calibration_nominals",
     }
 )
@@ -657,6 +658,17 @@ class Workspace:
                 ),
             )
             return {"shape": report.to_dict(), "verdict": report.verdict}
+
+        # Read-only and deliberately cheap: no re-solve, no Monte Carlo. It reads
+        # the poses as they stand and apportions the information they already
+        # carry, which is why it can run on every solve without being asked for.
+        # The weak direction it apportions along comes from the stored origin
+        # measurement rather than from anything computed here -- see the module
+        # docstring for why those are different questions.
+        if route == "/api/viewpoints":
+            project = Project.from_dict(body["project"], path=self.project.path)
+            report = viewpoint.viewpoint_report(project)
+            return {"viewpoints": report.to_dict(), "verdict": report.verdict}
 
         # Adopting the file's feature coordinates as nominals you can pick from.
         # A separate route from /api/check_calibration, which stays read-only:

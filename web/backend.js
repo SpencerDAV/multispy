@@ -25,16 +25,30 @@ const Backend = (() => {
    * absent: one is a CLI and the other is the transport this replaces.
    *
    * The build states this list in config.js, because it is the build that
-   * decides which files land in py/. The literal below is only a fallback for
-   * a config.js written before that, and it is a fallback with teeth: when the
-   * two disagree, every module the build shipped but this list omits is simply
-   * never written to the virtual filesystem, and the first import of one takes
-   * the whole page down while the local server -- which never reads this --
-   * carries on working perfectly. */
-  const MODULES = window.MULTISPY_PY_MODULES || [
-    '__init__', 'geometry', 'mesh', 'exif', 'project', 'solve', 'part', 'edgefit',
-    'export', 'webapp',
-  ];
+   * decides which files land in py/.
+   *
+   * There used to be a literal here as a fallback, and the comment above it
+   * called it "a fallback with teeth" -- correctly, and that was the argument
+   * for deleting it rather than maintaining it. It had rotted to ten names
+   * against a package of fifteen, so the one circumstance it existed for, a
+   * config.js too old to carry the variable, was also the circumstance in which
+   * it would silently omit six modules: the page would boot, run, and then die
+   * on the first import of one, while the local server -- which never reads
+   * this -- carried on working perfectly. A stale cached config.js on a live
+   * site is exactly that circumstance.
+   *
+   * So there is no fallback. Either the build told us what it shipped or we do
+   * not know, and not knowing is said out loud before anything is loaded,
+   * because a page that refuses to start is debuggable and a page that half
+   * starts is not. */
+  const MODULES = window.MULTISPY_PY_MODULES;
+  if (!Array.isArray(MODULES) || !MODULES.length) {
+    throw new Error(
+      'config.js did not say which Python modules were shipped '
+      + '(window.MULTISPY_PY_MODULES is missing or empty). This is a stale or missing '
+      + 'config.js — a hard reload should fix it. Guessing the list here is what broke '
+      + 'this build twice before, so it is not attempted.');
+  }
 
   let pyodide = null;
   let dispatch = null;

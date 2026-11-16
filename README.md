@@ -562,6 +562,70 @@ solve they then anchor are self-consistent by construction, so they inflate
 nothing here while validating nothing either. Read it as a floor on the
 uncertainty, never a ceiling.
 
+A third limit, and currently a real defect: **one nominal sigma is applied to
+all three axes.** `nominal_constraints` expands a point's nominal into three
+axis locks at the same tolerance, so a single-axis feature — a Perceptron
+`Range` or `OneDimensionMinRange` row, which states `Disabled / Enabled /
+Disabled` for exactly this reason — has its two uninspected axes pinned to the
+tolerance of the one axis that *was* inspected. On PRM1 that is p5 at 0.5 mm and
+p14 at 3.0 mm, on four axes between them that no sensor measured.
+
+The fix is a looser sigma on those axes, not releasing them. Releasing them is
+measurable and it is worse: dropping the four uninspected axis locks takes the
+origin from ±27.61 mm to **±60.67 mm** and moves the weak direction 54°, while
+the reprojection RMS holds at 2.0 px — the photographs are indifferent to a
+30 mm shift of p5 along X, because every camera that marks it is looking down
+that axis. The locks are weak evidence, but they are the only evidence those
+axes have.
+
+Per-axis nominals are already plumbed in: a `None` axis is skipped by
+`nominal_constraints`, survives the JSON round-trip, and is guarded for in
+`nominalcheck`, `part` and `solve`. Two things are missing — `in_part_space`
+raises on one, and `nominal_sigma` has no per-axis form. Note also that
+`align_to_nominals` requires three *fully* specified nominals, so a project
+would need more links before any could be made partial.
+
+### Which photograph is holding the origin up, and where should the next one stand?
+
+The sphere above says how big the uncertainty is, and its per-axis sigmas say
+which direction is worst. Neither says what to do about it. Press **read
+viewpoints** in the Viewpoints panel: it apportions the information along the
+origin's weakest direction across the photographs that supply it. No re-solve,
+so it is instant.
+
+It exists partly to head off a reasonable instinct that turns out to be a trap.
+A camera aimed down the part's X axis cannot see depth along X, so it looks like
+a camera that should count for less when X is the weak direction. **Do not weight
+it down.** A reprojection residual is in pixels, and the derivative of a pixel
+with respect to a world displacement *along* the viewing ray is already nearly
+zero — the Jacobian is a per-observation 3×3 information matrix and it has been
+doing this the whole time. On the PRM1 cell the effect is stark: per mark, a
+camera looking across the weak direction is worth **27×** one staring down it,
+with no weighting applied anywhere. Discounting that second camera by its aim
+would double-count the X it had already lost *and* throw away the Y and Z it
+sees better than anything else in the set, because a scalar cannot tell the
+axes apart.
+
+| | |
+|---|---|
+| **\|cos\|** | How squarely a camera looks down the weak direction. Near 1 and it can say almost nothing about that direction; near 0 and it is looking straight across it. Exactly 1 contributes exactly nothing, however close it stands. |
+| **share** | How much of the information along that direction the camera actually supplies. Sums to 100% across the set. |
+| **/mark** | `share` divided by its mark count — what one *more* mark there is worth, which is the figure to compare cameras on. A dense photo can hold a large share while each mark in it is nearly worthless. |
+| **left / +if marked** | Positioned points inside the frame that are not marked in it, and what marking them all would add. Usually the cheapest gain available, since it needs no new photograph. Occlusion is not modelled, so some may sit behind the part. |
+| **a missing vantage** | A line of sight perpendicular to the weak direction — that is what makes it worth taking — and, among those, the one furthest from the lines of sight you already hold. Two positions are offered because a camera and its opposite pin a point identically; take whichever is not a wall. |
+| **verdict** | `viewpoint-limited` when the error ellipsoid is lopsided enough that a new vantage can take some of it out. `evidence-limited` when it is nearly spherical, where no viewpoint is badly missing and the shortage is marks and nominals instead. |
+
+Read the verdict before the gain. A gain is a ratio of information along one
+direction, and sigma goes as its inverse square root, so half as much again is
+about 18% off one axis — and the containment radius answers to the whole
+ellipsoid, which barely moves. PRM1 reports a 48% gain from a camera looking
+*down* at the cell, which nothing in its nine photographs does, and that is
+still only 12.5 → 10.3 mm on one axis of a 27.6 mm radius. The panel says so
+where it would otherwise flatter itself.
+
+A reading, not a setting: it is cleared by any edit, because every figure is
+read off the poses and marks as they stood when it ran.
+
 ### Is each nominal on the feature it names?
 
 The section above ends on a limit: a datum point clicked on the wrong feature in
