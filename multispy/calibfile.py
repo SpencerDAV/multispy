@@ -234,6 +234,9 @@ def read_export(
                     limits=tuple(
                         _limits(row, a) for a in ("X", "Y", "Z")
                     ),  # type: ignore[arg-type]
+                    inspected=tuple(
+                        _inspected(row, a) for a in ("X", "Y", "Z")
+                    ),  # type: ignore[arg-type]
                     raw=dict(row),
                 )
             )
@@ -275,6 +278,30 @@ def read_export(
             f"untestable rather than passing"
         )
     return report
+
+
+def _inspected(row: dict[str, str], axis: str) -> bool | None:
+    """Whether the system actually inspects this feature on one axis.
+
+    The ``X Axis`` / ``Y Axis`` / ``Z Axis`` columns, which read ``Enabled`` or
+    ``Disabled``. Trivial to parse and easy to skip, which is exactly why it is
+    worth a named function: these three columns are the file saying, in its own
+    words, which of a feature's coordinates it has an opinion about. A
+    ``Range`` or ``OneDimensionMinRange`` row carries one ``Enabled`` and two
+    ``Disabled``, and reading that as three measured coordinates is the
+    difference between stating a drawing and inventing an inspection.
+
+    ``None``, not ``False``, where the column is absent or blank. A file that
+    does not carry the flags has not declared anything disabled, and defaulting
+    to ``False`` would widen every axis of every feature in such a file on the
+    strength of a missing column.
+    """
+    text = (row.get(f"{axis} Axis") or "").strip().lower()
+    if text.startswith("enable"):
+        return True
+    if text.startswith("disable"):
+        return False
+    return None
 
 
 def _limits(row: dict[str, str], axis: str) -> tuple[float | None, float | None]:

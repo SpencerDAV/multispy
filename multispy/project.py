@@ -163,7 +163,35 @@ class TiePoint:
 
     A real tolerance, not a formality: it is what decides whether the solve
     bends to meet the drawing or the drawing bends to meet the solve. Tight on
-    the datum features that define the frame, loose on everything else."""
+    the datum features that define the frame, loose on everything else.
+
+    One number for all three axes, which is right for a nominal somebody typed
+    off a drawing and wrong for a metrology feature -- see
+    ``nominal_sigma_axes``."""
+    nominal_sigma_axes: list[float | None] | None = None
+    """Per-axis tolerance, in nominal units, where one number will not do.
+
+    Three entries; any one ``None`` falls back to ``nominal_sigma`` and then to
+    ``Settings.sigma_nominal``. ``None`` for the whole field means the scalar
+    governs every axis, which is the common case and stays untouched.
+
+    This exists because a single-axis feature is not a point with a tolerance,
+    it is a *plane* with a tolerance. A Perceptron ``Range`` or
+    ``OneDimensionMinRange`` row measures one axis and says so outright, in
+    ``Enabled``/``Disabled`` flags per axis. Applying its half-millimetre
+    tolerance to the two axes nobody inspected does not state the drawing, it
+    invents an inspection: on the PRM1 cell that pinned four axes -- p5's X and
+    Z at 0.5 mm, p14's at 3.0 mm -- against photographs that have no opinion
+    about them at all.
+
+    The fix is a looser sigma on those axes rather than no sigma, and that
+    distinction is measured, not aesthetic. Dropping the four uninspected locks
+    on PRM1 took the origin's 95% radius from 27.61 mm to 60.67 mm and swung its
+    weak direction 54 degrees while the reprojection RMS held at 2.0 px -- every
+    camera that marks p5 is looking down the axis in question, so the lock is
+    weak evidence and the only evidence that axis has. A nominal with a ``None``
+    coordinate is the way to say "no evidence"; this field is the way to say
+    "evidence worth less"."""
     nominal_source: str = ""
     """Which named feature this point's nominal was taken from, if any.
 
@@ -179,6 +207,37 @@ class TiePoint:
 
     Keeps contributing, at ``Settings.uncertain_factor`` times its usual sigma,
     and is dropped sooner than a confident mark when the outlier pass runs."""
+
+    def nominal_sigma_on(self, axis: int, default: float) -> float:
+        """Tolerance governing one axis of this point's nominal, in nominal units.
+
+        The fallback chain written once, in one place, because it has three
+        links and every caller that re-implemented it would be a place for the
+        per-axis value to be quietly ignored: the per-axis entry, then the
+        scalar, then the project default the caller hands in.
+
+        ``default`` is passed rather than read, because a tie point does not
+        know which project it belongs to and should not have to.
+        """
+        axes = self.nominal_sigma_axes
+        if axes is not None and 0 <= axis < len(axes) and axes[axis] is not None:
+            return float(axes[axis])
+        if self.nominal_sigma is not None:
+            return float(self.nominal_sigma)
+        return float(default)
+
+    def nominal_is_partial(self) -> bool:
+        """True when this point states some axes of its nominal and not others.
+
+        A different thing from carrying no nominal at all, and worth its own
+        question: a partial nominal contributes to the solve but cannot help fix
+        the frame, which is the distinction :meth:`Project.in_part_space` turns
+        on.
+        """
+        if not self.nominal or len(self.nominal) != 3:
+            return False
+        stated = [v is not None for v in self.nominal]
+        return any(stated) and not all(stated)
 
 
 @dataclass
@@ -610,25 +669,29 @@ class Project:
 
         Regenerated on demand rather than stored, so editing a nominal cannot
         leave a stale lock behind.
+
+        Each lock takes its own axis's tolerance, via
+        :meth:`TiePoint.nominal_sigma_on`. The sigma is per lock and always was
+        -- it is only the *source* of the number that used to be shared -- so a
+        single-axis feature now produces one tight lock and two loose ones
+        instead of three tight ones, with nothing downstream needing to know.
         """
         out: list[AxisLockConstraint] = []
+        default = float(self.settings.sigma_nominal)
         for pt in self.points:
             if not pt.nominal or len(pt.nominal) != 3:
                 continue
-            sigma = pt.nominal_sigma
-            if sigma is None:
-                sigma = self.settings.sigma_nominal
-            sigma_world = max(float(sigma) * self.nominal_scale, 1e-9)
             for axis in range(3):
                 value = pt.nominal[axis]
                 if value is None:
                     continue
+                sigma = pt.nominal_sigma_on(axis, default)
                 out.append(
                     AxisLockConstraint(
                         point=pt.id,
                         axis=axis,
                         value=float(value) * self.nominal_scale,
-                        sigma=sigma_world,
+                        sigma=max(sigma * self.nominal_scale, 1e-9),
                         source="nominal",
                     )
                 )
@@ -646,8 +709,23 @@ class Project:
         Three non-collinear nominal'd points is the real test, but counting
         them is not enough -- three points in a row leave a rotation about that
         row free. Collinearity is checked against the nominals themselves,
-        since those are known before anything is solved."""
-        pts = [np.array(p.nominal, dtype=float) for p in self.points if p.nominal]
+        since those are known before anything is solved.
+
+        Only *fully* specified nominals count. A point stating one axis and not
+        the others is real evidence and goes into the solve as a lock, but it
+        cannot sit in a triangle -- there is no third coordinate to put it at --
+        and counting it here would promise a frame that
+        :func:`~multispy.solve.align_to_nominals` then declines to build. It
+        used to be counted, and worse than wrongly: ``np.array`` on a nominal
+        holding a ``None`` builds an object array, and the rank test on one
+        raises ``LinAlgError: SVD did not converge`` from inside a method whose
+        whole job is to answer True or False. This was the one place a partial
+        nominal crashed rather than being skipped."""
+        pts = [
+            np.array([float(v) for v in p.nominal], dtype=float)
+            for p in self.points
+            if p.nominal and len(p.nominal) == 3 and all(v is not None for v in p.nominal)
+        ]
         if len(pts) < 3:
             return False
         P = np.array(pts) - np.mean(pts, axis=0)
@@ -958,6 +1036,7 @@ class Project:
                     "xyz": p.xyz.tolist() if p.xyz is not None else None,
                     "nominal": p.nominal,
                     "nominal_sigma": p.nominal_sigma,
+                    "nominal_sigma_axes": p.nominal_sigma_axes,
                     "nominal_source": p.nominal_source,
                     "uncertain": p.uncertain,
                 }
@@ -1057,6 +1136,13 @@ class Project:
                 pt.nominal = [None if v is None else float(v) for v in nominal]
             if raw.get("nominal_sigma") is not None:
                 pt.nominal_sigma = float(raw["nominal_sigma"])
+            axes = raw.get("nominal_sigma_axes")
+            if axes is not None and len(axes) == 3:
+                # A ``None`` entry is kept as ``None``, never coerced to 0.0 --
+                # the same distinction ``nominal`` makes, and for the same
+                # reason: zero is an infinitely tight tolerance, which is the
+                # most destructive value this field can hold.
+                pt.nominal_sigma_axes = [None if v is None else float(v) for v in axes]
             pt.nominal_source = str(raw.get("nominal_source", "") or "")
             points.append(pt)
 

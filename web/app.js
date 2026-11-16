@@ -3982,6 +3982,27 @@ function wireOriginPanel() {
  * Withheld candidates are shown, disabled, with their reason. A feature whose
  * sensor was convicted is not a feature that does not exist, and hiding it would
  * only invite someone to type the number in by hand. */
+/* The tolerance field above holds one number, and for a single-axis metrology
+ * feature that is not what is in force. Saying so here is not decoration: a
+ * field reading "2" while two of the three axes are held at 20 is a tolerance
+ * that silently does not apply, which is the defect this whole per-axis form
+ * exists to fix. Read-only, because editing it by hand is the scalar field's
+ * job and typing there clears this. */
+function perAxisTolHtml(ap, u) {
+  const axes = ap.nominal_sigma_axes;
+  if (!Array.isArray(axes) || axes.every((v) => v === null || v === undefined)) return '';
+  const fallback = ap.nominal_sigma ?? (state.project.settings.sigma_nominal ?? 0.1);
+  const cells = ['X', 'Y', 'Z'].map((ax, i) => {
+    const v = axes[i] === null || axes[i] === undefined ? fallback : axes[i];
+    const loose = axes[i] !== null && axes[i] !== undefined
+                && Number(axes[i]) > Number(fallback) * 1.000001;
+    return `${ax} ±${Number(v).toPrecision(3).replace(/\.?0+$/, '')}${loose ? ' (uninspected)' : ''}`;
+  });
+  return `<div class="msg">per axis, from the calibration file: `
+       + `${escapeHtml(cells.join('  ·  '))} ${escapeHtml(u)}. The field above `
+       + `applies only where this states nothing; typing in it replaces this.</div>`;
+}
+
 function calibPickerHtml(ap) {
   const all = state.project.calibration_nominals || [];
   if (!all.length) {
@@ -4040,6 +4061,14 @@ function wireCalibPicker() {
         chosen.sigma === null || chosen.sigma === undefined
           ? null
           : Number(chosen.sigma);
+      // And the per-axis form beside it, which is the only thing that can say
+      // "the cell inspects this on Y". Each entry is null where the file states
+      // nothing for that axis, which falls back to the scalar and then to
+      // Settings.sigma_nominal -- so a null here is not a missing tolerance,
+      // it is the same tolerance the scalar already carries.
+      pt.nominal_sigma_axes = Array.isArray(chosen.sigma_axes)
+        ? chosen.sigma_axes.map((v) => (v === null || v === undefined ? null : Number(v)))
+        : null;
     }
     markDirty();
     renderPanels();
@@ -4149,6 +4178,7 @@ function renderPointsPanel() {
                             ? '' : ap.nominal_sigma}" `
               +   `placeholder="${(state.project.settings.sigma_nominal ?? 0.1)}">`
               +   `<span class="est">${escapeHtml(u)}</span></div>`
+              + perAxisTolHtml(ap, u)
               + calibPickerHtml(ap);
 
         const miss = nominalMiss(ap.id);
@@ -4223,6 +4253,16 @@ function renderPointsPanel() {
     if (!ap) return;
     const raw = e.target.value.trim();
     ap.nominal_sigma = raw === '' ? null : Number(raw);
+    // Typing one number here means one number, so any per-axis override the
+    // calibration import left behind goes. Keeping it would leave a field
+    // showing the figure that was typed while the axes it does not cover are
+    // the only ones using it -- a tolerance that silently does not apply is
+    // worse than one that is wrong.
+    if (ap.nominal_sigma_axes) {
+      ap.nominal_sigma_axes = null;
+      setStatus('typed tolerance now governs all three axes, replacing the '
+              + 'per-axis one the calibration file stated', 'warn');
+    }
     markDirty(); renderPanels();
   };
 
@@ -4239,7 +4279,12 @@ function renderPointsPanel() {
   const cn = $('clearnom');
   if (cn) cn.onclick = () => {
     const ap = pts.find((p) => p.id === state.activePoint);
-    if (ap) { ap.nominal = null; ap.nominal_sigma = null; markDirty(); renderPanels(); render(); }
+    if (ap) {
+      ap.nominal = null;
+      ap.nominal_sigma = null;
+      ap.nominal_sigma_axes = null;
+      markDirty(); renderPanels(); render();
+    }
   };
 }
 

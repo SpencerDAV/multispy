@@ -690,6 +690,7 @@ def align_to_nominals(
         if p.nominal and len(p.nominal) == 3 and all(v is not None for v in p.nominal)
         and p.id in positions
     ]
+    _report_partial_nominals(project, report)
     if len(nominal) < 2:
         return False
 
@@ -736,6 +737,62 @@ def align_to_nominals(
         "adjustment handles badly."
     )
     return True
+
+
+def _report_partial_nominals(project: Project, report: SolveReport) -> None:
+    """Say so when the frame rests on fewer nominals than the project appears to have.
+
+    A partial nominal -- one axis stated, the others left blank -- is deliberate
+    and useful: it is how a single-axis metrology feature says what it actually
+    knows, and it goes into the solve as a real axis lock. What it cannot do is
+    help *build* the frame. A similarity fit needs three full coordinates per
+    point, so :func:`align_to_nominals` counts only fully specified ones, and so
+    does :meth:`Project.in_part_space`.
+
+    The two facts together have a trap in them. A project showing five nominal'd
+    points, three of them partial, is a project with two, and the symptom of that
+    is not an error -- it is a reconstruction that quietly stays in arbitrary
+    coordinates while every panel still says "nominal" beside five points. On the
+    PRM1 cell this is one step away at all times: of its four links only p15 and
+    p16 are fully specified, so making either of the two single-axis features
+    partial would take it out of part space altogether. That is exactly why those
+    axes are widened rather than released -- but a project that does cross the
+    line deserves to be told, in the report, with the count.
+    """
+    partial = [p.id for p in project.points if p.nominal_is_partial()]
+    if not partial:
+        return
+    # Counted off the project, not off the points this solve happened to
+    # triangulate: the shortfall being described is in what was stated, and a
+    # figure that also moved with the reconstruction would be two facts at once.
+    # ``in_part_space`` is the verdict rather than ``n_full >= 3`` because it
+    # also rejects three nominals in a straight line.
+    n_full = sum(
+        1
+        for p in project.points
+        if p.nominal and len(p.nominal) == 3 and all(v is not None for v in p.nominal)
+    )
+    names = ", ".join(partial[:6]) + ("..." if len(partial) > 6 else "")
+    if project.in_part_space():
+        report.messages.append(
+            f"{len(partial)} point(s) state only some axes of their nominal ({names}). Those "
+            f"axes are constraints like any other, but they do not count toward the frame; "
+            f"{n_full} fully specified nominal(s) are what put this project in part space."
+        )
+        return
+    short = max(3 - n_full, 0)
+    need = (
+        f"Give {short} more point(s) a complete nominal, or complete the partial ones."
+        if short
+        else "There are enough complete nominals, so they must be lying in a straight line, "
+        "which leaves a rotation about that line free."
+    )
+    report.messages.append(
+        f"{len(partial)} point(s) state only some axes of their nominal ({names}), and "
+        f"{n_full} state all three. The frame needs three fully specified, non-collinear "
+        f"nominals, so this project is not in part space: the partial axes still pull the "
+        f"solve toward the drawing, but the coordinates it reports are not the part's. {need}"
+    )
 
 
 def _clear_unbacked_poses(project: Project) -> int:
@@ -2382,18 +2439,34 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     _warn_if_nominals_dictate(report)
     _warn_about_weak_nominals(project, report)
     report.n_nominals = sum(1 for pt in project.points if pt.nominal)
+    # Counted separately from ``n_nominals`` because only these fix the frame. A
+    # partial nominal is a real constraint and belongs in the total; saying it
+    # "fixes the origin" would be a different and false claim, and on a project
+    # whose single-axis features are partial the two counts are far apart.
+    n_full = sum(
+        1
+        for pt in project.points
+        if pt.nominal and len(pt.nominal) == 3 and all(v is not None for v in pt.nominal)
+    )
     report.part_space = project.in_part_space()
+    partly = (
+        f" The other {report.n_nominals - n_full} state only some axes and constrain the solve "
+        f"without contributing to the frame."
+        if report.n_nominals > n_full
+        else ""
+    )
     if report.part_space:
         report.messages.append(
-            f"in part space: {report.n_nominals} point nominal(s) fix the origin, orientation "
-            "and scale, so these coordinates are the part's own. A CAD model of the part goes "
-            "in at the identity."
+            f"in part space: {n_full} fully specified point nominal(s) fix the origin, "
+            "orientation and scale, so these coordinates are the part's own. A CAD model of "
+            f"the part goes in at the identity.{partly}"
         )
     elif report.n_nominals:
         report.warnings.append(
-            f"{report.n_nominals} point(s) carry a nominal, which is not enough to define part "
-            "space -- that needs three or more that do not lie in a straight line. The nominals "
-            "still constrain the solve, but the frame is not the part's."
+            f"{report.n_nominals} point(s) carry a nominal and {n_full} state all three axes, "
+            "which is not enough to define part space -- that needs three or more fully "
+            "specified ones that do not lie in a straight line. The nominals still constrain "
+            "the solve, but the frame is not the part's."
         )
 
     from_constraints = constraints_imply_scale(problem.constraints)

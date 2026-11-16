@@ -136,7 +136,11 @@ def fingerprint(project: Project) -> str:
             for im in sorted(project.images, key=lambda i: i.id)
         ],
         "nominals": {
-            p.id: [p.nominal, p.nominal_sigma]
+            # The per-axis sigma belongs here as much as the scalar: widening
+            # a single-axis feature's uninspected axes changes where the origin
+            # lands, so a stored radius that survived the edit would be a stale
+            # reading presented as a current one.
+            p.id: [p.nominal, p.nominal_sigma, p.nominal_sigma_axes]
             for p in sorted(project.points, key=lambda p: p.id)
             if p.nominal
         },

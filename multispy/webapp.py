@@ -688,7 +688,14 @@ class Workspace:
                 warn=float(project.settings.sensor_warn),
                 units=project.nominal_units,
             )
-            candidates = sensors.nominal_candidates(imported.sensors, filed)
+            # The project's own default goes in because a single-axis feature
+            # with no stated limits still has axes the cell does not inspect,
+            # and widening them has to widen something.
+            candidates = sensors.nominal_candidates(
+                imported.sensors,
+                filed,
+                default_sigma=float(project.settings.sigma_nominal),
+            )
             project.calibration_nominals = [c.to_dict() for c in candidates]
             self.save()
             usable = sum(1 for c in candidates if c.usable)

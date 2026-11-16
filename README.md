@@ -562,28 +562,85 @@ solve they then anchor are self-consistent by construction, so they inflate
 nothing here while validating nothing either. Read it as a floor on the
 uncertainty, never a ceiling.
 
-A third limit, and currently a real defect: **one nominal sigma is applied to
-all three axes.** `nominal_constraints` expands a point's nominal into three
-axis locks at the same tolerance, so a single-axis feature — a Perceptron
-`Range` or `OneDimensionMinRange` row, which states `Disabled / Enabled /
-Disabled` for exactly this reason — has its two uninspected axes pinned to the
-tolerance of the one axis that *was* inspected. On PRM1 that is p5 at 0.5 mm and
-p14 at 3.0 mm, on four axes between them that no sensor measured.
+### One tolerance per axis, because a single-axis feature has one
 
-The fix is a looser sigma on those axes, not releasing them. Releasing them is
-measurable and it is worse: dropping the four uninspected axis locks takes the
-origin from ±27.61 mm to **±60.67 mm** and moves the weak direction 54°, while
-the reprojection RMS holds at 2.0 px — the photographs are indifferent to a
-30 mm shift of p5 along X, because every camera that marks it is looking down
-that axis. The locks are weak evidence, but they are the only evidence those
-axes have.
+A third limit, now fixed, and worth reading before anybody changes it.
 
-Per-axis nominals are already plumbed in: a `None` axis is skipped by
-`nominal_constraints`, survives the JSON round-trip, and is guarded for in
-`nominalcheck`, `part` and `solve`. Two things are missing — `in_part_space`
-raises on one, and `nominal_sigma` has no per-axis form. Note also that
-`align_to_nominals` requires three *fully* specified nominals, so a project
-would need more links before any could be made partial.
+The defect was that **one nominal sigma was applied to all three axes.**
+`nominal_constraints` expands a point's nominal into three axis locks, and they
+all used to carry the same tolerance — so a single-axis feature, a Perceptron
+`Range` or `OneDimensionMinRange` row which states `Disabled / Enabled /
+Disabled` for exactly this reason, had its two uninspected axes pinned to the
+tolerance of the one axis that *was* inspected. On PRM1 that was p5 at 0.5 mm
+and p14 at 3.0 mm, across four axes between them that no sensor measured.
+
+`TiePoint.nominal_sigma_axes` now carries a tolerance per axis. A `None` entry
+falls back to `nominal_sigma` and then to `sigma_nominal`, so a coordinate
+somebody typed off a drawing still wants one number and nothing about it has
+changed. The calibration import reads the `Enabled`/`Disabled` columns and
+offers the uninspected axes at `sensors.UNINSPECTED_AXIS_FACTOR` — ten times the
+tolerance governing the inspected axis. **That factor is a judgement, not a
+measurement**, and it says so where it is defined: the file states a tolerance
+for the axes it inspects and nothing at all for the ones it does not, so there
+is no number to read and this one was chosen. The pick-list says which axes the
+cell actually inspects, and the Points panel shows the three tolerances in
+force.
+
+**Widened, not released**, and that distinction is the measured part. Releasing
+the uninspected axes — a `None` coordinate, no lock at all — is worse than
+holding them too tightly, and widening lands between the two. All three read off
+PRM1 itself, 48 samples at seed 11, differing only in the sigma on p5's and
+p14's X and Z (the axes the file marks `Disabled`):
+
+| reading | origin radius | reproj RMS | weak direction |
+|---|---|---|---|
+| tight — the defect, as the axes were pinned | ±31.06 mm | 2.03 px | (0.72, −0.38, 0.59) |
+| widened — ten times, on X and Z only | ±38.90 mm | 1.98 px | (0.32, −0.10, 0.94) |
+| released — no lock on those axes at all | **±68.99 mm** | 1.94 px | (−0.85, −0.52, −0.05) |
+
+Those are one consistent run, so read them against each other rather than
+against the ±27.61 mm and ±60.67 mm quoted earlier in this section, which were
+32 samples at a different seed. The conclusion is the same either way and the
+ordering is what matters: releasing roughly doubles the radius and swings the
+weak direction 64°. The photographs are indifferent to a 30 mm shift of p5 along
+X, because every camera that marks it is looking down that axis — so those locks
+are weak evidence and the only evidence those axes have.
+
+Read the middle row honestly in both directions. Widening costs about a quarter
+of the radius and swings the weak direction 35°, so it is not a free change:
+part of the old ±31 mm was bought with four axis locks nobody ever measured, and
+the viewpoint panel's advice moves with the direction. What it does not cost is
+pixels. The reprojection RMS *falls* monotonically as those locks loosen — 2.03,
+1.98, 1.94 — which is the clue to what the tight reading was doing.
+
+**A tight tolerance on an uninspected axis does not report a miss. It wins.**
+This came out the opposite way round from expected and is the more useful
+finding for it. Measured on a synthetic scene with two single-axis features
+whose uninspected X contradict each other by 25 mm each way:
+
+| reading | worst datum miss | reproj RMS |
+|---|---|---|
+| honest nominals | 0.02 mm | 1.06 px |
+| tight — 0.5 mm on the uninspected axis | 0.44 mm | 2.02 px |
+| widened — 5.0 mm | 18.76 mm | 1.20 px |
+
+The tight reading is the one with the clean asked-versus-achieved table, and it
+got there by bending the scene until the reprojection RMS doubled. A reader is
+told the part met its nominals and left to guess why the photographs got worse.
+Widening does not hide a disagreement behind a looser tolerance; it stops one
+being hidden behind a tighter one. Same mechanism as the warning in
+`nominalcheck.py`, arrived at from the other end.
+
+Two related things, since they are easy to trip over. `in_part_space` counts
+only *fully* specified nominals — it used to count partial ones, and raised
+`LinAlgError: SVD did not converge` on them, because `np.array([None, 527.1,
+None], dtype=float)` is an object array. And `align_to_nominals` requires three
+fully specified nominals, which is correct and was left alone: of PRM1's four
+links only p15 and p16 state all three axes, so making either single-axis
+feature partial would take the project out of part space with four points still
+labelled "nominal" in the panel. The solve report now says so in a sentence,
+with the count, rather than leaving it to an absent flag. All of this is
+defended in `tests/test_nominalaxes.py`.
 
 ### Which photograph is holding the origin up, and where should the next one stand?
 

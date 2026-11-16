@@ -274,6 +274,18 @@ class FeatureClaim:
         tuple[float | None, float | None],
     ] = ((None, None), (None, None), (None, None))
     """Upper and lower spec limit per axis, where the file states them."""
+    inspected: tuple[bool | None, bool | None, bool | None] = (None, None, None)
+    """Whether the system inspects this feature on each axis, as the file says.
+
+    The ``Enabled``/``Disabled`` flags, and the sharpest thing in the row about
+    what the measurement actually covers. A ``Range`` or
+    ``OneDimensionMinRange`` feature carries one ``Enabled`` and two
+    ``Disabled``: its nominal is a plane the drawing states, not a point the
+    cell measures. Taking its one tolerance onto all three axes turns the two
+    the file disclaimed into inspections nobody performed -- see
+    :func:`nominal_candidates` and ``TiePoint.nominal_sigma_axes``.
+
+    ``None`` where the file is silent, which is not the same as ``False``."""
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1490,6 +1502,35 @@ class NominalCandidate:
     invented. The tightest half-limit across the axes that state one, which is
     the conservative reading: a feature held to +-3 on one axis and +-8 on another
     is a feature worth trusting to 3."""
+    sigma_axes: list[float | None] | None = None
+    """The same tolerance resolved per axis, which is the honest shape of it.
+
+    ``sigma`` above is one number because that is what a typed nominal wants,
+    and for a feature the cell inspects on all three axes the two agree. They
+    part company on a single-axis feature, where the file states one
+    ``Enabled`` axis and two ``Disabled`` ones: the inspected axis keeps the
+    stated tolerance and the other two are *widened*, by
+    :data:`UNINSPECTED_AXIS_FACTOR`, to say that their coordinate is the
+    drawing's figure with no measurement behind it.
+
+    Widened and not dropped, which is the whole point. Dropping them -- a
+    ``None`` coordinate in the nominal -- was tried on the PRM1 cell and is
+    measurably worse: the origin's 95% radius went from 27.61 mm to 60.67 mm and
+    its weak direction swung 54 degrees, while the reprojection RMS held at
+    2.0 px. The photographs there are indifferent to a 30 mm shift of the
+    feature along its uninspected axis, because every camera that marks it is
+    looking down that axis. A weak constraint is the only kind available, and it
+    beats none.
+
+    ``None`` entries mean "nothing stated, fall back", exactly as in
+    ``TiePoint.nominal_sigma_axes``, so a feature the file gives no limits for
+    comes back all-``None`` rather than carrying an invented number."""
+    inspected: list[bool | None] | None = None
+    """Which axes the cell actually inspects, carried so the pick-list can say so.
+
+    The reason the tolerances differ, and the thing someone marking a point
+    needs to see: "the sensor reads Y only" changes which photographs are worth
+    taking next, and is invisible in a list of three coordinates."""
     verdict: str = ""
     """The sensor's verdict, carried along so the pick-list can show it."""
     usable: bool = True
@@ -1509,18 +1550,64 @@ class NominalCandidate:
             "session": self.session,
             "nominal": list(self.nominal),
             "sigma": self.sigma,
+            "sigma_axes": None if self.sigma_axes is None else list(self.sigma_axes),
+            "inspected": None if self.inspected is None else list(self.inspected),
             "verdict": self.verdict,
             "usable": self.usable,
             "note": self.note,
         }
 
 
+UNINSPECTED_AXIS_FACTOR = 10.0
+"""How much looser an uninspected axis is held than an inspected one.
+
+**A judgement, not a measurement.** Nothing in the export states it, and that
+is not an oversight in the parsing: the file says which axes it inspects and
+what their spec limits are, and about an axis it does not inspect it says only
+the drawing's coordinate. There is no stated uncertainty to read, so this number
+is chosen, and it is named and documented here rather than buried in an
+expression so that it can be argued with.
+
+The argument for an order of magnitude, in both directions. Too tight and the
+defect this exists to fix is still there: pinning an uninspected axis at the
+inspected axis's half-millimetre asserts an inspection that nobody performed,
+and on the PRM1 cell that was four axes across two points. Too loose and the
+lock stops being evidence at all, which is measurably worse than loose -- see
+``NominalCandidate.sigma_axes`` for the 27.61 to 60.67 mm figures. Ten keeps
+the axis pulled toward the drawing while letting the photographs win any real
+disagreement, which is the correct precedence: on the uninspected axis the
+drawing is the weaker witness.
+
+Where ten actually lands, measured on the cell this was written for: the
+origin's 95% radius reads 31.06 mm with those axes pinned, 38.90 mm at this
+factor and 68.99 mm with them released (48 samples, one seed, nothing else
+changed). So it buys back most of the distance to the released reading without
+giving up the constraint, and the quarter it costs against the pinned reading is
+confidence that was never earned.
+
+It is deliberately a factor rather than an absolute. The absolute would have to
+be in the part's units and would then be wrong for the next cell; a ratio to
+whatever the file itself stated is the same claim at any scale.
+"""
+
+
 def nominal_candidates(
-    claims: Sequence[SensorClaim], report: CalibrationReport
+    claims: Sequence[SensorClaim],
+    report: CalibrationReport,
+    *,
+    default_sigma: float | None = None,
 ) -> list[NominalCandidate]:
     """Every feature in the file that could serve as a clicked point's nominal.
 
     Ordered usable first, then by name, so the pick-list reads top-down.
+
+    ``default_sigma`` is the tolerance that will govern an axis this file states
+    nothing about -- ``Settings.sigma_nominal``, in the project's nominal units.
+    It is passed in rather than imported because this module knows nothing about
+    projects and should keep knowing nothing. It is needed anyway: a feature with
+    no stated spec limits at all still has inspected and uninspected axes, and
+    widening the uninspected ones means widening *something*. Without it such a
+    feature comes back with no per-axis tolerance rather than an invented one.
     """
     verdicts = {v.serial: v for v in report.verdicts}
     out: list[NominalCandidate] = []
@@ -1566,6 +1653,13 @@ def nominal_candidates(
                     f"is not applied, because moving the nominal would rewrite the figure the "
                     f"drawing states"
                 )
+            # Which axes the cell reads is the file's own statement about what
+            # its numbers cover, so it is said in the pick-list rather than
+            # only acted on. Someone choosing between two features wants to
+            # know that one is measured in three axes and the other in one.
+            axis_note = _inspection_note(feature)
+            if axis_note:
+                note += f". {axis_note}"
             out.append(
                 NominalCandidate(
                     feature=feature.name,
@@ -1573,6 +1667,8 @@ def nominal_candidates(
                     session=session_key(claim),
                     nominal=[float(v) for v in feature.nominal],
                     sigma=_tightest_limit(feature),
+                    sigma_axes=_axis_limits(feature, default_sigma=default_sigma),
+                    inspected=list(feature.inspected),
                     verdict=state,
                     usable=usable,
                     note=note,
@@ -1580,6 +1676,98 @@ def nominal_candidates(
             )
     out.sort(key=lambda c: (not c.usable, c.feature))
     return out
+
+
+def _axis_limits(
+    feature: FeatureClaim, *, default_sigma: float | None = None
+) -> list[float | None] | None:
+    """The feature's tolerance per axis, widened where the cell does not look.
+
+    Three rules, in order, and each axis takes the first that applies:
+
+    * the file states spec limits for that axis -- use their half-width, the
+      same reading :func:`_tightest_limit` takes and for the same reason;
+    * the file says that axis is not inspected -- widen the feature's base
+      tolerance by :data:`UNINSPECTED_AXIS_FACTOR`, because the coordinate is
+      the drawing's with nothing measuring it;
+    * otherwise ``None``, which falls back to the scalar and then to the
+      project default. Not a number, because there is nothing here to make one
+      out of and a fabricated tolerance is weighted exactly like a real one.
+
+    The base for the widening is the feature's own tightest stated limit where
+    it has one, and ``default_sigma`` where it does not. That second case is not
+    a corner: on the cell this was written against, ``FM_RH_Inner`` is a
+    single-axis feature with no stated limits anywhere in its row, and it is one
+    of the two points whose uninspected axes were being pinned.
+
+    Returns ``None`` -- the whole field, not three ``None``s -- when the file
+    says nothing about inspection and nothing about limits, so that a project
+    loading such a feature is left exactly as it was rather than carrying an
+    empty per-axis override around.
+    """
+    stated = [_axis_half_width(feature, axis) for axis in range(3)]
+    flags = list(feature.inspected)
+    if all(v is None for v in stated) and all(f is None for f in flags):
+        return None
+
+    base = _tightest_limit(feature)
+    if base is None and default_sigma is not None:
+        base = float(default_sigma)
+
+    out: list[float | None] = []
+    for axis in range(3):
+        if stated[axis] is not None:
+            out.append(stated[axis])
+        elif flags[axis] is False and base is not None:
+            out.append(float(base) * UNINSPECTED_AXIS_FACTOR)
+        else:
+            out.append(None)
+    return out
+
+
+def _axis_half_width(feature: FeatureClaim, axis: int) -> float | None:
+    """Half-width of one axis's spec band, or ``None`` if the file states none.
+
+    The per-axis half of :func:`_tightest_limit`, which takes the minimum of
+    these. Factored out rather than duplicated so the asymmetric-band reading --
+    "+0.50 / -3.50" is a four-millimetre band, not a half-millimetre tolerance --
+    is written once and cannot drift between the scalar and the per-axis form.
+    """
+    usl, lsl = feature.limits[axis]
+    sides = [abs(float(v)) for v in (usl, lsl) if v is not None and abs(float(v)) > 1e-9]
+    if not sides:
+        return None
+    return sum(sides) / 2.0 if len(sides) == 2 else sides[0]
+
+
+def _inspection_note(feature: FeatureClaim) -> str:
+    """What the file says this feature's measurement covers, in words.
+
+    Said rather than implied, because the per-axis tolerance is otherwise a
+    number that differs between axes for reasons the pick-list does not explain,
+    and an unexplained number invites someone to overwrite it by hand.
+    """
+    flags = list(feature.inspected)
+    if all(f is None for f in flags):
+        return ""
+    on = [name for name, f in zip("XYZ", flags) if f is True]
+    off = [name for name, f in zip("XYZ", flags) if f is False]
+    if not off:
+        return f"The cell inspects this on {', '.join(on) or 'no axis'}"
+    inspected = ", ".join(on) if on else "no axis at all"
+    return (
+        f"The cell inspects this on {inspected}; {', '.join(off)} "
+        f"{'is' if len(off) == 1 else 'are'} marked Disabled, so "
+        f"{'that coordinate' if len(off) == 1 else 'those coordinates'} "
+        f"{'is' if len(off) == 1 else 'are'} the drawing's figure with nothing "
+        f"measuring {'it' if len(off) == 1 else 'them'}. The tolerance offered "
+        f"there is {UNINSPECTED_AXIS_FACTOR:g}x whatever governs the inspected "
+        f"axis -- which is this feature's stated limit where the file gives one "
+        f"and the project's own sigma_nominal where it does not. Still a "
+        f"constraint, because releasing such an axis outright measurably loosens "
+        f"the origin, but loose enough that the photographs win a real "
+        f"disagreement"
+    )
 
 
 def _tightest_limit(feature: FeatureClaim) -> float | None:
@@ -1608,14 +1796,11 @@ def _tightest_limit(feature: FeatureClaim) -> float | None:
     that. Shifting the nominal to suit would be worse -- it would silently
     rewrite the drawing's own number -- so the asymmetry is reported instead.
     """
-    halves: list[float] = []
-    for usl, lsl in feature.limits:
-        stated = [abs(float(v)) for v in (usl, lsl) if v is not None and abs(float(v)) > 1e-9]
-        if not stated:
-            continue
-        # Both sides stated: the half-width of the band they bound. One side
-        # only: that side is all the file offers, so it stands alone.
-        halves.append(sum(stated) / 2.0 if len(stated) == 2 else stated[0])
+    # Both sides stated: the half-width of the band they bound. One side only:
+    # that side is all the file offers, so it stands alone. Done per axis by
+    # :func:`_axis_half_width`, which the per-axis form shares, so the reading
+    # cannot differ between the two.
+    halves = [v for v in (_axis_half_width(feature, axis) for axis in range(3)) if v is not None]
     return min(halves) if halves else None
 
 

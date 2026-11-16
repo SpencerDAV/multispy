@@ -60,7 +60,7 @@ from __future__ import annotations
 import copy
 import itertools
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -163,11 +163,27 @@ class PointShape:
     nominal: list[float] = field(default_factory=list)
     sigma: float = 0.0
     """The tolerance in force, the default already substituted, so the report
-    shows what was actually used rather than a blank."""
+    shows what was actually used rather than a blank.
+
+    Where the axes carry different tolerances this is the one in force *along
+    the direction the point actually missed in*, not the tightest of the three.
+    The distinction matters for a single-axis metrology feature: a deviation
+    lying almost entirely along an axis the cell does not inspect should be
+    graded against that axis's loose tolerance, and grading it against the one
+    tight axis would convict the point of disagreeing with an inspection nobody
+    performed. Identical to the tightest, and to the scalar, whenever the three
+    agree -- which is every nominal somebody typed."""
+    sigma_axes: list[float] = field(default_factory=list)
+    """The three tolerances this was resolved from, defaults substituted.
+
+    Reported rather than collapsed, because ``sigma`` above is a figure derived
+    from the residual's own direction and is therefore not something a reader
+    can look up anywhere."""
     sigma_defaulted: bool = False
-    """True when the file stated no tolerance and ``Settings.sigma_nominal``
-    was used. These are the points that act as rigid anchors in a solve, so a
-    large residual on one of them matters more than its size suggests."""
+    """True when nothing stated any tolerance for this point and
+    ``Settings.sigma_nominal`` was used on every axis. These are the points that
+    act as rigid anchors in a solve, so a large residual on one of them matters
+    more than its size suggests."""
     floor: float = 0.0
     """The finest agreement the photographs could show at this point's depth,
     in nominal units. See :func:`precision_floor`."""
@@ -279,6 +295,30 @@ class ShapeReport:
         return asdict(self)
 
 
+def _sigma_along(sigma_axes: Sequence[float], residual: np.ndarray) -> float:
+    """The tolerance in force along the direction a point actually missed in.
+
+    With one tolerance per axis there is no single number to divide a deviation
+    *magnitude* by, and the two obvious choices are both wrong. The tightest
+    axis convicts a point of a deviation that lies along a loose one; the
+    loosest excuses the reverse. The honest figure is the ellipsoid's own radius
+    in the direction of the residual, which is what this returns: ellipsoid
+    half-axes ``s``, direction ``u``, radius ``1 / sqrt(sum((u_i / s_i)^2))``.
+    Dividing the deviation by it gives the Mahalanobis distance, so the sigma
+    count the caller reports is the same quantity it has always been.
+
+    Reduces exactly to the shared value when the three agree, which is every
+    nominal anybody typed by hand -- so this changes no existing reading.
+    """
+    s = np.maximum(np.asarray(sigma_axes, dtype=float), 1e-12)
+    d = np.asarray(residual, dtype=float)
+    mag = float(np.linalg.norm(d))
+    if mag <= 1e-15:
+        return float(np.min(s))
+    weighted = float(np.linalg.norm(d / s))
+    return mag / weighted if weighted > 1e-15 else float(np.min(s))
+
+
 def _verdict(worst_sigmas: float, tol_sigmas: float, warn_sigmas: float) -> str:
     if worst_sigmas <= tol_sigmas:
         return "consistent"
@@ -321,6 +361,7 @@ def check_nominal_shape(
     for pt in trial.points:
         pt.nominal = None
         pt.nominal_sigma = None
+        pt.nominal_sigma_axes = None
     solved = solve(trial)
     report.reproj_px = float(solved.rms_reprojection_px)
     report.line_px = float(solved.rms_line_px)
@@ -337,13 +378,22 @@ def check_nominal_shape(
     default_sigma = float(project.settings.sigma_nominal)
     rows: list[PointShape] = []
     for p in linked:
-        defaulted = p.nominal_sigma is None
+        per_axis = [p.nominal_sigma_on(axis, default_sigma) for axis in range(3)]
+        stated_axes = p.nominal_sigma_axes or []
+        defaulted = p.nominal_sigma is None and not any(
+            v is not None for v in stated_axes
+        )
         rows.append(PointShape(
             id=p.id,
             label=p.label or "",
             source=p.nominal_source or "",
             nominal=[float(v) for v in p.nominal],
-            sigma=default_sigma if defaulted else float(p.nominal_sigma),
+            # The tightest axis, until the fit below knows which way the point
+            # missed and can say which tolerance was actually in force. Every
+            # early return from here on reports this one, which is the
+            # conservative reading when there is no direction to project onto.
+            sigma=min(per_axis),
+            sigma_axes=per_axis,
             sigma_defaulted=defaulted,
             positioned=p.id in got,
         ))
@@ -436,6 +486,7 @@ def check_nominal_shape(
         r.deviation = float(np.linalg.norm(d))
         r.floor = point_precision(rays.get(r.id, []), depths.get(r.id, []), focal,
                                   float(solved.rms_reprojection_px), scale_mm)
+        r.sigma = _sigma_along(r.sigma_axes, d)
         r.sigma_used = max(r.sigma, r.floor)
         r.floor_governs = r.floor > r.sigma
         r.sigmas = r.deviation / r.sigma_used if r.sigma_used > 1e-12 else float("inf")
