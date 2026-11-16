@@ -78,6 +78,15 @@ What is being defended here:
   covers the new field, or widening an axis would leave a stale radius looking
   current.
 
+The calibration rows under test are written out in :data:`FIXTURE` rather than
+read from the export they came off. ``projects/`` is gitignored -- it holds the
+user's own photographs and marks -- so a test that read the real file would pass
+on one machine and fail in every clone, which is worse than no test. The flags
+and spec limits are transcribed because they are the numbers being tested; the
+geometry is trivial because none of this examines geometry.
+:func:`test_the_fixture_still_matches_the_real_export_where_it_is_present` keeps
+the two in step wherever the real file happens to exist.
+
 Run directly for a readable report::
 
     .venv\\Scripts\\python.exe tests\\test_nominalaxes.py
@@ -103,6 +112,109 @@ from multispy.solve import solve
 from test_synthetic import build_project, nominal_a_few
 
 EXPORT = Path(__file__).resolve().parents[1] / "projects" / "prm1" / "Rear Module1.txt"
+"""The real export these tests were written against, where it happens to exist.
+
+``projects/`` is gitignored -- it holds the user's own photos and marks -- so
+this file is not in a clone and these tests cannot depend on it. They run off
+:data:`FIXTURE` instead, and
+:func:`test_the_fixture_still_matches_the_real_export_where_it_is_present`
+compares the two whenever the file is there, so the stand-in cannot quietly
+drift from the thing it stands for.
+"""
+
+
+# --------------------------------------------------------------------------
+# the fixture: the rows under test, written out
+# --------------------------------------------------------------------------
+
+COLUMNS = (
+    "Serial Number", "Entity Name", "Algorithm", "Standoff",
+    "fov near X", "fov near Y", "fov near Z", "fov far X", "fov far Y", "fov far Z",
+    "Part Number", "CA Sweep Face",
+    "x(i)", "x(j)", "x(k)", "y(i)", "y(j)", "y(k)", "z(i)", "z(j)", "z(k)",
+    "cfov(x)", "cfov(y)", "cfov(z)", "nominal(x)", "nominal(y)", "nominal(z)",
+    "Calibration Date", "X Axis", "Y Axis", "Z Axis",
+    "X Offset", "Y Offset", "Z Offset",
+    "X USL", "Y USL", "Z USL", "X LSL", "Y LSL", "Z LSL",
+)
+"""The columns ``calibfile`` actually reads, which is a subset of the real header.
+
+A subset is honest here rather than lazy: ``read_export`` works off a
+``DictReader`` and looks columns up by name, so a row carrying only the columns
+anything consults exercises the same code path. Writing out all 106 would make
+the five rows below unreadable and would invite the fixture to be maintained by
+copy-paste.
+"""
+
+FRUSTUM = {
+    400: ((51.85, 71.40, -71.40), (80.75, 109.65, 110.50)),
+    600: ((74.80, 102.85, -102.85), (117.30, 158.10, 160.65)),
+}
+"""Near and far half-extents by standoff, as the real sensors declare them."""
+
+FIXTURE = (
+    # (name, serial, algorithm, standoff, nominal, inspected, usl, lsl, offsets)
+    #
+    # The five features these tests turn on, with the real file's own
+    # Enabled/Disabled flags and spec limits -- those are the numbers under
+    # test, so they are transcribed rather than invented. RH_CP_58's
+    # +0.50/-3.50 is the asymmetric band that cost a round of 6.5-sigma
+    # nonsense; FM_RH_Inner and LH_SPARE_TIRE_TAB state no limit anywhere in
+    # their rows, which is the awkward case the widening has to cope with.
+    (
+        "RH_CP_58", "127252", "Range", 400,
+        (5151.00, 527.10, 520.00), ("Disabled", "Enabled", "Disabled"),
+        (None, 0.50, None), (None, -3.50, None), (None, -81.39, None),
+    ),
+    (
+        "FM_RH_Inner", "100653", "OneDimensionMinRange", 600,
+        (4656.00, 500.00, 545.00), ("Disabled", "Enabled", "Disabled"),
+        (None, None, None), (None, None, None), (None, -31.69, None),
+    ),
+    (
+        "LH_SPARE_TIRE_TAB", "106098", "OneDimensionMinRange", 400,
+        (7189.00, -64.00, 706.00), ("Disabled", "Disabled", "Enabled"),
+        (None, None, None), (None, None, None), (None, None, 3.50),
+    ),
+    (
+        "LH_CP_103", "127245", "Hole", 600,
+        (5743.99, -418.18, 695.58), ("Enabled", "Enabled", "Enabled"),
+        (8.00, 8.00, 8.00), (-8.00, -8.00, -8.00), (4.86, -3.69, 0.51),
+    ),
+    (
+        "RH_CP_75", "127241", "Hole", 600,
+        (6797.50, 525.36, 640.90), ("Enabled", "Enabled", "Enabled"),
+        (5.00, 4.00, 5.00), (-5.00, -4.00, -5.00), (11.89, -36.92, -27.00),
+    ),
+)
+
+
+def fixture_text() -> str:
+    """The fixture rendered as an export, one sensor per feature.
+
+    The geometry is deliberately trivial -- identity direction cosines, the field
+    of view centred on the feature's own nominal -- because none of these tests
+    examines geometry. What that buys is that every sensor comes back
+    ``consistent`` from :func:`sensors.diagnose`, so a verdict never becomes an
+    incidental reason a candidate is missing from the pick-list. The geometry
+    faults are :mod:`test_sensors`' subject and are tested there against a rig
+    built for it.
+    """
+    rows = []
+    for name, serial, algorithm, standoff, nominal, axes, usl, lsl, offsets in FIXTURE:
+        near, far = FRUSTUM[standoff]
+        rows.append("\t".join(str(v) for v in (
+            serial, name, algorithm, f"{standoff:.0f}",
+            *(f"{v:.2f}" for v in near), *(f"{v:.2f}" for v in far),
+            f"917-{standoff:04d}", "Y-Z",
+            1, 0, 0, 0, 1, 0, 0, 0, 1,
+            *(f"{v:.5f}" for v in nominal), *(f"{v:.2f}" for v in nominal),
+            "2/1/2020 8:25:02 AM", *axes,
+            *("" if v is None else f"{v:.2f}" for v in offsets),
+            *("" if v is None else f"{v:.2f}" for v in usl),
+            *("" if v is None else f"{v:.2f}" for v in lsl),
+        )))
+    return "\n".join(["\t".join(COLUMNS), *rows])
 
 
 # --------------------------------------------------------------------------
@@ -140,18 +252,22 @@ def locks_by_axis(project: Project) -> dict[int, float]:
     return {c.axis: round(c.sigma / scale, 9) for c in project.nominal_constraints()}
 
 
-def claim(feature_name: str) -> sensors.FeatureClaim:
-    """One named feature as the real PRM1 export states it."""
-    imported = calibfile.read_export(EXPORT)
+def claim(feature_name: str, source: str | Path | None = None) -> sensors.FeatureClaim:
+    """One named feature, parsed out of an export.
+
+    ``source`` defaults to the fixture. The real file can be passed instead,
+    which is how the cross-check below compares the two.
+    """
+    imported = calibfile.read_export(fixture_text() if source is None else source)
     for sensor in imported.sensors:
         for feature in sensor.features:
             if feature.name == feature_name:
                 return feature
-    raise AssertionError(f"{feature_name} is not in {EXPORT.name}")
+    raise AssertionError(f"{feature_name} is not in this export")
 
 
 def candidates(default_sigma: float | None = 0.1) -> dict[str, sensors.NominalCandidate]:
-    imported = calibfile.read_export(EXPORT)
+    imported = calibfile.read_export(fixture_text())
     filed = sensors.diagnose(imported.sensors, tol=1.0, warn=5.0, units="mm")
     return {
         c.feature: c
@@ -338,6 +454,32 @@ def test_a_project_with_no_partial_nominals_says_nothing_about_them() -> None:
 # --------------------------------------------------------------------------
 # the import: read the flags, widen, invent nothing
 # --------------------------------------------------------------------------
+
+
+def test_the_fixture_still_matches_the_real_export_where_it_is_present() -> None:
+    """A stand-in for real data that nothing compares to the real data is just a
+    second set of numbers to maintain.
+
+    ``projects/`` is gitignored, so the export is on the machine this was written
+    on and not in a clone. That is the right call for a folder holding somebody's
+    photographs, and it means the fixture is what the rest of this module runs
+    against. This test is what stops the fixture drifting: where the file *is*
+    present it has to agree, feature for feature, on the two things being tested
+    -- which axes the cell inspects and what tolerance each one carries. Where it
+    is absent the test passes quietly rather than failing for the absence, since
+    a clone is not wrong to lack it.
+    """
+    if not EXPORT.is_file():
+        return
+    for name, *_rest in FIXTURE:
+        real, fake = claim(name, EXPORT), claim(name)
+        assert real.inspected == fake.inspected, (name, real.inspected, fake.inspected)
+        assert real.limits == fake.limits, (name, real.limits, fake.limits)
+        assert sensors._tightest_limit(real) == sensors._tightest_limit(fake), name
+        assert sensors._axis_limits(real, default_sigma=0.1) == sensors._axis_limits(
+            fake, default_sigma=0.1
+        ), name
+        assert np.allclose(real.nominal, fake.nominal), (name, real.nominal, fake.nominal)
 
 
 def test_the_file_states_which_axes_it_inspects_and_the_parser_reads_them() -> None:
