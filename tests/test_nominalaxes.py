@@ -53,13 +53,19 @@ What is being defended here:
 
 * **An uninspected axis is not held as though it had been measured**, and the
   asked-versus-achieved table says so. This one came back the opposite way round
-  from how it was expected and is the more useful finding for it: a tight
-  tolerance on an axis nobody inspected does not report a miss, it *wins*. Two
-  such figures that contradict each other are satisfied to a third of a
-  millimetre -- a clean datum table -- by bending the scene until the
-  reprojection RMS roughly doubles. Widened, the same two figures come back as
-  the millimetres of residual they are, in the table built to show that, and the
-  photographs are left alone.
+  from how it was expected, and generalises past single-axis features once it
+  does: **a nominal tighter than the evidence does not report a miss, it wins.**
+  The solve meets it by moving everything else, so the one table built to show a
+  drawing being contradicted comes out clean and the cost surfaces in the pixels,
+  where nothing attributes it. Two such figures that contradict each other are
+  satisfied to a third of a millimetre while the reprojection RMS roughly
+  doubles. Widened, the same two figures come back as the millimetres of residual
+  they are and the photographs are left alone. The same mechanism, with the axes
+  still coupled, is what drove this project's first bad solve: two mislabelled
+  points pinned at the 0.1 mm default held their own deviation at zero and pushed
+  two honest nominals 97 and 210 mm out -- see ``nominalcheck``'s module
+  docstring. Single-axis features are only where it bites hardest, and the one
+  place the file warns you in advance.
 
 * **The import reads the file's flags and widens, rather than dropping or
   inventing.** Including the awkward case the cell actually contains: a
@@ -593,7 +599,9 @@ def test_an_uninspected_axis_is_not_held_as_if_it_had_been_measured() -> None:
     X held at 0.5 mm, the solve bends the scene until the drawing is satisfied to
     a third of a millimetre -- a clean asked-versus-achieved table -- while the
     reprojection RMS roughly doubles. The reader is told the part met its
-    nominals and is left to guess why the photographs got worse.
+    nominals and is left to guess why the photographs got worse. Which is the
+    general rule and not a quirk of single-axis features: a nominal tighter than
+    the evidence wins, and the clean table is the symptom.
 
     Widened, the same two drawing figures come back as the millimetres of
     residual they are, in the one table built to show exactly that, and the

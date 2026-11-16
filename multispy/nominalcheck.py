@@ -22,6 +22,19 @@ focal to 2.37x its EXIF value, and stopped the bundle adjustment converging at
 all. Every one of those numbers says "something is wrong" and none of them says
 what.
 
+Stated generally, because it is not really about mislabelling: **a nominal
+tighter than the evidence does not report a miss, it wins.** The solve meets it
+by moving everything else, so the asked-versus-achieved table -- the one place
+built to show a drawing being contradicted -- comes out clean and the cost
+surfaces in the pixels instead, where nothing attributes it. Mislabelling is one
+way to get there. Another, measured since, is a tolerance applied to an axis
+nobody inspected: two single-axis features whose uninspected axes contradicted
+each other by 25 mm came back satisfied to 0.44 mm with the reprojection RMS
+doubled, and reporting the same disagreement honestly took nothing more than
+loosening those axes to what the file actually claimed about them. See
+``TiePoint.nominal_sigma_axes``. A clean datum table beside a worsening
+reprojection RMS is the signature, and it is worth recognising on sight.
+
 So this asks a question the fit cannot answer for itself: forget the frame and
 forget the units, and compare *shapes*. Distances between points are unchanged
 by any rotation or translation, and dividing one by another cancels the scale,
