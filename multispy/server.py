@@ -264,7 +264,12 @@ class Handler(BaseHTTPRequestHandler):
             project = self.state.workspace.adopt(body["project"])
             base = project.path.parent if project.path else Path.cwd()
             out_dir = Path(body.get("out_dir") or (base / "export"))
-            written = webapp.write_exports(project, out_dir, body.get("formats"))
+            written = webapp.write_exports(
+                project,
+                out_dir,
+                body.get("formats"),
+                step_shape=body.get("step_shape") or "tessellated",
+            )
         self._send_json({"written": written, "out_dir": str(out_dir)})
 
     def _post_add_folder(self, body: dict) -> None:

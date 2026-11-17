@@ -1039,6 +1039,76 @@ def test_missing_mesh_still_places_the_body(root: Path) -> list[str]:
     return bad
 
 
+def test_front_end_paths(root: Path) -> list[str]:
+    """The two routes the buttons take, which no CAD check would reach.
+
+    The STEP button is not a thin wrapper over ``export_step``: in server mode
+    it asks for one format out of the set, and in the browser it asks for the
+    bytes with no folder to put them in. Both deliver a different thing from
+    what the CLI does, and both are what a user actually presses.
+    """
+    from multispy import webapp
+
+    project = build_scene(root)
+    bad: list[str] = []
+
+    # server mode: one format, so one file -- not the whole export set
+    out = root / "one"
+    written = webapp.write_exports(project, out, formats=["step"])
+    bad += check(
+        list(written) == ["step"],
+        f"asking for step alone wrote {list(written)}",
+    )
+    landed = sorted(p.name for p in out.iterdir())
+    bad += check(
+        landed == ["scene.step"],
+        f"asking for step alone left {landed} in the folder",
+    )
+    bad += check(
+        "AP242" in Model(out / "scene.step").header["FILE_SCHEMA"],
+        "the default shape did not write AP242",
+    )
+
+    # the shape has to survive the trip, or the shift-click does nothing
+    webapp.write_exports(project, out, formats=["step"], step_shape="wireframe")
+    model = Model(out / "scene.step")
+    bad += check(
+        "AUTOMOTIVE_DESIGN" in model.header["FILE_SCHEMA"],
+        "step_shape='wireframe' still wrote the AP242 default",
+    )
+    bad += check(
+        not model.of_type("TRIANGULATED_FACE"),
+        "step_shape='wireframe' still wrote tessellated geometry",
+    )
+
+    # browser mode: bytes, no folder, and callable more than once
+    work = root / "bytes"
+    first = webapp.step_bytes(project, work_dir=work)
+    second = webapp.step_bytes(project, work_dir=work)
+    bad += check(
+        first.startswith(b"ISO-10303-21;"),
+        "step_bytes did not return a Part 21 file",
+    )
+    bad += check(
+        first == second,
+        "step_bytes gave a different answer the second time it was called",
+    )
+    wire = webapp.step_bytes(project, "wireframe", work_dir=work)
+    bad += check(
+        b"AUTOMOTIVE_DESIGN" in wire and b"AP242" not in wire,
+        "step_bytes ignored the shape it was given",
+    )
+    bad += check(
+        not list(work.glob("*.step")),
+        "step_bytes left its scratch file behind",
+    )
+    # and what it returns has to be a real file, not just bytes that start right
+    scratch = root / "from_bytes.step"
+    scratch.write_bytes(first)
+    bad += test_every_reference_resolves(Model(scratch))
+    return bad
+
+
 def test_optical_frame(root: Path) -> list[str]:
     """A declared optical frame is drawn where the template says it is."""
     project = build_scene(root)
@@ -1158,6 +1228,7 @@ def main() -> int:
             ("refusals", test_refusals(root, project)),
             ("a missing mesh file", test_missing_mesh_still_places_the_body(root)),
             ("optical frame", test_optical_frame(root)),
+            ("the front end's two routes", test_front_end_paths(root)),
         ):
             print(f"  {'ok  ' if not result else 'FAIL'} {name}")
             failures += result

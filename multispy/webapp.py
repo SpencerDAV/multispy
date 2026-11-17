@@ -345,7 +345,12 @@ def mesh_payload(path: Path, cache: dict | None = None,
     return payload
 
 
-def write_exports(project: Project, out_dir: str | Path, formats=None) -> dict[str, str]:
+def write_exports(
+    project: Project,
+    out_dir: str | Path,
+    formats=None,
+    step_shape: str = "tessellated",
+) -> dict[str, str]:
     """Every requested export, into ``out_dir``. Returns what was written."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -362,10 +367,9 @@ def write_exports(project: Project, out_dir: str | Path, formats=None) -> dict[s
     if "ply" in formats:
         written["ply"] = str(export.export_ply(project, out_dir / "tiepoints.ply"))
     if "step" in formats:
-        # the shape mode is deliberately not a front-end choice: tessellated is
-        # right unless a particular CAD seat cannot read AP242, which is a thing
-        # you find out at the other end and then re-export for from the CLI
-        written["step"] = str(export.export_step(project, out_dir / "scene.step"))
+        written["step"] = str(
+            export.export_step(project, out_dir / "scene.step", shape=step_shape)
+        )
     # only worth writing when there is something placed to describe
     if "rig" in formats and project.placed_instances():
         written["rig"] = str(export.export_rig(project, out_dir / "rig.json"))
@@ -393,6 +397,32 @@ def export_zip(project: Project, formats=None, work_dir: str | Path = "/tmp/ms_e
             if path.is_file():
                 zf.write(path, path.relative_to(work_dir).as_posix())
     return buf.getvalue()
+
+
+def step_bytes(
+    project: Project,
+    shape: str = "tessellated",
+    work_dir: str | Path = "/tmp/ms_step",
+) -> bytes:
+    """The STEP scene on its own, for a front end with nowhere to put a folder.
+
+    Written through the same scratch directory as :func:`export_zip` and for the
+    same reason, but handed back bare rather than packed: a zip holding one file
+    is an extra step between the user and the thing they asked for, and a
+    browser can download a ``.step`` as readily as a ``.zip``.
+
+    ``shape`` is exposed here, unlike in :func:`write_exports`, because the
+    browser build has no command line to fall back to. Somebody whose CAD seat
+    will not read AP242 tessellated geometry has to be able to ask for the
+    wireframe from the page itself, or the export is simply broken for them with
+    no way out.
+    """
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out = export.export_step(project, work_dir / "scene.step", shape=shape)
+    data = out.read_bytes()
+    out.unlink()  # a scratch file, and the next call wants a clean name
+    return data
 
 
 # --------------------------------------------------------------------------

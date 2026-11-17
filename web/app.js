@@ -1068,10 +1068,37 @@ async function exportNow() {
     // the workspace needs this session's edits before it writes anything
     await api('/api/state', { project: projectPayload() });
     clearDirty();
-    const data = await Backend.exportAll();
+    const data = await Backend.exportAll(undefined, projectPayload());
     setStatus(`exported to ${data.out_dir}`, 'ok');
   } catch (err) {
     setStatus(`export failed: ${err.message}`, 'bad');
+  }
+}
+
+/** The STEP scene on its own, which is the one export a CAD seat wants.
+ *
+ *  Shift picks the wireframe. The default carries every triangle as AP242
+ *  tessellated geometry, which is compact and right for anything built on
+ *  OpenCASCADE, NX, CATIA or Creo -- and silently unreadable to a CAD system
+ *  that does not do AP242, where the file opens with the cameras present and
+ *  the bodies missing. That is the one case this needs an escape hatch for,
+ *  and in the browser build there is no command line to be the escape hatch.
+ */
+async function exportStepNow(wireframe) {
+  try {
+    const shape = wireframe ? 'wireframe' : 'tessellated';
+    setStatus(wireframe ? 'writing scene.step (wireframe)…' : 'writing scene.step…');
+    await api('/api/state', { project: projectPayload() });
+    clearDirty();
+    const data = await Backend.exportStep(shape, projectPayload());
+    setStatus(`scene.step written to ${data.out_dir}`, 'ok');
+  } catch (err) {
+    // the browser build runs Python in the page, so a refusal arrives as a
+    // whole traceback; the status bar is one line, and the useful line is the
+    // last one -- "nothing solved yet" rather than six frames of path
+    const lines = String(err.message).trim().split('\n');
+    const reason = lines[lines.length - 1].replace(/^[\w.]*(Error|Exception):\s*/, '');
+    setStatus(`STEP export failed: ${reason || err.message}`, 'bad');
   }
 }
 
@@ -6478,6 +6505,7 @@ $('btn-redo').onclick = doRedo;
 $('showshaded').onchange = (e) => { state.showShaded = e.target.checked; render(); };
 $('btn-solve').onclick = solveNow;
 $('btn-export').onclick = exportNow;
+$('btn-step').onclick = (ev) => exportStepNow(ev.shiftKey);
 $('showvp').onchange = (e) => { state.showVP = e.target.checked; render(); };
 $('showresid').onchange = (e) => { state.showResid = e.target.checked; updateHint(); render(); };
 $('showexpected').onchange = (e) => { state.showExpected = e.target.checked; render(); };

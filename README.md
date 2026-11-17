@@ -927,8 +927,15 @@ registered images, 17 points, 70 observations, 0.487 px mean reprojection error.
 
 ### The STEP scene
 
-`export/scene.step` is the one to open in CAD. Everything the solve knows, in
-one file and one coordinate system, each a named node in the assembly tree:
+**STEP** in the toolbar writes `export/scene.step` on its own — the one export
+a CAD seat wants, without the COLMAP model and the Blender script beside it.
+(In the browser build it downloads the file directly.) **Shift-click** for the
+wireframe, which is the escape hatch for a CAD system that will not read AP242;
+see the table below. The **Export** button still writes everything, `scene.step`
+included.
+
+Everything the solve knows, in one file and one coordinate system, each a named
+node in the assembly tree:
 
 | Node | What it is |
 |---|---|
@@ -955,8 +962,8 @@ everything:
 | `none` | Placements only: the tree, the poses, the cameras and the points | AP214 | everything |
 
 If a CAD seat opens the default with the cameras present and the bodies
-missing, it does not do AP242 tessellated geometry — re-export with
-`--step-shape wireframe`:
+missing, it does not do AP242 tessellated geometry — shift-click **STEP**, or
+re-export with `--step-shape wireframe`:
 
 ```
 .venv\Scripts\python.exe -m multispy export projects\mypart\project.multispy --step-shape wireframe

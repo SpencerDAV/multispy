@@ -151,6 +151,11 @@ def _ms_export_zip(formats_json):
     formats = json.loads(formats_json) if formats_json else None
     return webapp.export_zip(_ws.project, formats, work_dir="/export")
 
+def _ms_export_step(shape):
+    # bytes, not JSON: one STEP file, and a zip holding one file is an extra
+    # step between the user and what they asked for
+    return webapp.step_bytes(_ws.project, shape or "tessellated", work_dir="/export")
+
 def _ms_reset(name):
     global _ws
     _ws = webapp.blank_workspace("/workspace", name or "untitled")
@@ -281,15 +286,44 @@ def _ms_open_bundle(tmp_path, is_zip):
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   }
 
-  /** Static mode has nowhere to export to, so the same writers produce a zip. */
-  async function exportAll(formats) {
-    if (!isStatic()) return call('/api/export', { formats });
+  /** Static mode has nowhere to export to, so the same writers produce a zip.
+   *
+   *  `project` is required in server mode and ignored in static mode, where the
+   *  workspace already holds the only copy. Leaving it out is how the server
+   *  build's Export button came to answer `project` and write nothing: the
+   *  route adopts the posted project, and a body without one is a KeyError
+   *  dressed up as an error message.
+   */
+  async function exportAll(formats, project) {
+    if (!isStatic()) return call('/api/export', { formats, project });
     if (!booted) throw new Error('MultiSpy is still starting up');
     const bytes = exportFn(formats ? JSON.stringify(formats) : '');
     const blob = new Blob([bytes.toJs ? bytes.toJs() : bytes], { type: 'application/zip' });
     if (bytes.destroy) bytes.destroy();
     download('multispy-export.zip', blob);
     return { written: { zip: 'multispy-export.zip' }, out_dir: 'your downloads folder' };
+  }
+
+  /** The STEP scene alone: a file next to the project, or a direct download. */
+  async function exportStep(shape, project) {
+    if (!isStatic()) {
+      const data = await call('/api/export', {
+        formats: ['step'],
+        step_shape: shape,
+        project,
+      });
+      return { ...data, file: 'scene.step' };
+    }
+    if (!booted) throw new Error('MultiSpy is still starting up');
+    const fn = pyodide.globals.get('_ms_export_step');
+    const bytes = fn(shape || 'tessellated');
+    fn.destroy();
+    const blob = new Blob([bytes.toJs ? bytes.toJs() : bytes], {
+      type: 'application/octet-stream',
+    });
+    if (bytes.destroy) bytes.destroy();
+    download('scene.step', blob);
+    return { written: { step: 'scene.step' }, out_dir: 'your downloads folder' };
   }
 
   /** Download the whole workspace -- project, photos and models -- as one zip.
@@ -340,6 +374,7 @@ def _ms_open_bundle(tmp_path, is_zip):
     forgetAllPhotos,
     addFileUpload,
     exportAll,
+    exportStep,
     saveBundle,
     openFile,
     resetProject,
