@@ -29,8 +29,46 @@ concurrency:
 
 jobs:
   suite:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Both runners, for the reason at the top of this file carried one step
+    # further. A green tick meant "green on whichever machine last ran them";
+    # this job replaced that with "green on a machine nobody works on" -- and
+    # then ran only Ubuntu, while the work happens on Windows. So the one
+    # combination the suite is actually developed against was the combination
+    # never checked, and the gap is not hypothetical: a path joined with a
+    # forward slash, a file written without an encoding and read back through a
+    # different default, a temporary directory still held open when the test
+    # tries to remove it, a backslash arriving inside a provenance string that
+    # is split on "/". None of those can fail on Ubuntu. All of them can fail
+    # for a user of this tool, which is a Windows tool.
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Not fail-fast. The whole question a matrix asks is whether the two
+      # platforms disagree, and cancelling the other runner the moment one goes
+      # red is precisely how that answer gets withheld -- you learn that
+      # something broke and lose the one fact worth having, which is whether it
+      # broke in both places or only one.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    # 45 rather than 30, as headroom rather than a measurement. The two slow
+    # files noted at the foot of this file are the bulk of the wall time; on a
+    # local Windows machine they came to 116 s and 53 s of a 4-minute suite,
+    # against an Ubuntu job that has been finishing in a little over 5 minutes
+    # all told. Neither figure is the hosted Windows runner, which nothing here
+    # has yet timed -- so the limit is loosened enough that a first red tick
+    # means a real failure and not an unfamiliar runner being slow. Raised for
+    # both, so it means the same thing on each.
+    timeout-minutes: 45
+    defaults:
+      run:
+        # Git Bash, on Windows too. Every run step below is a shell script --
+        # the projects/ guard, the loop over the suite -- and the Windows
+        # default is pwsh, which would mean keeping a second translated copy of
+        # each and letting the two drift. One copy, one shell, and the runners
+        # differ only where the platform genuinely differs. GitHub invokes it
+        # with the same `-eo pipefail` on both.
+        shell: bash
     steps:
       # A bare checkout, and it must stay bare.
       #
