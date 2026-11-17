@@ -44,6 +44,7 @@ PY_MODULES = (
     "geometry",
     "mesh",
     "exif",
+    "dirgroup",
     "project",
     "solve",
     "part",
@@ -54,6 +55,7 @@ PY_MODULES = (
     "sensorcheck",
     "nominalcheck",
     "viewpoint",
+    "cadguard",
     "export",
     "webapp",
 )

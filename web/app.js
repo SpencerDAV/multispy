@@ -8,6 +8,11 @@
 
 const AXIS_COLOR = ['#ff5a5a', '#4ddb7f', '#5a9cff'];
 const AXIS_NAME = ['X', 'Y', 'Z'];
+/* Direction groups get their own palette, deliberately nothing like the axis
+ * colours: a tray line and an X line mean different things to the solve, and
+ * the one mistake worth designing against is drawing one where you meant the
+ * other. */
+const GROUP_COLOR = ['#ffb347', '#c792ea', '#56d4dd', '#f78fb3', '#9ccc65', '#e6b8ff'];
 const RESIDUAL_GAIN = 10; // sub-pixel errors are invisible at 1:1
 /* Screen pixels a press may wander and still count as a click rather than a
  * drag. A press on a control line is ambiguous -- it could mean "flip this"
@@ -21,6 +26,12 @@ const state = {
   current: null,
   mode: 'lines',
   axis: 0,
+  dirGroup: null,
+  /* Direction group a new control line will be drawn into, or null to draw an
+   * ordinary axis line. Held beside `axis` rather than folded into it as a
+   * fourth value, because the two are not alternatives of the same kind: an
+   * axis is a fact about the world, a group is a promise that several lines
+   * agree with each other. */
   activePoint: null,
   activeInstance: null,
   activeAnchor: null,
@@ -662,6 +673,7 @@ function markDirty() {
   // across an edit would show a true statement about a project that no longer
   // exists, so it goes rather than ages.
   state.viewpoints = null;
+  state.cadCheck = null;
   state.dirty = true;
   $('dirty').textContent = 'unsaved changes';
   $('dirty').className = 'dirty';
@@ -694,6 +706,7 @@ function projectPayload() {
 
 function adopt(data) {
   state.viewpoints = null;   // new poses, so the apportionment above them is void
+  state.cadCheck = null;   // and the bodies-vs-photographs verdict with it
   state.project = data.project;
   state.meta = data.project._images_meta || {};
   if (data.report !== undefined) state.report = data.report;
@@ -1401,10 +1414,61 @@ function projectWorld(im, X) {
   return { x: f * xn + cx, y: f * yn + cy };
 }
 
+/* ------------------------------------------------------- direction groups */
+
+/** The project's direction groups, creating the list if an older file lacks it. */
+function dirGroups() {
+  if (!state.project) return [];
+  if (!Array.isArray(state.project.direction_groups)) state.project.direction_groups = [];
+  return state.project.direction_groups;
+}
+
+function dirGroupOf(gid) {
+  return dirGroups().find((g) => g.id === gid) || null;
+}
+
+function groupColor(gid) {
+  const i = dirGroups().findIndex((g) => g.id === gid);
+  return GROUP_COLOR[(i < 0 ? 0 : i) % GROUP_COLOR.length];
+}
+
+function lineColor(ln) {
+  return ln.direction_group ? groupColor(ln.direction_group) : AXIS_COLOR[ln.axis];
+}
+
+function groupLabel(gid) {
+  const g = dirGroupOf(gid);
+  return (g && g.label) || gid;
+}
+
+/** Control lines on one world axis, which excludes every grouped line.
+ *
+ *  The same rule as `ImageView.axis_segments` on the Python side, and it has to
+ *  be the same: a readiness badge counting tray lines towards "2 axes marked"
+ *  would promise a calibration the solve cannot deliver. */
+function axisLinesOn(im, axis) {
+  return im.axis_lines.filter((l) => l.axis === axis && !l.direction_group);
+}
+
+function groupLinesIn(im, gid) {
+  return im.axis_lines.filter((l) => l.direction_group === gid);
+}
+
+/** Lines and photos a group holds, across the whole project. */
+function groupTally(gid) {
+  let lines = 0;
+  const images = new Set();
+  for (const im of state.project.images) {
+    const n = groupLinesIn(im, gid).length;
+    if (n) { lines += n; images.add(im.id); }
+  }
+  return { lines, images: images.size };
+}
+
 /** Vanishing point of one axis from its control lines, by median pairwise
  *  intersection. Only an overlay -- the solver does this properly. */
 function vanishingPoint(im, axis) {
-  const lines = im.axis_lines.filter((l) => l.axis === axis);
+  const lines = axisLinesOn(im, axis);
   if (lines.length < 2) return null;
   const hom = lines.map((l) => [
     l.p0[1] - l.p1[1],
@@ -1542,7 +1606,8 @@ function drawFilmstripOverlays() {
 function drawControlLines(im, z) {
   im.axis_lines.forEach((ln, idx) => {
     const isHover = state.hover && state.hover.kind === 'line' && state.hover.index === idx;
-    ctx.strokeStyle = AXIS_COLOR[ln.axis];
+    const col = lineColor(ln);
+    ctx.strokeStyle = col;
     ctx.lineWidth = (isHover ? 3.5 : 2) / z;
     // dashed means flagged uncertain: still in the solve, at a wider sigma,
     // and the first thing dropped if something has to go
@@ -1553,18 +1618,31 @@ function drawControlLines(im, z) {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // direction arrow: p0 -> p1 must point along the POSITIVE axis
-    const dx = ln.p1[0] - ln.p0[0], dy = ln.p1[1] - ln.p0[1];
-    const len = Math.hypot(dx, dy) || 1;
-    const a = 13 / z;
-    const ux = dx / len, uy = dy / len;
-    ctx.beginPath();
-    ctx.moveTo(ln.p1[0], ln.p1[1]);
-    ctx.lineTo(ln.p1[0] - a * ux + a * 0.45 * uy, ln.p1[1] - a * uy - a * 0.45 * ux);
-    ctx.lineTo(ln.p1[0] - a * ux - a * 0.45 * uy, ln.p1[1] - a * uy + a * 0.45 * ux);
-    ctx.closePath();
-    ctx.fillStyle = AXIS_COLOR[ln.axis];
-    ctx.fill();
+    /* Direction arrow: p0 -> p1 must point along the POSITIVE axis.
+     *
+     * Drawn only on an axis line, and its absence on a grouped one is the
+     * point. A group's residual is odd in its direction and the solve squares
+     * it, so which end you dragged from changes nothing -- and an arrowhead
+     * there would invite someone to check it, or worse, to correct it. */
+    if (!ln.direction_group) {
+      const dx = ln.p1[0] - ln.p0[0], dy = ln.p1[1] - ln.p0[1];
+      const len = Math.hypot(dx, dy) || 1;
+      const a = 13 / z;
+      const ux = dx / len, uy = dy / len;
+      ctx.beginPath();
+      ctx.moveTo(ln.p1[0], ln.p1[1]);
+      ctx.lineTo(ln.p1[0] - a * ux + a * 0.45 * uy, ln.p1[1] - a * uy - a * 0.45 * ux);
+      ctx.lineTo(ln.p1[0] - a * ux - a * 0.45 * uy, ln.p1[1] - a * uy + a * 0.45 * ux);
+      ctx.closePath();
+      ctx.fillStyle = col;
+      ctx.fill();
+    } else if (isHover) {
+      // which group this belongs to, where the eye already is
+      ctx.fillStyle = col;
+      ctx.font = `${13 / z}px sans-serif`;
+      ctx.fillText(groupLabel(ln.direction_group),
+                   (ln.p0[0] + ln.p1[0]) / 2 + 9 / z, (ln.p0[1] + ln.p1[1]) / 2 - 7 / z);
+    }
 
     for (const [hx, hy, which] of [[ln.p0[0], ln.p0[1], 0], [ln.p1[0], ln.p1[1], 1]]) {
       const hot = state.hover && state.hover.kind === 'handle'
@@ -1573,7 +1651,7 @@ function drawControlLines(im, z) {
       ctx.arc(hx, hy, (hot ? 6 : 4) / z, 0, Math.PI * 2);
       ctx.fillStyle = hot ? '#fff' : '#0d0f12';
       ctx.fill();
-      ctx.strokeStyle = AXIS_COLOR[ln.axis];
+      ctx.strokeStyle = col;
       ctx.lineWidth = 1.5 / z;
       ctx.stroke();
     }
@@ -1584,7 +1662,7 @@ function drawVanishingRays(im, z) {
   for (let axis = 0; axis < 3; axis++) {
     const vp = vanishingPoint(im, axis);
     if (!vp) continue;
-    const lines = im.axis_lines.filter((l) => l.axis === axis);
+    const lines = axisLinesOn(im, axis);
     ctx.save();
     ctx.setLineDash([6 / z, 6 / z]);
     ctx.strokeStyle = AXIS_COLOR[axis] + '66';
@@ -2297,7 +2375,7 @@ function drawPartOrigin(im, z) {
 
 function drawPendingLine(z) {
   const d = state.drag;
-  ctx.strokeStyle = AXIS_COLOR[state.axis];
+  ctx.strokeStyle = state.dirGroup ? groupColor(state.dirGroup) : AXIS_COLOR[state.axis];
   ctx.lineWidth = 2 / z;
   ctx.setLineDash([4 / z, 4 / z]);
   ctx.beginPath();
@@ -2351,6 +2429,13 @@ function hitTest(p) {
 function flipLine(im, index) {
   const ln = im.axis_lines[index];
   if (!ln) return;
+  if (ln.direction_group) {
+    // Nothing to reverse: a group has no positive end. Said rather than done
+    // silently, because the click was a reasonable thing to try.
+    setStatus(`${groupLabel(ln.direction_group)} lines have no direction to reverse — `
+            + `a group's sign cancels in the solve, so either end does`, 'ok');
+    return;
+  }
   [ln.p0, ln.p1] = [ln.p1, ln.p0];
   markDirty();
   setStatus(`${AXIS_NAME[ln.axis]} line ${index} reversed — the arrow now points the other way`, 'ok');
@@ -2810,8 +2895,15 @@ window.addEventListener('mouseup', () => {
   if (d.kind === 'newline') {
     const len = Math.hypot(d.to.x - d.from.x, d.to.y - d.from.y) * state.view.zoom;
     if (len > 12) {
-      im.axis_lines.push({ axis: state.axis, p0: [d.from.x, d.from.y], p1: [d.to.x, d.to.y] });
+      const ln = { axis: state.axis, p0: [d.from.x, d.from.y], p1: [d.to.x, d.to.y] };
+      if (state.dirGroup && dirGroupOf(state.dirGroup)) ln.direction_group = state.dirGroup;
+      im.axis_lines.push(ln);
       markDirty();
+      if (ln.direction_group) {
+        const t = groupTally(ln.direction_group);
+        setStatus(`${groupLabel(ln.direction_group)}: ${t.lines} line(s) across ${t.images} photo(s)`
+                + ` — ${groupAdvice(t)}`, t.lines - 2 > 0 ? 'ok' : 'warn');
+      }
       renderPanels();
     } else if (d.flip !== undefined) {
       flipLine(im, d.flip);
@@ -2882,6 +2974,20 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'f' && Viewer3D.isOn()) { Viewer3D.frameAll(); return; }
 
   if (k === '1' || k === '2' || k === '3') { setAxis(+k - 1); return; }
+  /* 4 steps through the direction groups and back out to the axes, so a set of
+   * tray lines can be marked across a photo set without going to the panel
+   * between each one. */
+  if (k === '4') {
+    const ids = dirGroups().map((g) => g.id);
+    if (!ids.length) {
+      newDirGroup();
+    } else {
+      const at = ids.indexOf(state.dirGroup);
+      if (at + 1 >= ids.length) setAxis(state.axis);
+      else setDirGroup(ids[at + 1]);
+    }
+    return;
+  }
   if (k === 'l') { setMode('lines'); return; }
   if (k === 'p') { setMode('points'); return; }
   if (k === 'o') { setMode('objects'); return; }
@@ -3036,9 +3142,55 @@ function setMode(mode) {
 
 function setAxis(axis) {
   state.axis = axis;
-  for (const b of $('axes').children) b.classList.toggle('on', +b.dataset.axis === axis);
+  state.dirGroup = null;
+  syncAxisButtons();
   if (state.mode !== 'lines') setMode('lines');
   updateHint();
+}
+
+/** Draw the next control line into a direction group instead of onto an axis.
+ *
+ *  Passing a group that no longer exists falls back to the axis buttons rather
+ *  than leaving the toolbar in a state that would attach new lines to nothing. */
+function setDirGroup(gid) {
+  const g = gid ? dirGroupOf(gid) : null;
+  if (!g) { setAxis(state.axis); return; }
+  state.dirGroup = g.id;
+  syncAxisButtons();
+  if (state.mode !== 'lines') setMode('lines');
+  updateHint();
+  renderDirGroupPanel();
+  render();
+}
+
+function syncAxisButtons() {
+  for (const b of $('axes').children) {
+    const isGroup = b.dataset.axis === 'group';
+    b.classList.toggle('on', isGroup ? !!state.dirGroup : !state.dirGroup && +b.dataset.axis === state.axis);
+  }
+  const btn = $('axisgroup');
+  if (btn) {
+    btn.textContent = state.dirGroup ? (groupLabel(state.dirGroup).slice(0, 9) || 'Grp') : 'Grp';
+    btn.style.color = state.dirGroup ? groupColor(state.dirGroup) : '';
+  }
+}
+
+/** One line on what a group's counts mean for the solve.
+ *
+ *  Mirrors `dirgroup.contribution_note` on the Python side. Duplicated rather
+ *  than fetched because it has to be right while the user is still drawing,
+ *  before any solve has run -- and the arithmetic is two numbers, so the risk
+ *  of the two drifting is smaller than the risk of saying nothing until a
+ *  solve. */
+function groupAdvice(tally) {
+  if (tally.images < 2) {
+    return tally.lines < 2
+      ? 'one line fixes only a plane — draw this edge in another photo'
+      : 'all in one photo, so it is ignored: draw this edge in a second photo';
+  }
+  const net = tally.lines - 2;
+  if (net <= 0) return 'break-even — a third line is where it starts to help';
+  return `${net} net constraint${net === 1 ? '' : 's'}`;
 }
 
 function updateHint() {
@@ -3084,11 +3236,22 @@ function updateHint() {
         + `the next photo and snap again — <b>Enter</b> then reconciles all of them into `
         + `one measured pose, and moves the cameras to match.`;
 
+  const tally = state.dirGroup ? groupTally(state.dirGroup) : null;
+  const linesHint = state.dirGroup
+    ? `Drag along the same edge you marked as <b>${escapeHtml(groupLabel(state.dirGroup))}</b> `
+      + `in the other photos. <b>Either end — it makes no difference</b>, unlike an axis line: `
+      + `the solve works this direction out, so it has no positive end to point at. `
+      + `So far ${tally.lines} line(s) across ${tally.images} photo(s) — ${groupAdvice(tally)}. `
+      + `Right-click to delete, <b>U</b> to flag uncertain. <b>4</b> steps through the groups, `
+      + `1/2/3 go back to an axis.`
+    : `Drag along an edge parallel to the <b>${AXIS_NAME[state.axis]}</b> axis. `
+      + `Draw in the <b>+${AXIS_NAME[state.axis]}</b> direction — the arrow shows which way. `
+      + `Click a drawn line to reverse it, right-click to delete, <b>U</b> to flag it `
+      + `uncertain. Two per axis minimum, three is better. Keys 1/2/3 switch axis, `
+      + `<b>4</b> draws into a direction group instead.`;
+
   const hints = {
-    lines: `Drag along an edge parallel to the <b>${AXIS_NAME[state.axis]}</b> axis. `
-         + `Draw in the <b>+${AXIS_NAME[state.axis]}</b> direction — the arrow shows which way. `
-         + `Click a drawn line to reverse it, right-click to delete, <b>U</b> to flag it `
-         + `uncertain. Two per axis minimum, three is better. Keys 1/2/3 switch axis.`,
+    lines: linesHint,
     points: `Click the same physical feature in each photo it appears in. `
           + `<b>N</b> starts a new point, <b>Tab</b> jumps to the next photo missing it, `
           + `<b>U</b> flags one uncertain. Two shared points per image pair is the minimum.`,
@@ -3106,8 +3269,7 @@ function updateHint() {
 
 function imageStatus(im) {
   const rep = state.report && state.report.images ? state.report.images[im.id] : null;
-  const axes = new Set(im.axis_lines.map((l) => l.axis));
-  const ready = [...axes].filter((a) => im.axis_lines.filter((l) => l.axis === a).length >= 2);
+  const ready = [0, 1, 2].filter((a) => axisLinesOn(im, a).length >= 2);
   if (!im.enabled) return { color: '#555', text: 'off' };
   if (ready.length < 2) return { color: '#777', text: `${ready.length}/2 axes` };
   if (rep && rep.positioned) {
@@ -3182,10 +3344,12 @@ function buildFilmstrip() {
 function renderPanels() {
   renderSolvePanel();
   renderImagePanel();
+  renderDirGroupPanel();
   renderPartPanel();
   renderObjectsPanel();
   renderPointsPanel();
   renderViewpointPanel();
+  renderCadPanel();
   renderConstraintsPanel();
   renderImageListPanel();
   updateHint();
@@ -3237,7 +3401,7 @@ function renderImagePanel() {
   const rep = state.report && state.report.images ? state.report.images[im.id] : null;
   const g = groupOf(im);
 
-  const counts = [0, 1, 2].map((a) => im.axis_lines.filter((l) => l.axis === a).length);
+  const counts = [0, 1, 2].map((a) => axisLinesOn(im, a).length);
   $('imgcount').textContent = meta.name || im.id;
   /* A pose moved by the edge alignment is not a pose the bundle adjustment ever
    * agreed to, and it outlives the panel that produced it. Saying so here --
@@ -3252,6 +3416,18 @@ function renderImagePanel() {
   let html = `<div class="axiscounts">` + counts.map((c, a) =>
     `<div class="${['x','y','z'][a]} ${c < 2 ? 'short' : ''}">${AXIS_NAME[a]} ${c}</div>`
   ).join('') + `</div>`;
+
+  const freeHere = im.axis_lines.filter((l) => l.direction_group).length;
+  if (freeHere) {
+    // Said beside the axis counts, never inside them: these do not help this
+    // photo calibrate, and a count that implied they did would be a lie the
+    // solve then has to contradict.
+    html += `<div class="row" style="margin-top:7px"><span class="k">direction-group lines</span>`
+          + `<span class="v">${freeHere}</span></div>`
+          + `<div class="note">Not counted above: a group's direction is worked out by the `
+          + `solve, so it cannot calibrate the camera that sees it. It constrains the bundle `
+          + `once this photo is calibrated from two real axes.</div>`;
+  }
 
   html += `<div class="row" style="margin-top:7px"><span class="k">tie points here</span>`
         + `<span class="v">${Object.keys(im.observations).length}</span></div>`;
@@ -3334,6 +3510,123 @@ function renderImagePanel() {
   const undoOne = $('imgrefineundo');
   if (undoOne) undoOne.onclick = () => revertEdges([im.id]);
   scheduleExif();
+}
+
+/* --------------------------------------------------- direction groups panel */
+
+function newDirGroup() {
+  const used = new Set(dirGroups().map((g) => g.id));
+  let i = 0;
+  while (used.has(`d${i}`)) i++;
+  const id = `d${i}`;
+  dirGroups().push({ id, label: `group ${dirGroups().length + 1}`, d: null });
+  markDirty();
+  setDirGroup(id);
+  renderPanels();
+  setStatus(`drawing into ${groupLabel(id)} — mark the same edge in two or more photos; `
+          + `either end, it makes no difference`, 'ok');
+  return id;
+}
+
+function deleteDirGroup(gid) {
+  const t = groupTally(gid);
+  if (t.lines && !confirm(
+        `Delete ${groupLabel(gid)} and the ${t.lines} control line(s) drawn into it?\n\n`
+      + `The lines go too. They cannot become axis lines: nobody ever said which axis `
+      + `they follow, and guessing would quietly feed the solve a false fact.`)) return;
+  for (const im of state.project.images) {
+    im.axis_lines = im.axis_lines.filter((l) => l.direction_group !== gid);
+  }
+  state.project.direction_groups = dirGroups().filter((g) => g.id !== gid);
+  if (state.dirGroup === gid) setAxis(state.axis);
+  markDirty();
+  renderPanels();
+  render();
+}
+
+function renderDirGroupPanel() {
+  const el = $('dgpanel');
+  const badge = $('dgcount');
+  if (!el) return;
+  const groups = dirGroups();
+  const reports = {};
+  for (const r of (state.report && state.report.direction_groups) || []) reports[r.id] = r;
+
+  badge.textContent = groups.length ? `${groups.length}` : '';
+
+  let html = '';
+  if (!groups.length) {
+    html += `<div class="empty">A direction group is a long straight edge whose world `
+          + `direction nobody knows — a cable tray, a conduit run, a handrail. Mark the same `
+          + `edge in two or more photos and the solve works out which way it goes, using it to `
+          + `tie those cameras together. Three lines is where a group starts to help: it costs `
+          + `two unknowns of its own.</div>`;
+  }
+
+  for (const g of groups) {
+    const t = groupTally(g.id);
+    const rep = reports[g.id];
+    const active = state.dirGroup === g.id;
+    const col = groupColor(g.id);
+    const net = t.lines - 2;
+    const grade = t.images < 2 ? 'bad' : net > 0 ? 'good' : 'warn';
+    html += `<div class="dgrow${active ? ' sel' : ''}" data-gid="${escapeHtml(g.id)}">`
+          + `<div class="dghead">`
+          +   `<span class="dgswatch" style="background:${col}"></span>`
+          +   `<input type="text" class="dglabel" data-gid="${escapeHtml(g.id)}" `
+          +     `value="${escapeHtml(g.label || g.id)}">`
+          +   `<button class="smallbtn dgdraw" data-gid="${escapeHtml(g.id)}">`
+          +     `${active ? 'drawing' : 'draw'}</button>`
+          +   `<button class="smallbtn dgdel" data-gid="${escapeHtml(g.id)}" title="Delete this group and its lines">&times;</button>`
+          + `</div>`
+          + `<div class="row"><span class="k">lines / photos</span>`
+          +   `<span class="v">${t.lines} / ${t.images}</span></div>`
+          + `<div class="row"><span class="k">net constraints</span>`
+          +   `<span class="v ${grade}">${t.images < 2 ? '—' : Math.max(0, net)}</span></div>`;
+
+    if (rep && rep.identifiable && rep.direction) {
+      const d = rep.direction.map((v) => v.toFixed(3)).join(', ');
+      html += `<div class="row"><span class="k">direction</span><span class="v">${d}</span></div>`
+            + `<div class="row"><span class="k">line RMS</span>`
+            +   `<span class="v">${rep.rms_px.toFixed(2)} px</span></div>`
+            + `<div class="row"><span class="k">views cross at</span>`
+            +   `<span class="v">${(Math.asin(Math.min(1, rep.conditioning)) * 180 / Math.PI).toFixed(0)}&deg;</span></div>`;
+      if (rep.n_culled) {
+        html += `<div class="note warn">${rep.n_culled} line(s) in this group were dropped as `
+              + `outliers. They are still drawn — check each is on the edge you meant.</div>`;
+      }
+    } else if (rep) {
+      html += `<div class="note bad">Not identifiable yet. ${escapeHtml(rep.note)}</div>`;
+    } else {
+      html += `<div class="note">${escapeHtml(groupAdvice(t))}. No solve yet, so no direction.</div>`;
+    }
+    if (rep && rep.identifiable) {
+      html += `<div class="note">${escapeHtml(rep.note)}</div>`;
+    }
+    html += `</div>`;
+  }
+
+  html += `<button class="smallbtn" id="dgnew" style="margin-top:7px">+ new direction group</button>`;
+  el.innerHTML = html;
+
+  const mk = $('dgnew');
+  if (mk) mk.onclick = () => newDirGroup();
+  for (const b of el.querySelectorAll('.dgdraw')) {
+    b.onclick = () => setDirGroup(b.dataset.gid);
+  }
+  for (const b of el.querySelectorAll('.dgdel')) {
+    b.onclick = () => deleteDirGroup(b.dataset.gid);
+  }
+  for (const inp of el.querySelectorAll('.dglabel')) {
+    inp.onchange = () => {
+      const g = dirGroupOf(inp.dataset.gid);
+      if (!g) return;
+      g.label = inp.value.trim() || g.id;
+      markDirty();
+      syncAxisButtons();
+      renderPanels();
+    };
+  }
 }
 
 /* ------------------------------------------------------- focal from EXIF */
@@ -3708,6 +4001,151 @@ function shapeCheckHtml() {
   }
   for (const w of (r.warnings || [])) html += `<div class="note bad">${escapeHtml(w)}</div>`;
   return html;
+}
+
+/* Did the CAD bodies make the photographs fit worse?
+ *
+ * The one panel here that answers a question about something that already
+ * happened rather than about the current state: it re-solves without the body
+ * anchors and compares, per image, on tie points only. See multispy/cadguard.py
+ * for why the comparison cannot be read off the per-image RMS already in the
+ * report -- that figure has the anchor marks folded into it and so answers a
+ * different question.
+ *
+ * Costs two full solves, so unlike the other readings it is never run on a
+ * render. Cleared by any edit, same as the viewpoint reading: a verdict about
+ * marks that have since changed is a verdict about nothing. */
+const CAD_COLOR = {
+  improves: 'good', harmless: 'good', worsens: 'bad', untestable: 'unknown',
+};
+
+function cadPanelHtml() {
+  const r = state.cadCheck;
+  if (!r) {
+    return `<div class="note">Known objects are a much stronger claim than tie points &mdash; `
+         + `a body says these features are in exactly this rigid arrangement, because a CAD `
+         + `file says so. When that is right it is worth more than any number of marks. When `
+         + `it is wrong it is a confident lie, and the bundle will bend the cameras to fit it. `
+         + `This solves with the bodies and without them and compares each photograph's tie `
+         + `points, so a body that cost you calibration says so instead of hiding.</div>`;
+  }
+  const col = GRADE_COLOR[CAD_COLOR[r.verdict] || 'unknown'] || GRADE_COLOR.unknown;
+  let html = `<div class="row" style="align-items:center;gap:6px">`
+           +   `<span style="width:10px;height:10px;border-radius:50%;background:${col};`
+           +     `display:inline-block;flex:none"></span><b>${escapeHtml(r.verdict)}</b>`;
+  if (r.ok) {
+    html += `<span style="color:var(--text-dim)">${r.before_rms_px.toFixed(2)} &rarr; `
+          + `${r.after_rms_px.toFixed(2)} px on tie points</span>`;
+  }
+  html += `</div>`;
+
+  if (!r.ok) {
+    html += `<div class="note">${escapeHtml(r.reason || 'nothing to compare')}</div>`;
+    return html;
+  }
+
+  if (r.focal_before_px && r.focal_after_px) {
+    const pct = 100 * Math.abs(r.focal_after_px - r.focal_before_px) / r.focal_before_px;
+    html += `<div class="row"><span class="k">shared focal</span><span class="v">`
+          + `${r.focal_before_px.toFixed(0)} &rarr; ${r.focal_after_px.toFixed(0)} px `
+          + `<span style="color:var(--text-dim)">(${pct.toFixed(1)}%)</span></span></div>`;
+  }
+
+  const rows = r.images || [];
+  if (rows.length) {
+    html += `<table class="obs"><tr><th>image</th><th>pts</th><th>without</th><th>with</th>`
+          + `<th>change</th><th>worst point</th></tr>`
+          + rows.map((v) =>
+              `<tr${v.worsened ? ' style="color:var(--bad)"' : ''}>`
+            + `<td>${escapeHtml(v.image)}</td>`
+            + `<td>${v.n_points}</td>`
+            + `<td>${v.before_px.toFixed(2)}</td>`
+            + `<td>${v.after_px.toFixed(2)}</td>`
+            + `<td>${v.delta_px >= 0 ? '+' : ''}${v.delta_px.toFixed(2)}`
+            + `${v.worsened ? ` <b>&gt;${v.allowed_px.toFixed(2)}</b>` : ''}</td>`
+            + `<td>${escapeHtml(v.worst_point || '')}</td></tr>`).join('')
+          + `</table>`;
+    html += `<div class="note"><b>without</b> and <b>with</b> are that photograph's tie-point `
+          + `RMS with the body anchors out of the solve and in it &mdash; tie points only, so `
+          + `a body's own marks cannot flatter or damn it. A row is flagged when it worsens by `
+          + `more than its own allowance, which is the larger of 0.25 px and a tenth of where `
+          + `it started.</div>`;
+  }
+
+  for (const n of (r.notes || [])) {
+    html += `<div class="note${r.verdict === 'worsens' ? ' bad' : ''}">${escapeHtml(n)}</div>`;
+  }
+  if (r.verdict === 'worsens') {
+    html += `<div style="display:flex;gap:5px;margin-top:6px">`
+          + `<button class="smallbtn" id="cadrevert">put the body-free cameras back</button>`
+          + `</div>`
+          + `<div class="note">That restores the camera poses and points from the solve `
+          + `without the bodies, and leaves every anchor you clicked exactly where it is, so `
+          + `you can re-click one corner and check again. It does not re-place the bodies `
+          + `against the restored cameras &mdash; a rejected body is left rejected rather than `
+          + `quietly re-fitted.</div>`;
+  }
+  return html;
+}
+
+function renderCadPanel() {
+  const el = $('cadpanel');
+  if (!el) return;
+  const r = state.cadCheck;
+  const badge = $('cadcount');
+  if (badge) badge.textContent = r && r.ok ? r.verdict : '';
+  el.innerHTML = `<div class="row"><span class="k">bodies against the marks</span>`
+               +   `<button class="smallbtn" id="checkcad">check CAD</button></div>`
+               + cadPanelHtml();
+  wireCadPanel();
+}
+
+function wireCadPanel() {
+  const btn = $('checkcad');
+  if (btn) {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      setStatus('checking the bodies — two solves, one with them and one without…');
+      try {
+        const data = await api('/api/check_cad', { project: projectPayload() });
+        const r = data.cad;
+        state.cadCheck = r;
+        setStatus(
+          r.ok
+            ? `CAD ${r.verdict}: tie points ${r.before_rms_px.toFixed(2)} → `
+              + `${r.after_rms_px.toFixed(2)} px, ${(r.worsened || []).length} image(s) worse`
+            : `CAD check untestable: ${r.reason}`,
+          r.ok && r.verdict === 'worsens' ? 'warn' : 'ok');
+      } catch (err) {
+        setStatus(`could not check the bodies: ${err.message || err}`, 'warn');
+      } finally {
+        btn.disabled = false;
+        renderPanels();
+        render();
+      }
+    };
+  }
+  const revert = $('cadrevert');
+  if (revert) {
+    revert.onclick = async () => {
+      revert.disabled = true;
+      pushUndoBefore('put the body-free cameras back');
+      setStatus('restoring the solve from before the bodies…');
+      try {
+        const data = await api('/api/check_cad', { project: projectPayload(), apply: true });
+        if (data.project) adopt(data);
+        state.cadCheck = data.cad;
+        setStatus(data.applied || 'restored', 'ok');
+      } catch (err) {
+        setStatus(`could not restore: ${err.message || err}`, 'warn');
+      } finally {
+        revert.disabled = false;
+        renderPanels();
+        render();
+        if (Viewer3D.isOn()) Viewer3D.render();
+      }
+    };
+  }
 }
 
 /* Where the information along the origin's worst direction comes from.
@@ -5689,7 +6127,16 @@ function escapeHtml(s) {
 /* ------------------------------------------------------------------- startup */
 
 for (const b of $('modes').children) b.onclick = () => setMode(b.dataset.mode);
-for (const b of $('axes').children) b.onclick = () => setAxis(+b.dataset.axis);
+for (const b of $('axes').children) {
+  b.onclick = () => {
+    if (b.dataset.axis !== 'group') { setAxis(+b.dataset.axis); return; }
+    // the toolbar button picks up where the panel left off, or makes the first
+    // group so that one click is enough to start marking
+    const ids = dirGroups().map((g) => g.id);
+    if (!ids.length) newDirGroup();
+    else setDirGroup(state.dirGroup && ids.includes(state.dirGroup) ? state.dirGroup : ids[0]);
+  };
+}
 $('btn-help').onclick = () => openDocs();
 $('btn-save').onclick = saveNow;
 $('btn-undo').onclick = doUndo;

@@ -40,9 +40,15 @@ const Backend = (() => {
    * So there is no fallback. Either the build told us what it shipped or we do
    * not know, and not knowing is said out loud before anything is loaded,
    * because a page that refuses to start is debuggable and a page that half
-   * starts is not. */
+   * starts is not.
+   *
+   * Scoped to the static build, because only the static build loads Python into
+   * the page. The local server's own config.js sets MULTISPY_MODE and nothing
+   * else -- there is no module list because there is no virtual filesystem to
+   * write one into -- so an unconditional check here takes the dev server down
+   * at module scope, which is how this comment came to be two paragraphs long. */
   const MODULES = window.MULTISPY_PY_MODULES;
-  if (!Array.isArray(MODULES) || !MODULES.length) {
+  if (MODE === 'pyodide' && (!Array.isArray(MODULES) || !MODULES.length)) {
     throw new Error(
       'config.js did not say which Python modules were shipped '
       + '(window.MULTISPY_PY_MODULES is missing or empty). This is a stale or missing '

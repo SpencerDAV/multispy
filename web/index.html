@@ -189,6 +189,20 @@
   .axiscounts div.z { border-bottom: 2px solid var(--axis-z); }
   .axiscounts div.short { color: var(--warn); }
 
+  /* direction groups: a shared edge whose world direction the solve works out */
+  .dgrow {
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 6px; margin-bottom: 6px;
+  }
+  .dgrow.sel { border-color: var(--accent); background: var(--surface-2); }
+  .dghead { display: flex; align-items: center; gap: 5px; margin-bottom: 3px; }
+  .dgswatch { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .dghead .dglabel { flex: 1; min-width: 0; }
+  .dghead .dgdel { padding: 3px 6px; }
+  .dgrow .row .v.good { color: var(--good); }
+  .dgrow .row .v.warn { color: var(--warn); }
+  .dgrow .row .v.bad { color: var(--bad); }
+
   .smallbtn {
     background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px;
     padding: 3px 8px; cursor: pointer; font-size: 11px;
@@ -417,6 +431,7 @@
       <button class="axis0" data-axis="0" title="X axis (1)">X</button>
       <button class="axis1" data-axis="1" title="Y axis (2)">Y</button>
       <button class="axis2" data-axis="2" title="Z axis (3)">Z</button>
+      <button id="axisgroup" data-axis="group" title="Draw into a direction group (4) — a shared edge whose world direction the solve works out. Pick or create one in the Direction groups panel.">Grp</button>
     </div>
 
     <div class="spacer"></div>
@@ -485,6 +500,10 @@
         <div class="inner" id="imgpanel"></div>
       </div>
       <div class="section">
+        <h3>Direction groups <span class="count" id="dgcount"></span></h3>
+        <div class="inner" id="dgpanel"></div>
+      </div>
+      <div class="section">
         <h3>Focal check <span class="count" id="obsverdict"></span></h3>
         <div class="inner" id="obspanel"></div>
       </div>
@@ -503,6 +522,10 @@
       <div class="section">
         <h3>Viewpoints <span class="count" id="vpcount"></span></h3>
         <div class="inner" id="vppanel"></div>
+      </div>
+      <div class="section">
+        <h3>CAD vs the photographs <span class="count" id="cadcount"></span></h3>
+        <div class="inner" id="cadpanel"></div>
       </div>
       <div class="section">
         <h3>Constraints</h3>

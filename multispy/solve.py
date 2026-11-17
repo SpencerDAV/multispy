@@ -30,6 +30,16 @@ import numpy as np
 from scipy import sparse
 from scipy.optimize import least_squares
 
+from .dirgroup import (
+    MIN_IMAGES,
+    MIN_PAIR_SINE,
+    DirectionGroupReport,
+    contribution_note,
+    direction_at,
+    initial_direction,
+    plane_normal,
+    tangent_basis,
+)
 from .geometry import (
     AXIS_NAMES,
     Intrinsics,
@@ -211,6 +221,9 @@ class SolveReport:
     points: dict[str, PointReport] = field(default_factory=dict)
     instances: dict[str, InstanceReport] = field(default_factory=dict)
     constraints: list[ConstraintReport] = field(default_factory=list)
+    direction_groups: list[DirectionGroupReport] = field(default_factory=list)
+    """One row per declared direction group, refused ones included -- a group
+    that did nothing is exactly the one the user needs to hear about."""
     constraint_worst: float = 0.0
     """Largest constraint violation, in world units."""
     datum_scale: float | None = None
@@ -264,6 +277,7 @@ class SolveReport:
             "points": {k: vars(v) for k, v in self.points.items()},
             "instances": {k: vars(v) for k, v in self.instances.items()},
             "constraints": [vars(c) for c in self.constraints],
+            "direction_groups": [g.to_dict() for g in self.direction_groups],
             "constraint_worst": self.constraint_worst,
             "datum_scale": self.datum_scale,
             "rig": self.rig.to_dict(),
@@ -292,8 +306,23 @@ def calibrate_all(project: Project, report: SolveReport) -> dict[str, Intrinsics
         segs = im.axis_segments()
         usable = {a: s for a, s in segs.items() if len(s) >= 2}
         if len(usable) < 2:
+            # Said explicitly, because this is where someone who has just drawn
+            # six tray lines into a photo would otherwise sit and wonder why it
+            # still will not calibrate. A vanishing point measures a camera
+            # against a direction that is already known; a direction the bundle
+            # has yet to work out gives it nothing to measure against.
+            free = len(im.free_lines())
+            grouped = (
+                f" The {free} line(s) here that follow a direction group do not count towards "
+                "this: a group's direction is worked out by the solve, so it cannot calibrate "
+                "the camera that sees it. They still constrain the bundle once this photo is "
+                "calibrated some other way."
+                if free
+                else ""
+            )
             rep.notes.append(
-                f"{len(usable)} axis/axes with 2+ control lines; need 2 axes to calibrate"
+                f"{len(usable)} axis/axes with 2+ control lines; need 2 axes to calibrate."
+                + grouped
             )
             continue
         try:
@@ -1234,11 +1263,30 @@ class _Problem:
             im = project.image(iid)
             for ln in im.axis_lines:
                 p0 = np.array([ln.p0[0], ln.p0[1], 1.0])
+                if ln.is_free:
+                    continue  # follows a direction the bundle works out, not an axis
                 p1 = np.array([ln.p1[0], ln.p1[1], 1.0])
                 L = ln.length()
                 if L < 1e-6:
                     continue
                 self.lines.append((iid, ln.axis, np.cross(p0, p1), L, ln))
+
+        # ---- grouped control lines, and the directions they share
+        #
+        # Collected here rather than read off the project because
+        # identifiability depends on what actually reached *this* solve: a group
+        # whose second photograph was dropped for having too few marks is a
+        # one-photograph group as far as this problem is concerned, and has to
+        # be refused on that basis rather than on the project's own count.
+        #
+        # Appended to the parameter vector after everything else, so every
+        # offset above is exactly where it was before groups existed and a
+        # project with none has a layout identical to the old one.
+        self._collect_direction_groups()
+        self.off_dirs = self.n_params
+        for gid in self.dir_group_ids:
+            self.dir_slots[gid] = self.n_params
+            self.n_params += 2
 
         # Held, not recomputed. ``all_constraints()`` builds fresh objects for
         # the nominals every call, so a second call would produce an equal list
@@ -1284,6 +1332,14 @@ class _Problem:
         self.line_confident = self.line_weight >= 1.0
         self.line_errs = np.zeros(len(self.lines))
         """Filled by the first bundle pass; zeros mean nothing has been measured yet."""
+        # Grouped lines carry the same uncertain flag at the same factor. A line
+        # along an edge you are not sure is really parallel to the tray is the
+        # same kind of doubt as one you are not sure is parallel to X.
+        self.dir_line_weight = np.array(
+            [unc if ln.uncertain else 1.0 for _iid, _gid, _line, _L, ln in self.dir_lines]
+        )
+        self.dir_line_confident = self.dir_line_weight >= 1.0
+        self.dir_line_errs = np.zeros(len(self.dir_lines))
         self.anchor_weight = [np.ones(len(b[3])) for b in self.anchor_blocks]
         self.anchor_confident = [np.ones(len(b[3]), dtype=bool) for b in self.anchor_blocks]
         self.sigma_point = float(self.s.sigma_px)
@@ -1324,6 +1380,7 @@ class _Problem:
         self.r_reproj = 2 * self.n_obs
         self.r_anchor = 2 * self.n_anchor_obs
         self.r_lines = len(self.lines)
+        self.r_dirlines = len(self.dir_lines)
         self.r_constraints = len(self.constraints)
         self.r_depth = self.n_obs + self.n_anchor_obs
         self.r_gauge = 6 * self.n_img + len(self.group_ids) + 6 * len(self.instance_slots)
@@ -1331,7 +1388,12 @@ class _Problem:
         self.o_reproj = 0
         self.o_anchor = self.o_reproj + self.r_reproj
         self.o_lines = self.o_anchor + self.r_anchor
-        self.o_cons = self.o_lines + self.r_lines
+        # Grouped lines sit immediately after the axis lines and before the
+        # constraints, so they fall inside the robust-kernel slice below with the
+        # rest of the clicked data -- and so a project with no groups has
+        # ``o_cons`` exactly where it always did.
+        self.o_dirlines = self.o_lines + self.r_lines
+        self.o_cons = self.o_dirlines + self.r_dirlines
         self.o_depth = self.o_cons + self.r_constraints
         self.o_gauge = self.o_depth + self.r_depth
         self.r_focal = len(self.group_ids)
@@ -1371,6 +1433,106 @@ class _Problem:
     def _uncertain_point(self, pid: str) -> bool:
         pt = self.project.point(pid)
         return bool(pt is not None and pt.uncertain)
+
+    # --------------------------------------------------- direction groups
+
+    def _collect_direction_groups(self) -> None:
+        """Sort the grouped lines by group, initialise each direction, and refuse
+        the groups that cannot earn their two unknowns.
+
+        Every group gets a line count, an image list and a conditioning figure
+        whether it is accepted or not, because a refused group still has to be
+        reported -- someone who has just drawn three lines into one photograph
+        needs to be told why they did nothing, and an absent entry would read as
+        "fine".
+        """
+        self.dir_lines: list[tuple[str, str, np.ndarray, float, Any]] = []
+        self.dir_group_ids: list[str] = []
+        self.dir_slots: dict[str, int] = {}
+        self.dir_base: dict[str, np.ndarray] = {}
+        self.dir_tangent: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self.dir_conditioning: dict[str, float] = {}
+        self.dir_counts: dict[str, int] = {}
+        self.dir_images: dict[str, list[str]] = {}
+        self.dir_refused: dict[str, str] = {}
+        self.dir_orphans = 0
+        """Grouped lines naming a group that no longer exists. Counted rather
+        than dropped silently: deleting a group from the panel should take its
+        lines with it, so one of these means something did not."""
+
+        declared = {g.id for g in self.project.direction_groups}
+        entries: dict[str, list[tuple[str, np.ndarray, float, Any]]] = {}
+        for iid in self.image_ids:
+            for ln in self.project.image(iid).axis_lines:
+                if not ln.is_free:
+                    continue
+                L = ln.length()
+                if L < 1e-6:
+                    continue
+                if ln.direction_group not in declared:
+                    self.dir_orphans += 1
+                    continue
+                p0 = np.array([ln.p0[0], ln.p0[1], 1.0])
+                p1 = np.array([ln.p1[0], ln.p1[1], 1.0])
+                entries.setdefault(ln.direction_group, []).append(
+                    (iid, np.cross(p0, p1), L, ln)
+                )
+
+        for g in self.project.direction_groups:
+            mine = entries.get(g.id, [])
+            images = sorted({iid for iid, _l, _L, _ln in mine})
+            self.dir_counts[g.id] = len(mine)
+            self.dir_images[g.id] = images
+
+            normals = []
+            for iid, line, _L, _ln in mine:
+                im = self.project.image(iid)
+                if im.R is None:
+                    continue
+                n = plane_normal(im.R, self.fixed[self.group_of_image[iid]].K(), line)
+                if n is not None:
+                    normals.append(n)
+            d0, sine, _pair = initial_direction(normals)
+            self.dir_conditioning[g.id] = float(sine)
+
+            if len(images) < MIN_IMAGES:
+                self.dir_refused[g.id] = contribution_note(len(mine), len(images), sine)
+                continue
+            if d0 is None:
+                floor = math.degrees(math.asin(MIN_PAIR_SINE))
+                got = math.degrees(math.asin(max(min(sine, 1.0), 0.0)))
+                self.dir_refused[g.id] = (
+                    f"{len(mine)} lines across {len(images)} photos, but the squarest pair of "
+                    f"views in this group crosses at only {got:.2f} degrees, under the "
+                    f"{floor:.1f} needed to start from. The direction they imply is mostly the "
+                    "noise in the endpoints, so this group is left out rather than allowed to "
+                    "bend the cameras towards it. A photo looking across this edge rather than "
+                    "along it is what it needs, not another line."
+                )
+                continue
+
+            self.dir_group_ids.append(g.id)
+            self.dir_base[g.id] = d0
+            self.dir_tangent[g.id] = tangent_basis(d0)
+            self.dir_lines.extend((iid, g.id, line, L, ln) for iid, line, L, ln in mine)
+
+    def direction_of(self, x: np.ndarray, gid: str) -> np.ndarray:
+        """One group's world direction as the parameter vector currently states it.
+
+        The two parameters are an offset in radians from ``dir_base[gid]`` within
+        that group's tangent basis, so they start at exactly zero and
+        ``direction_at`` returns a unit vector for any excursion the solver
+        tries. Unlike ``self.fixed`` for intrinsics, ``dir_base`` is deliberately
+        *not* moved by ``write_back``: the baseline and the parameters have to
+        agree, and shifting the base while the offsets still hold their values
+        would apply the same refinement twice.
+        """
+        pos = self.dir_slots[gid]
+        u, v = self.dir_tangent[gid]
+        return direction_at(self.dir_base[gid], u, v, x[pos], x[pos + 1])
+
+    def directions_at(self, x: np.ndarray) -> dict[str, np.ndarray]:
+        return {gid: self.direction_of(x, gid) for gid in self.dir_group_ids}
 
     # ------------------------------------------------------------------ pack
 
@@ -1526,6 +1688,30 @@ class _Problem:
                 out[cursor] = w * (L / 2.0) * sin_angle / sl
             cursor += 1
 
+        # grouped control lines: the same geometry with the world axis replaced
+        # by a direction the solve works out. An axis line uses ``R[:, axis]``,
+        # which is just ``R @ e_axis`` -- the basis vector carried into the camera
+        # frame -- so this is the identical expression with ``e_axis`` swapped for
+        # ``d``. Same (L/2) sin(theta) pixel slip, same sigma_line_px, which is
+        # what makes an axis line and a grouped line comparable in one panel.
+        #
+        # Odd in ``d``, so squaring it leaves both the drawn end and the group's
+        # own sign immaterial. That is why a group, unlike an axis line, does not
+        # care which way it was dragged.
+        cursor = self.o_dirlines
+        dirs = self.directions_at(x)
+        for (iid, gid, line, L, _ln), w in zip(self.dir_lines, self.dir_line_weight):
+            R, _ = poses[iid]
+            cam = cams[self.group_of_image[iid]]
+            nrm = cam.K().T @ line
+            nn = np.linalg.norm(nrm)
+            if nn < 1e-12:
+                out[cursor] = 0.0
+            else:
+                sin_angle = float((nrm / nn) @ (R @ dirs[gid]))
+                out[cursor] = w * (L / 2.0) * sin_angle / sl
+            cursor += 1
+
         cursor = self.o_cons
         for c in self.constraints:
             if isinstance(c, AxisLockConstraint):
@@ -1642,6 +1828,20 @@ class _Problem:
                 S[row, pos] = 1
             row += 1
 
+        # a grouped line touches its image's rotation, the shared intrinsics and
+        # the group's own 2 direction parameters -- and no translation, since
+        # moving a camera cannot tilt a direction
+        row = self.o_dirlines
+        for iid, gid, _line, _L, _ln in self.dir_lines:
+            k = self.img_index[iid]
+            S[row, 6 * k : 6 * k + 3] = 1
+            for pos in self.group_slots[self.group_of_image[iid]].values():
+                S[row, pos] = 1
+            pos = self.dir_slots[gid]
+            S[row, pos] = 1
+            S[row, pos + 1] = 1
+            row += 1
+
         row = self.o_cons
         for c in self.constraints:
             if isinstance(c, AxisLockConstraint):
@@ -1698,6 +1898,16 @@ class _Problem:
             inst.R, inst.t = R_obj, t_obj
             # keep the locked-pose baseline in step, as for intrinsics above
             self.fixed_instances[inst_id] = (R_obj.copy(), t_obj.copy())
+        # Solved directions, for the panel to show. A refused group has its
+        # stored direction cleared rather than left alone: a figure from an
+        # earlier solve would otherwise sit in the panel beside a note saying the
+        # group was ignored. ``dir_base`` is left where it is -- see
+        # ``direction_of`` for why moving it here would double the refinement.
+        for g in self.project.direction_groups:
+            if g.id in self.dir_slots:
+                g.d = [float(v) for v in self.direction_of(x, g.id)]
+            else:
+                g.d = None
 
 
 def _line_errors(problem: _Problem, x: np.ndarray) -> np.ndarray:
@@ -1710,6 +1920,24 @@ def _line_errors(problem: _Problem, x: np.ndarray) -> np.ndarray:
         nrm = cams[problem.group_of_image[iid]].K().T @ line
         nn = np.linalg.norm(nrm)
         out[i] = 0.0 if nn < 1e-12 else abs((L / 2.0) * float((nrm / nn) @ R[:, axis]))
+    return out
+
+
+def _dir_line_errors(problem: _Problem, x: np.ndarray) -> np.ndarray:
+    """The same endpoint slip, in pixels, for each grouped control line.
+
+    Deliberately the identical measure to ``_line_errors`` rather than an angle
+    or a normalised residual: a user comparing a tray line against an X line in
+    the same panel is entitled to compare like with like.
+    """
+    poses, cams, _X, _objects = problem.unpack(x)
+    dirs = problem.directions_at(x)
+    out = np.zeros(len(problem.dir_lines))
+    for i, (iid, gid, line, L, _ln) in enumerate(problem.dir_lines):
+        R, _t = poses[iid]
+        nrm = cams[problem.group_of_image[iid]].K().T @ line
+        nn = np.linalg.norm(nrm)
+        out[i] = 0.0 if nn < 1e-12 else abs((L / 2.0) * float((nrm / nn) @ (R @ dirs[gid])))
     return out
 
 
@@ -1859,8 +2087,16 @@ def _cull_outliers(
             if e > s.cull_sigma * sigma:
                 candidates.append((float(e / sigma), "anchor", b, j, iid, key, float(e)))
 
-    sure_lines = problem.line_errs[problem.line_confident] if len(problem.lines) else np.zeros(0)
-    line_sigma = _robust_scale(sure_lines, s.sigma_line_px)
+    # One scale for every control line, axis or grouped: the residual is the same
+    # endpoint slip in the same pixels, so splitting the estimate would judge the
+    # two kinds against different ideas of what a well-drawn line looks like.
+    sure_lines = [
+        problem.line_errs[problem.line_confident] if len(problem.lines) else np.zeros(0),
+        problem.dir_line_errs[problem.dir_line_confident]
+        if len(problem.dir_lines)
+        else np.zeros(0),
+    ]
+    line_sigma = _robust_scale(np.concatenate(sure_lines), s.sigma_line_px)
     for i, (iid, axis, _line, _L, _ln) in enumerate(problem.lines):
         axis_count[(iid, axis)] = axis_count.get((iid, axis), 0) + 1
         limit = (s.cull_sigma if problem.line_confident[i] else doubt_sigma) * line_sigma
@@ -1877,18 +2113,59 @@ def _cull_outliers(
                 )
             )
 
+    # Grouped lines are judged against the same scale as axis lines, because the
+    # residual is the same measure in the same units. The guard differs: an axis
+    # line's vanishing point needs two lines in its own photograph, while a group
+    # needs three lines across two photographs -- below that it is break-even and
+    # the cull would be quietly turning a working constraint into a pair of free
+    # parameters.
+    group_lines: dict[str, int] = {}
+    group_images: dict[str, set[str]] = {}
+    for i, (iid, gid, _line, _L, _ln) in enumerate(problem.dir_lines):
+        group_lines[gid] = group_lines.get(gid, 0) + 1
+        group_images.setdefault(gid, set()).add(iid)
+    for i, (iid, gid, _line, _L, _ln) in enumerate(problem.dir_lines):
+        limit = (s.cull_sigma if problem.dir_line_confident[i] else doubt_sigma) * line_sigma
+        if problem.dir_line_errs[i] > limit:
+            label = problem.project.direction_group(gid)
+            name = (label.label or gid) if label is not None else gid
+            candidates.append(
+                (
+                    float(problem.dir_line_errs[i] / line_sigma),
+                    "dirline",
+                    i,
+                    0,
+                    iid,
+                    f"{name} line",
+                    float(problem.dir_line_errs[i]),
+                )
+            )
+
     if not candidates:
         return False
 
     candidates.sort(key=lambda c: -c[0])
-    budget = max(1, int(0.2 * (problem.n_obs + problem.n_anchor_obs + len(problem.lines))))
+    budget = max(
+        1,
+        int(
+            0.2
+            * (
+                problem.n_obs
+                + problem.n_anchor_obs
+                + len(problem.lines)
+                + len(problem.dir_lines)
+            )
+        ),
+    )
     dropped: list[tuple[str, str, float, float]] = []
     starved = 0
 
     for n_sigma, kind, b, j, iid, label, err in candidates:
         if len(dropped) >= budget:
             break
-        if kind != "line" and image_count.get(iid, 0) <= 2:
+        # the "a photo needs 2 marks" guard is about clicked points, not lines:
+        # dropping a control line costs a photo nothing it is counted on for
+        if kind not in ("line", "dirline") and image_count.get(iid, 0) <= 2:
             starved += 1
             continue
         if kind == "line":
@@ -1899,6 +2176,19 @@ def _cull_outliers(
                 continue
             axis_count[(iid, j)] -= 1
             problem.line_weight[b] = 0.0
+            report.images.setdefault(iid, ImageReport(id=iid)).n_culled += 1
+            dropped.append((iid, label, err, n_sigma))
+            continue
+        if kind == "dirline":
+            gid = problem.dir_lines[b][1]
+            # three lines across two photos is the floor. Dropping to two leaves
+            # a group that fits itself exactly and constrains nothing, so culling
+            # into that state would silently cost more than the bad line did.
+            if group_lines.get(gid, 0) <= 3 or len(group_images.get(gid, ())) <= 2:
+                starved += 1
+                continue
+            group_lines[gid] -= 1
+            problem.dir_line_weight[b] = 0.0
             report.images.setdefault(iid, ImageReport(id=iid)).n_culled += 1
             dropped.append((iid, label, err, n_sigma))
             continue
@@ -1995,6 +2285,7 @@ def bundle_adjust(
     if s.reweight_instances or s.cull_sigma > 0:
         point_errs, anchor_errs = _observation_errors(problem, result.x)
         problem.line_errs = _line_errors(problem, result.x)
+        problem.dir_line_errs = _dir_line_errors(problem, result.x)
         if s.reweight_instances and problem.anchor_blocks:
             changed |= _reweight_instances(problem, anchor_errs, report)
         if s.cull_sigma > 0:
@@ -2134,6 +2425,23 @@ def _fill_statistics(
             continue   # culled: reported as a count, kept out of the RMS
         per_image_lines.setdefault(iid, []).append(err)
         line_sq_all.append(err**2)
+
+    # Grouped lines fold into the same per-image and overall line RMS. They are
+    # control lines drawn in that photograph and measured the same way, so
+    # keeping them out of the headline figure would report a cleaner line RMS
+    # than the solve actually achieved.
+    dir_errs = _dir_line_errors(problem, x)
+    per_group: dict[str, list[float]] = {}
+    for (iid, gid, _line, _L, _ln), w, err in zip(
+        problem.dir_lines, problem.dir_line_weight, dir_errs
+    ):
+        if w <= 0.0:
+            continue  # culled: reported as a count, kept out of the RMS
+        per_image_lines.setdefault(iid, []).append(float(err))
+        line_sq_all.append(float(err) ** 2)
+        per_group.setdefault(gid, []).append(float(err))
+    _fill_direction_group_reports(problem, per_group, report)
+
     for iid, errs in per_image_lines.items():
         report.images.setdefault(iid, ImageReport(id=iid)).line_rms_px = float(
             np.sqrt(np.mean(np.square(errs)))
@@ -2152,6 +2460,78 @@ def _fill_statistics(
     report.n_images_positioned = sum(1 for r in report.images.values() if r.positioned)
     report.n_points_triangulated = sum(1 for r in report.points.values() if r.triangulated)
     report.focals = {gid: float(cams[gid].f) for gid in cams}
+
+
+def _fill_direction_group_reports(
+    problem: _Problem, per_group: dict[str, list[float]], report: SolveReport
+) -> None:
+    """One row per declared group, including the ones that were refused.
+
+    ``net_constraints`` is reported beside the line count rather than instead of
+    it, because the two answer different questions and only one of them is the
+    one people assume. A group of two lines has a line count of 2 and a net
+    contribution of 0, and a panel showing only the first would let someone build
+    a dozen of them and believe the solve had gained something.
+    """
+    for g in problem.project.direction_groups:
+        n_lines = problem.dir_counts.get(g.id, 0)
+        images = problem.dir_images.get(g.id, [])
+        refusal = problem.dir_refused.get(g.id)
+        used = per_group.get(g.id, [])
+        identifiable = g.id in problem.dir_slots
+        n_culled = sum(
+            1
+            for i, (_iid, gid, _l, _L, _ln) in enumerate(problem.dir_lines)
+            if gid == g.id and problem.dir_line_weight[i] <= 0.0
+        )
+        rep = DirectionGroupReport(
+            id=g.id,
+            label=g.label,
+            n_lines=n_lines,
+            n_images=len(images),
+            images=list(images),
+            identifiable=identifiable,
+            direction=None if not identifiable else list(g.d or []) or None,
+            net_constraints=max(0, n_lines - 2) if identifiable else 0,
+            conditioning=problem.dir_conditioning.get(g.id, 0.0),
+            rms_px=float(np.sqrt(np.mean(np.square(used)))) if used else 0.0,
+            max_px=float(max(used)) if used else 0.0,
+            n_culled=n_culled,
+            note=refusal
+            or contribution_note(n_lines, len(images), problem.dir_conditioning.get(g.id, 0.0)),
+        )
+        report.direction_groups.append(rep)
+
+    if problem.dir_orphans:
+        report.warnings.append(
+            f"{problem.dir_orphans} control line(s) name a direction group that no longer "
+            "exists and were ignored. Deleting a group should take its lines with it, so this "
+            "means some were left behind -- find them in the Lines panel and delete or regroup "
+            "them."
+        )
+
+    refused = [r for r in report.direction_groups if r.n_lines and not r.identifiable]
+    if refused:
+        report.warnings.append(
+            f"{len(refused)} direction group(s) were left out of the solve: "
+            + "; ".join(f"{r.label or r.id} -- {r.note}" for r in refused[:3])
+            + ("…" if len(refused) > 3 else "")
+        )
+    idle = [r for r in report.direction_groups if r.identifiable and r.net_constraints == 0]
+    if idle:
+        report.messages.append(
+            f"{len(idle)} direction group(s) are break-even: a direction costs 2 unknowns and "
+            "each line gives 1 residual, so two lines constrain nothing. A third line in any "
+            "photo is where each of them starts to help."
+        )
+    earning = [r for r in report.direction_groups if r.net_constraints > 0]
+    if earning:
+        total = sum(r.net_constraints for r in earning)
+        report.messages.append(
+            f"{len(earning)} direction group(s) contributed {total} net constraint(s) from "
+            f"{sum(r.n_lines for r in earning)} line(s) on edges whose world direction was "
+            "never stated."
+        )
 
 
 def _warn_about_weak_nominals(project: Project, report: SolveReport) -> None:

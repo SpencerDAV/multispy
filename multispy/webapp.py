@@ -23,7 +23,17 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageOps
 
-from . import calibfile, exif, export, nominalcheck, sensorcheck, sensors, uncertainty, viewpoint
+from . import (
+    cadguard,
+    calibfile,
+    exif,
+    export,
+    nominalcheck,
+    sensorcheck,
+    sensors,
+    uncertainty,
+    viewpoint,
+)
 from .geometry import AXIS_NAMES, _observability_advice, analyse_axes
 from .mesh import FEATURE_ANGLE_DEG, MESH_SUFFIXES, UNIT_SCALES, load_mesh, suggest_units
 from .part import PartFitReport, part_fit, place_part
@@ -60,6 +70,7 @@ SHARED_ROUTES = frozenset(
         "/api/check_sensors_in_photos",
         "/api/check_nominal_shape",
         "/api/viewpoints",
+        "/api/check_cad",
         "/api/use_calibration_nominals",
     }
 )
@@ -263,6 +274,11 @@ def observability_payload(body: dict) -> dict:
 
     by_axis: dict[int, list[list[float]]] = {}
     for ln in body.get("axis_lines") or []:
+        # a grouped line has no world axis to analyse: its direction is an output
+        # of the bundle, so it cannot contribute to a vanishing point here any
+        # more than it can in ``calibrate_all``
+        if ln.get("direction_group"):
+            continue
         by_axis.setdefault(int(ln["axis"]), []).append(
             [float(ln["p0"][0]), float(ln["p0"][1]), float(ln["p1"][0]), float(ln["p1"][1])]
         )
@@ -669,6 +685,28 @@ class Workspace:
             project = Project.from_dict(body["project"], path=self.project.path)
             report = viewpoint.viewpoint_report(project)
             return {"viewpoints": report.to_dict(), "verdict": report.verdict}
+
+        # Two full solves, so this is the expensive one on this list -- and its own
+        # route rather than part of /api/solve for that reason, and for a better
+        # one: /api/solve saves by default, and a check that answers "did the
+        # bodies make this worse" must not be able to write the worse answer to
+        # disk on its way to telling you about it. Read-only, like the shape
+        # check, and for the same reason: the comparison only means anything
+        # against a solve the bodies are NOT in, so it runs its own.
+        #
+        # ``apply`` is separate and explicit. Putting the body-free cameras back
+        # is a real edit to the project, and it is not something to do as a side
+        # effect of looking.
+        if route == "/api/check_cad":
+            project = Project.from_dict(body["project"], path=self.project.path)
+            report = cadguard.check_cad_bodies(project)
+            out: dict[str, Any] = {"cad": report.to_dict(), "verdict": report.verdict}
+            if body.get("apply"):
+                project = self.adopt(body["project"])
+                out["applied"] = cadguard.restore_without_bodies(project, report)
+                self.save()
+                out["project"] = project_payload(self.project)
+            return out
 
         # Adopting the file's feature coordinates as nominals you can pick from.
         # A separate route from /api/check_calibration, which stays read-only:

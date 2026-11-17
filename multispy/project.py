@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 
+from .dirgroup import DirectionGroup
 from .mesh import FEATURE_ANGLE_DEG
 
 FORMAT_VERSION = 3
@@ -48,10 +49,13 @@ def clean_anchor_name(name: str) -> str:
 
 @dataclass
 class AxisLine:
-    """A control line segment, drawn along a world axis.
+    """A control line segment, drawn along a world axis -- or along a direction
+    the solve works out, if it names a direction group.
 
-    Direction matters: ``p0 -> p1`` is taken to point along the *positive* axis,
-    which is how the sign ambiguity of the vanishing point gets resolved.
+    Direction matters for an axis line: ``p0 -> p1`` is taken to point along the
+    *positive* axis, which is how the sign ambiguity of the vanishing point gets
+    resolved. It does not matter for a grouped line, whose residual is odd in the
+    direction and squared; see ``dirgroup``.
     """
 
     axis: int  # 0=X, 1=Y, 2=Z
@@ -64,9 +68,28 @@ class AxisLine:
     photo with only two lines on an axis it may be all there is -- so it keeps
     contributing, at ``Settings.uncertain_factor`` times its usual sigma, and it
     is the first thing dropped when the solve decides something has to go."""
+    direction_group: str | None = None
+    """``DirectionGroup.id`` this line follows, instead of a world axis.
+
+    The whole point of a group is that the direction has no name in the part's
+    coordinate system: a cable tray, a conduit run, a handrail. You cannot say
+    which axis such an edge follows, but you can say the edge in this photo is
+    the same one -- or parallel to it -- in the next. ``None`` is an ordinary
+    axis line, which is what every project written before groups existed
+    contains.
+
+    When this is set, ``axis`` is meaningless and is not read anywhere: the
+    direction is a solve parameter. ``axis_segments`` therefore leaves a grouped
+    line out, because a direction that is itself an output of the bundle cannot
+    calibrate the camera that sees it."""
 
     def length(self) -> float:
         return float(np.hypot(self.p1[0] - self.p0[0], self.p1[1] - self.p0[1]))
+
+    @property
+    def is_free(self) -> bool:
+        """True when this line follows a solved direction rather than a world axis."""
+        return self.direction_group is not None
 
 
 @dataclass
@@ -126,11 +149,24 @@ class ImageView:
     re-solving the entire project."""
 
     def axis_segments(self) -> dict[int, np.ndarray]:
-        """Control lines regrouped as ``{axis: (N,4) array}`` for the geometry code."""
+        """Control lines regrouped as ``{axis: (N,4) array}`` for the geometry code.
+
+        Grouped lines are left out, and that is the single place the rule lives:
+        calibration reads this, and a vanishing point can only measure a camera
+        against a direction already known. A line following a direction the
+        bundle has yet to work out has nothing to offer here -- see ``dirgroup``
+        for why a photo carrying only such lines still will not calibrate.
+        """
         out: dict[int, list[list[float]]] = {}
         for ln in self.axis_lines:
+            if ln.is_free:
+                continue
             out.setdefault(ln.axis, []).append([ln.p0[0], ln.p0[1], ln.p1[0], ln.p1[1]])
         return {a: np.array(v, dtype=float) for a, v in out.items()}
+
+    def free_lines(self) -> list[AxisLine]:
+        """Control lines in this photo that follow a solved direction."""
+        return [ln for ln in self.axis_lines if ln.is_free]
 
     def center(self) -> np.ndarray | None:
         """Camera centre in world coordinates."""
@@ -624,6 +660,12 @@ class Project:
     groups: dict[str, CameraGroup] = field(default_factory=dict)
     points: list[TiePoint] = field(default_factory=list)
     constraints: list[Constraint] = field(default_factory=list)
+    direction_groups: list[DirectionGroup] = field(default_factory=list)
+    """Shared directions whose orientation the solve works out.
+
+    A list rather than a dict, unlike ``groups``, because the order is the order
+    the user made them in and the panel shows them that way; there are a handful
+    of these, not hundreds."""
     templates: dict[str, ObjectTemplate] = field(default_factory=dict)
     instances: list[ObjectInstance] = field(default_factory=list)
     settings: Settings = field(default_factory=Settings)
@@ -656,6 +698,32 @@ class Project:
 
     def point(self, point_id: str) -> TiePoint | None:
         return next((p for p in self.points if p.id == point_id), None)
+
+    def direction_group(self, group_id: str) -> DirectionGroup | None:
+        return next((g for g in self.direction_groups if g.id == group_id), None)
+
+    def direction_group_lines(self) -> dict[str, list[tuple[ImageView, AxisLine]]]:
+        """Every grouped control line, keyed by the group id it names.
+
+        Keyed by the id on the *line* rather than built from
+        ``direction_groups``, so a line naming a group that has been deleted
+        shows up here and can be reported instead of vanishing silently. The
+        solve and the panel both count from this, which is what keeps the "lines
+        across photos" figure the user is shown the same one the solve used.
+        """
+        out: dict[str, list[tuple[ImageView, AxisLine]]] = {}
+        for im in self.images:
+            for ln in im.axis_lines:
+                if ln.direction_group is not None:
+                    out.setdefault(ln.direction_group, []).append((im, ln))
+        return out
+
+    def next_direction_group_id(self) -> str:
+        used = {g.id for g in self.direction_groups} | set(self.direction_group_lines())
+        i = 0
+        while f"d{i}" in used:
+            i += 1
+        return f"d{i}"
 
     def nominal_constraints(self) -> list["AxisLockConstraint"]:
         """Every point nominal, expanded into the axis locks it already means.
@@ -1045,6 +1113,7 @@ class Project:
             "nominal_units": self.nominal_units,
             "nominal_scale": self.nominal_scale,
             "constraints": [asdict(c) for c in self.constraints],
+            "direction_groups": [asdict(g) for g in self.direction_groups],
             "templates": {
                 tid: {
                     "id": t.id,
@@ -1104,6 +1173,7 @@ class Project:
                         p0=list(l["p0"]),
                         p1=list(l["p1"]),
                         uncertain=bool(l.get("uncertain", False)),
+                        direction_group=l.get("direction_group") or None,
                     )
                     for l in raw.get("axis_lines", [])
                 ],
@@ -1170,6 +1240,17 @@ class Project:
             else:
                 raise ValueError(f"unknown constraint type {kind!r}")
 
+        direction_groups = [
+            DirectionGroup(
+                id=raw["id"],
+                label=raw.get("label", ""),
+                # the solved direction is an output, so a file that never had one
+                # loads with none rather than with a zero vector
+                d=None if raw.get("d") is None else [float(v) for v in raw["d"]],
+            )
+            for raw in d.get("direction_groups") or []
+        ]
+
         templates: dict[str, ObjectTemplate] = {}
         for tid, raw in (d.get("templates") or {}).items():
             optical_raw = raw.get("optical")
@@ -1231,6 +1312,7 @@ class Project:
             groups=groups,
             points=points,
             constraints=constraints,
+            direction_groups=direction_groups,
             templates=templates,
             instances=instances,
             settings=settings,

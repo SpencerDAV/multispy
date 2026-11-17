@@ -125,11 +125,21 @@ def fingerprint(project: Project) -> str:
                 "enabled": im.enabled,
                 "obs": {k: [round(float(v), 3) for v in uv]
                         for k, uv in sorted(im.observations.items())},
+                # The direction group a line names is evidence -- it says which
+                # other lines this one has to agree with -- so moving a line into
+                # a group, out of one, or across to another has to show up here.
+                # Appended only when the line has one, deliberately: an
+                # axis-only project's digest is then exactly what it was before
+                # groups existed, and a measured origin does not start reading
+                # stale on every project in existence merely because the build
+                # understands something those projects do not use. The group's
+                # *solved* direction is an output and stays out, like a pose.
                 "lines": [
                     [ln.axis,
                      [round(float(v), 3) for v in ln.p0],
                      [round(float(v), 3) for v in ln.p1],
                      bool(ln.uncertain)]
+                    + ([ln.direction_group] if ln.direction_group else [])
                     for ln in im.axis_lines
                 ],
             }
