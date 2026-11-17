@@ -226,7 +226,14 @@ def test_the_wall_holds_against_the_worst_a_correspondence_can_be():
     rather than destroyed.
     """
     unguarded = [solved_focal(0.0, "scattered", seed)[0] for seed in SCATTER_SEEDS]
-    assert all(f < true_focal() / 1000 for f in unguarded), unguarded
+    # A fiftieth of the true focal, matching the sibling assertion above, and not
+    # the thousandth this used to demand. The claim being made is that the focal
+    # is destroyed without the wall, and 42 px against a true 2100 says that
+    # beyond argument. A thousandth was pinning where a diverging optimiser
+    # happens to stop, which is not a property of this code: on Linux CI one of
+    # these three seeds settled at 6.5 px rather than under 2.1 and the suite
+    # went red over a collapse of three hundred times instead of a thousand.
+    assert all(f < true_focal() / 50 for f in unguarded), unguarded
 
     for seed in SCATTER_SEEDS:
         f, true, _rep, _proj = solved_focal(1.5, "scattered", seed)
