@@ -1,0 +1,106 @@
+name: Tests
+
+# Why this exists, since the repository went a long time without it.
+#
+# Every test file here runs standalone and they were all green -- on whichever
+# machine last ran them. That is not the same as green, and the difference
+# surfaced the hard way: tests/test_nominalaxes.py read its fixture from
+# projects/prm1/, which is gitignored because it holds the user's own photos and
+# marks. The file passed on the author's machine and could not pass in a clone at
+# all. Nothing caught it, because the only workflow in the repository was
+# pages.yml, which builds the browser bundle and checks its files exist. Nothing
+# anywhere ran the suite.
+#
+# So this job's value is not that it runs the tests. It is that it runs them
+# somewhere nobody has been working.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # A bare checkout, and it must stay bare.
+      #
+      # Read this before adding a step that fetches, unpacks or generates test
+      # data. The one bug this job has already justified itself by catching was a
+      # test that depended on a directory absent from the repository, and a job
+      # that had been "helpfully" given that directory would have gone green
+      # through it. Seeding fixture data here does not strengthen the suite, it
+      # removes the only thing this job checks that a developer's own machine
+      # does not. If a test needs a fixture, the fixture belongs in tests/ and in
+      # git, built by the test itself -- see the Cell builder in
+      # tests/test_sensors.py, or FIXTURE in tests/test_nominalaxes.py.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # Stated as a check rather than left to a comment nobody reads. projects/
+      # is gitignored, so a checkout cannot contain it and this passes trivially
+      # today -- which is the point: it will go on passing until somebody commits
+      # project data or adds a step that creates it, and then it fails here
+      # instead of quietly voiding the guarantee above.
+      - name: The tree must carry no project data
+        run: |
+          if [ -e projects ]; then
+            echo "projects/ exists in a clean checkout."
+            echo "This job's whole purpose is to run the suite where no project data exists."
+            echo "A test needing a fixture should carry its own, in tests/ and in git."
+            exit 1
+          fi
+          echo "no projects/ -- the suite is running against the repository alone"
+
+      # Every file, not a subset, and every failure rather than only the first.
+      #
+      # Run file by file rather than through one pytest invocation: several of
+      # these carry an explicit main() that lists which tests to run and prints a
+      # readable report at the end (tests/test_part.py, tests/test_nominalcheck.py
+      # and others), and that report is most of their value when something breaks.
+      # Collecting the failures and reporting at the end means one push tells you
+      # about all of them instead of hiding four behind the first.
+      - name: Suite
+        run: |
+          failed=""
+          for f in tests/test_*.py; do
+            echo "::group::$f"
+            if python "$f"; then
+              echo "ok $f"
+            else
+              echo "::error file=$f::$f failed"
+              failed="$failed $f"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "failed:$failed"
+            exit 1
+          fi
+          echo "all $(ls tests/test_*.py | wc -l) files passed"
+
+      # tests/test_focal.py and tests/test_sensorcheck.py are minutes each and
+      # between them are most of the wall time -- the first re-solves a scene
+      # under a dozen mis-markings, the second builds an edge field per image.
+      # If this job ever needs to be fast, those two are the ones to put behind a
+      # condition. They are emphatically not the ones to drop: test_focal is what
+      # pins the focal wall, without which one mis-marked body drags the shared
+      # focal from 2100 px to 5.
