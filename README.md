@@ -944,7 +944,49 @@ node in the assembly tree:
 | `P4_nominal`, … | The same points where the drawing states them, in green. The gap between the two *is* the residual, measurable with the CAD system's own dimension tool. |
 | `<part> (part)` | The part, at the origin — which is where it is by definition once the nominals have put the scene into part space. |
 | placed bodies | Every placed object at its solved pose, with its anchors marked and a frustum for any declared optical frame. |
+| `<name> (unplaced)` | A CAD template nothing has placed yet, parked at its own model origin. Pass `unplaced=False` for a file that states only what was measured. |
+| reference planes | Your datum surfaces — see below. |
 | `MS_Origin` | The world axis triad. |
+
+#### Each body is its own part, with one transform above it
+
+A placed object is a node holding the measurement, and the geometry hangs
+underneath it:
+
+```
+MultiSpy_prm1                  ← part space: the frame the nominals define
+ └─ Tooling                    ← local → part-space transform lives HERE
+     ├─ Tooling_body           ← the mesh, at its own model origin
+     ├─ Tooling_anchors        ← the anchors marked on it
+     └─ Tooling_optical        ← frustum, if the template declares one
+```
+
+Nothing is ever baked into world coordinates. `Tooling_body` sits at the
+identity in the coordinates its OBJ or STL was authored in, and the only thing
+standing between it and part space is one rigid transform on the node above.
+
+That is what makes a model swappable: a better CAD file of the same part, built
+on the same origin, drops straight into the `_body` node, and the transform —
+which is the measurement, and the expensive part — never moves. The same
+structure is why ten identical cameras in an array cost one mesh and ten
+transforms rather than ten copies of the mesh.
+
+#### Reference planes
+
+Datum surfaces you type in, under **Reference planes** in the panel: a name, an
+axis and an offset, in the project's nominal units and in part space — the same
+numbers you type for a point nominal, so a plane at `Z = 995` lands where a
+nominal of 995 does. They save with the project and go into every export.
+
+They are the one thing in the file that is not evidence. Nothing here enters
+the solve, and a plane has no residual to report, because it states where a
+datum *is* rather than claiming to have found one. It exists to be dimensioned
+against once the scene is open in CAD.
+
+Each one comes through as a genuine bounded planar surface — a `FACE_SURFACE`
+on a `PLANE` — so CAD can select it, offset from it, project onto it and
+measure to it. Not four lines in the shape of a rectangle, which can do none of
+those things. They are sized to the scene unless you give one a size.
 
 Written in **millimetres** by default, because that is what a drawing is
 dimensioned in, while the scene is solved in metres; the file's unit context

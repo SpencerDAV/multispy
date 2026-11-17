@@ -646,6 +646,7 @@ STEP_COLOURS = {
     "nominal": (80, 200, 110),
     "anchor": (90, 200, 255),
     "origin": (150, 150, 150),
+    "plane": (210, 170, 80),
 }
 """One colour per kind of thing, matching the PLY export where they overlap.
 
@@ -760,6 +761,84 @@ def _step_body(
     return None
 
 
+def _step_template(
+    step: StepFile,
+    project: Project,
+    template,
+    *,
+    part: bool,
+    scale: float,
+    shape: str,
+    mark: float,
+    depth: float,
+    anchors: bool,
+    faceted_limit: int,
+) -> object:
+    """One template as a node holding its body, its anchors and its optics.
+
+    The body goes in a product of its own rather than straight into this one,
+    so that what a CAD user replaces when a better model turns up is a single
+    leaf, and the transform that located it -- which is the measurement, and the
+    expensive part -- lives a level above and never moves.
+    """
+    name = template.name or template.id
+    comp = step.component(name)
+
+    if shape != "none":
+        mesh_path = project.resolve_mesh_path(template)
+        if mesh_path is not None and mesh_path.exists():
+            body = _step_body(
+                step,
+                name,
+                meshlib.load_mesh(mesh_path),
+                template.unit_scale * scale,
+                shape,
+                template.crease_angle,
+                faceted_limit,
+            )
+            if body is not None:
+                tessellated = shape == "tessellated"
+                leaf = step.component(
+                    f"{name}_body", [body], tessellated=tessellated
+                )
+                step.colour([body], STEP_COLOURS["part" if part else "object"])
+                # identity: the body is already in the model file's own frame,
+                # which is exactly what makes it swappable
+                step.place(comp, leaf, name=f"{name}_body")
+
+    if anchors:
+        marks: list[int] = []
+        for local in template.anchor_points().values():
+            marks.extend(step.cross(mark, local * scale))
+        if marks:
+            held = step.curve_set(marks, f"{name}_anchors")
+            leaf = step.component(f"{name}_anchors", [held])
+            step.colour([held], STEP_COLOURS["anchor"])
+            step.place(comp, leaf, name=f"{name}_anchors")
+
+    if template.optical is not None:
+        fov = template.optical.fov_deg or 50.0
+        half = depth * math.tan(math.radians(fov) / 2.0)
+        lines = _step_frustum(
+            half_x=half,
+            half_y=half * 0.75,
+            depth=depth,
+            center=np.array(template.optical.center, dtype=float)
+            * template.unit_scale
+            * scale,
+            axis=template.optical.forward,
+            up=template.optical.up,
+        )
+        held = step.curve_set(
+            [step.polyline(pts) for pts in lines], f"{name}_optical"
+        )
+        leaf = step.component(f"{name}_optical", [held])
+        step.colour([held], STEP_COLOURS["optical"])
+        step.place(comp, leaf, name=f"{name}_optical")
+
+    return comp
+
+
 def export_step(
     project: Project,
     out_path: str | Path,
@@ -769,6 +848,8 @@ def export_step(
     frustum: float | None = None,
     marker: float | None = None,
     nominals: bool = True,
+    planes: bool = True,
+    unplaced: bool = True,
     anchors: bool = True,
     origin: bool = True,
     label_limit: int = 400,
@@ -895,8 +976,16 @@ def export_step(
         )
 
     # -------------------------------------------------------- the CAD bodies
-    # one component per template, placed once per instance: ten identical
-    # cameras in an array share one mesh instead of carrying ten copies of it
+    # One product per template, placed once per instance, and the mesh itself
+    # one level further down in a product of its own.
+    #
+    # That extra level is the whole point of exporting an assembly rather than
+    # a bag of triangles. The body sits at the identity in the model file's own
+    # coordinates -- nothing is baked into world coordinates anywhere -- and the
+    # only thing standing between it and part space is one rigid transform on
+    # the occurrence above it. So a better CAD model of the same part, built on
+    # the same origin, drops straight in: replace the body node and the
+    # measured transform, the anchors and the optical frame are all untouched.
     built: dict[str, object] = {}
     for inst in instances:
         template = project.template_of(inst)
@@ -904,53 +993,18 @@ def export_step(
             continue
         comp = built.get(inst.template)
         if comp is None:
-            name = template.name or inst.template
-            body = None
-            if shape != "none":
-                mesh_path = project.resolve_mesh_path(template)
-                if mesh_path is not None and mesh_path.exists():
-                    body = _step_body(
-                        step,
-                        name,
-                        meshlib.load_mesh(mesh_path),
-                        template.unit_scale * scale,
-                        shape,
-                        template.crease_angle,
-                        faceted_limit,
-                    )
-            items = [] if body is None else [body]
-            tessellated = shape == "tessellated" and body is not None
-            comp = step.component(name, items, tessellated=tessellated)
-            if body is not None:
-                step.colour([body], STEP_COLOURS["part" if inst.is_part else "object"])
-
-            if anchors:
-                marks: list[int] = []
-                for local in template.anchor_points().values():
-                    marks.extend(step.cross(mark, local * scale))
-                if marks:
-                    held = step.curve_set(marks, f"{name}_anchors")
-                    comp.items.append(held)
-                    step.colour([held], STEP_COLOURS["anchor"])
-
-            if template.optical is not None:
-                fov = template.optical.fov_deg or 50.0
-                half = depth * math.tan(math.radians(fov) / 2.0)
-                lines = _step_frustum(
-                    half_x=half,
-                    half_y=half * 0.75,
-                    depth=depth,
-                    center=np.array(template.optical.center, dtype=float)
-                    * template.unit_scale
-                    * scale,
-                    axis=template.optical.forward,
-                    up=template.optical.up,
-                )
-                held = step.curve_set(
-                    [step.polyline(pts) for pts in lines], f"{name}_optical"
-                )
-                comp.items.append(held)
-                step.colour([held], STEP_COLOURS["optical"])
+            comp = _step_template(
+                step,
+                project,
+                template,
+                part=inst.is_part,
+                scale=scale,
+                shape=shape,
+                mark=mark,
+                depth=depth,
+                anchors=anchors,
+                faceted_limit=faceted_limit,
+            )
             built[inst.template] = comp
 
         label = inst.label or inst.id
@@ -961,6 +1015,54 @@ def export_step(
             inst.t * scale,
             name=f"{label} (part)" if inst.is_part else label,
         )
+
+    # Templates nobody has placed yet.
+    #
+    # They have no measured transform, so they go in at the identity and say so
+    # in their name. The alternative -- leaving them out -- is what makes an
+    # export of a project mid-way through marking look empty rather than
+    # unfinished, and it also denies you the thing the assembly is for: the
+    # model is in the file, in its own frame, ready to be dragged into place by
+    # hand or swapped for a better one.
+    if unplaced:
+        for tid, template in project.templates.items():
+            if tid in built:
+                continue
+            comp = _step_template(
+                step,
+                project,
+                template,
+                part=False,
+                scale=scale,
+                shape=shape,
+                mark=mark,
+                depth=depth,
+                anchors=anchors,
+                faceted_limit=faceted_limit,
+            )
+            built[tid] = comp
+            step.place(root, comp, name=f"{template.name or tid} (unplaced)")
+
+    # ---------------------------------------------------- reference surfaces
+    # Last, because they are the only thing in the file that was not measured:
+    # a datum is where the drawing says it is, and the whole use of putting one
+    # here is to dimension the measurement against it.
+    for plane in (project.reference_planes if planes else []):
+        name = plane.label or plane.describe(project.nominal_units)
+        # nominal units -> metres -> the file's units, the same chain a nominal
+        # takes, because a plane typed as "Z = 995" means the same 995 a point
+        # nominal does
+        origin_out = plane.origin() * project.nominal_scale * scale
+        half = (
+            plane.size * project.nominal_scale * scale
+            if plane.size is not None
+            else max(extent * 0.6, 1e-3)
+        )
+        u, _v, _n = plane.basis()
+        face = step.plane_face(origin_out, plane.unit_normal(), half, name, u=u)
+        comp = step.component(name, [face])
+        step.colour([face], STEP_COLOURS["plane"])
+        step.place(root, comp, name=name)
 
     out_path.write_text(step.dumps(), encoding="utf-8")
     return out_path

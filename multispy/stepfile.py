@@ -425,6 +425,44 @@ class StepFile:
         shell = self.add(f"CLOSED_SHELL('',{refs(faces)})")
         return self.add(f"FACETED_BREP({text(name)},#{shell})")
 
+    # ------------------------------------------------------ bounded surfaces
+
+    def plane_face(self, origin, normal, half: float, name: str = "", u=None) -> int:
+        """A square patch of plane, as a real surface rather than a drawn outline.
+
+        A reference surface has to be something a CAD user can select, dimension
+        to, offset from and project onto. Four lines in the shape of a rectangle
+        are none of those things, so this is a genuine ``FACE_SURFACE`` on a
+        ``PLANE``, wrapped in the open shell that makes it a surface model and
+        not a claim to be a solid.
+
+        The patch is finite because a STEP face must be; ``half`` is how far it
+        reaches from ``origin`` in each direction.
+        """
+        n = np.asarray(normal, dtype=float)
+        n = n / max(float(np.linalg.norm(n)), 1e-12)
+        if u is None:
+            seed = np.eye(3)[int(np.argmin(np.abs(n)))]
+        else:
+            seed = np.asarray(u, dtype=float)
+        u = seed - n * float(seed @ n)
+        u = u / max(float(np.linalg.norm(u)), 1e-12)
+        v = np.cross(n, u)
+        o = np.asarray(origin, dtype=float)
+
+        corners = [
+            o - u * half - v * half,
+            o + u * half - v * half,
+            o + u * half + v * half,
+            o - u * half + v * half,
+        ]
+        plane = self.add(f"PLANE({text(name)},#{self.axis(o, n, u)})")
+        loop = self.add("POLY_LOOP('',%s)" % refs([self.point(c) for c in corners]))
+        bound = self.add(f"FACE_OUTER_BOUND('',#{loop},.T.)")
+        face = self.add(f"FACE_SURFACE({text(name)},(#{bound}),#{plane},.T.)")
+        shell = self.add(f"OPEN_SHELL('',(#{face}))")
+        return self.add(f"SHELL_BASED_SURFACE_MODEL({text(name)},(#{shell}))")
+
     # ------------------------------------------------------------ structure
 
     def component(

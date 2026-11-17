@@ -17,7 +17,16 @@ import numpy as np
 from .dirgroup import DirectionGroup
 from .mesh import FEATURE_ANGLE_DEG
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
+"""Bumped from 3 when reference planes arrived.
+
+Additive fields have not bumped this before, and the reasoning was that an
+older build ignoring an unknown key is harmless. It is not harmless here,
+because the server autosaves: an older build would open a project carrying
+datum planes, drop them on the floor as an unknown key, and write them out of
+existence the next time anything touched the file. A refusal to open is a
+worse afternoon and a better outcome than losing the drawing's datums without
+being told."""
 """Version 2 adds object templates and instances. Version 3 adds the part
 instance and the per-image record of an edge refinement. Older files load
 unchanged -- they simply have none."""
@@ -274,6 +283,76 @@ class TiePoint:
             return False
         stated = [v is not None for v in self.nominal]
         return any(stated) and not all(stated)
+
+
+@dataclass
+class ReferencePlane:
+    """A datum surface, typed in from the drawing and carried into the CAD export.
+
+    Stated in part space and in the project's nominal units, because that is
+    the frame and those are the numbers a drawing's datums arrive in: "Z = 995"
+    is something somebody reads off a print, and a plane stored in metres would
+    make that a conversion done by hand every time it is typed or read back.
+
+    A plane is not evidence and never enters the solve. It is a surface the
+    measurement is *reported against* -- the thing a CAD user dimensions to
+    once the scene is open in front of them. That is why it carries no
+    tolerance and no residual: it states where a datum is, rather than claiming
+    to have found one.
+
+    ``normal`` and ``offset`` rather than three points on the surface, because
+    a datum on a drawing is a direction and a distance, and three points would
+    invite a plane that is nearly but not exactly the one that was meant.
+    """
+
+    id: str
+    label: str = ""
+    normal: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
+    """Plane normal in part space. Need not be unit length."""
+    offset: float = 0.0
+    """Signed distance from the origin along ``normal``, in nominal units."""
+    size: float | None = None
+    """Half-width of the square drawn for it, in nominal units.
+
+    A plane is infinite and a CAD file cannot hold an infinite face, so one gets
+    drawn at some size. ``None`` sizes it to the scene, which is right until
+    somebody wants a datum that visibly overhangs the part.
+    """
+
+    def unit_normal(self) -> np.ndarray:
+        n = np.array(self.normal, dtype=float)
+        length = float(np.linalg.norm(n))
+        if length < 1e-12:
+            return np.array([0.0, 0.0, 1.0])
+        return n / length
+
+    def origin(self) -> np.ndarray:
+        """The point on the plane closest to the origin, in nominal units."""
+        return self.unit_normal() * float(self.offset)
+
+    def basis(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``(u, v, n)``: two in-plane directions and the normal.
+
+        ``u`` is chosen against whichever world axis the normal leans on least,
+        so a plane normal to Z gets a sensible X-ish ``u`` rather than a
+        degenerate one.
+        """
+        n = self.unit_normal()
+        seed = np.eye(3)[int(np.argmin(np.abs(n)))]
+        u = seed - n * float(seed @ n)
+        u = u / max(float(np.linalg.norm(u)), 1e-12)
+        return u, np.cross(n, u), n
+
+    def describe(self, units: str = "mm") -> str:
+        """How the panel and the export name it, e.g. ``Z = 995 mm``."""
+        n = self.unit_normal()
+        for axis, name in enumerate("XYZ"):
+            if abs(abs(n[axis]) - 1.0) < 1e-9:
+                value = self.offset * (1.0 if n[axis] > 0 else -1.0)
+                return f"{name} = {value:g} {units}"
+        return (
+            f"n=({n[0]:.3f}, {n[1]:.3f}, {n[2]:.3f}) at {self.offset:g} {units}"
+        )
 
 
 @dataclass
@@ -668,6 +747,12 @@ class Project:
     of these, not hundreds."""
     templates: dict[str, ObjectTemplate] = field(default_factory=dict)
     instances: list[ObjectInstance] = field(default_factory=list)
+    reference_planes: list[ReferencePlane] = field(default_factory=list)
+    """Datum surfaces to carry into the CAD export. See :class:`ReferencePlane`.
+
+    A list rather than a dict, and for the same reason as ``direction_groups``:
+    there are a handful, the order is the order somebody made them in, and the
+    panel shows them that way."""
     settings: Settings = field(default_factory=Settings)
     nominal_units: str = "mm"
     """Units the point nominals are typed in. Drawings are rarely in metres."""
@@ -912,6 +997,13 @@ class Project:
             i += 1
         return f"tpl{i}"
 
+    def next_plane_id(self) -> str:
+        used = {p.id for p in self.reference_planes}
+        i = 0
+        while f"pl{i}" in used:
+            i += 1
+        return f"pl{i}"
+
     # -------------------------------------------------------- known objects
 
     def anchor_world_points(self) -> dict[str, np.ndarray]:
@@ -1114,6 +1206,7 @@ class Project:
             "nominal_scale": self.nominal_scale,
             "constraints": [asdict(c) for c in self.constraints],
             "direction_groups": [asdict(g) for g in self.direction_groups],
+            "reference_planes": [asdict(p) for p in self.reference_planes],
             "templates": {
                 tid: {
                     "id": t.id,
@@ -1306,6 +1399,17 @@ class Project:
                 inst.is_part = False
             seen_part = True
 
+        reference_planes = [
+            ReferencePlane(
+                id=raw.get("id") or f"pl{i}",
+                label=raw.get("label", ""),
+                normal=[float(v) for v in raw.get("normal", [0.0, 0.0, 1.0])],
+                offset=float(raw.get("offset", 0.0)),
+                size=None if raw.get("size") is None else float(raw["size"]),
+            )
+            for i, raw in enumerate(d.get("reference_planes", []))
+        ]
+
         project = cls(
             name=d.get("name", "untitled"),
             images=images,
@@ -1315,6 +1419,7 @@ class Project:
             direction_groups=direction_groups,
             templates=templates,
             instances=instances,
+            reference_planes=reference_planes,
             settings=settings,
             nominal_units=d.get("nominal_units", "mm"),
             nominal_scale=float(d.get("nominal_scale", 0.001)),

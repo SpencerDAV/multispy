@@ -3597,6 +3597,7 @@ function renderPanels() {
   renderPointsPanel();
   renderViewpointPanel();
   renderCadPanel();
+  renderPlanesPanel();
   renderConstraintsPanel();
   renderImageListPanel();
   updateHint();
@@ -5985,6 +5986,75 @@ function parseDirection(raw) {
   return len > 1e-9 ? nums.map((v) => v / len) : null;
 }
 
+/** Datum surfaces, typed in the units the drawing states them in.
+ *
+ *  These are the one thing in the project that is not evidence: nothing here
+ *  enters the solve, and a plane has no residual to report, because it states
+ *  where a datum *is* rather than claiming to have found one. It exists to be
+ *  dimensioned against once the scene is open in CAD, which is why the only
+ *  place it shows up is the 3D view and the STEP export.
+ */
+function renderPlanesPanel() {
+  const el = $('plpanel');
+  const planes = state.project.reference_planes || (state.project.reference_planes = []);
+  const units = state.project.nominal_units || 'mm';
+  $('plcount').textContent = planes.length ? `${planes.length}` : '';
+
+  let html = '<div class="cons"><ul>';
+  if (!planes.length) {
+    html += `<li style="color:var(--text-dim);font-style:italic">None. Add the drawing's `
+          + `datums and they come through the STEP export as real surfaces you can `
+          + `dimension to.</li>`;
+  }
+  planes.forEach((pl, i) => {
+    const n = pl.normal || [0, 0, 1];
+    const axis = AXIS_NAME.findIndex((_, a) => Math.abs(Math.abs(n[a]) - 1) < 1e-9);
+    const where = axis >= 0
+      ? `${AXIS_NAME[axis]} = ${+(pl.offset * (n[axis] < 0 ? -1 : 1)).toFixed(4)} ${units}`
+      : `n=(${n.map((v) => (+v).toFixed(2)).join(', ')}) at ${+(+pl.offset).toFixed(4)} ${units}`;
+    const label = pl.label ? `${escapeHtml(pl.label)} — ` : '';
+    html += `<li title="${escapeHtml(where)}"><span>${label}${where}</span>`
+          + `<button class="x-btn" data-pli="${i}">×</button></li>`;
+  });
+  html += '</ul>';
+
+  html += `<div style="display:flex;gap:4px;margin-top:7px;align-items:center">`
+        + `<input type="text" id="pl-name" placeholder="name" style="flex:1;min-width:0">`
+        + `<select id="pl-axis" style="width:52px">`
+        + AXIS_NAME.map((nm, a) => `<option value="${a}"${a === 2 ? ' selected' : ''}>${nm}</option>`).join('')
+        + `</select>`
+        + `<input type="number" id="pl-off" value="0" step="any" style="width:68px" title="offset in ${units}">`
+        + `<button class="smallbtn" id="pl-add">add</button></div>`;
+  html += `<div class="msg">Offsets are in ${units}, in part space — the same numbers `
+        + `you type for a point nominal.</div>`;
+  html += '</div>';
+  el.innerHTML = html;
+
+  for (const b of el.querySelectorAll('.x-btn')) {
+    b.onclick = () => {
+      planes.splice(+b.dataset.pli, 1);
+      markDirty(); renderPanels(); syncViewer();
+    };
+  }
+  const add = $('pl-add');
+  if (add) add.onclick = () => {
+    const axis = +$('pl-axis').value;
+    const normal = [0, 0, 0];
+    normal[axis] = 1;
+    const used = new Set(planes.map((p) => p.id));
+    let k = 0;
+    while (used.has(`pl${k}`)) k += 1;
+    planes.push({
+      id: `pl${k}`,
+      label: $('pl-name').value.trim(),
+      normal,
+      offset: parseFloat($('pl-off').value) || 0,
+      size: null,
+    });
+    markDirty(); renderPanels(); syncViewer();
+  };
+}
+
 function renderConstraintsPanel() {
   const el = $('conspanel');
   const pts = state.project.points;
@@ -6237,7 +6307,27 @@ function buildScene() {
                                label: `${fmtRadius(sph.radius)} ${sph.units}` };
   }
 
-  return { points, cameras, objects, center, extent, markScale, focus, origin };
+  /* Datum surfaces, converted out of the units they were typed in.
+   *
+   * The panel takes them in nominal units because that is what the drawing
+   * states; the viewer works in world metres like everything else here. Doing
+   * the conversion once, here, is what keeps a plane at "Z = 995" landing in
+   * the same place as a point nominal of 995. */
+  const nominalScale = state.project.nominal_scale || 0.001;
+  const planes = (state.project.reference_planes || []).map((pl) => {
+    const raw = pl.normal || [0, 0, 1];
+    const len = Math.hypot(raw[0], raw[1], raw[2]) || 1;
+    const n = raw.map((v) => v / len);
+    return {
+      id: pl.id,
+      label: pl.label || '',
+      normal: n,
+      origin: n.map((v) => v * (pl.offset || 0) * nominalScale),
+      size: pl.size != null ? pl.size * nominalScale : null,
+    };
+  });
+
+  return { points, cameras, objects, planes, center, extent, markScale, focus, origin };
 }
 
 /** In model mode the viewer works in the model's own units, so the scene it

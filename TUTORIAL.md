@@ -225,7 +225,10 @@ can eyeball the alignment immediately in 3D.
 
 `scene.step` is the one to hand to anybody who works in CAD: one assembly, in
 millimetres, with every camera, tie point and body a named node you can measure
-between. The **STEP** button beside Export writes just that file, which is
+between. Each body hangs under the transform that located it, so a better CAD
+model of the same part drops into the `_body` node without disturbing the
+measurement. Add your drawing's datums under **Reference planes** first and
+they come through as real surfaces to dimension against. The **STEP** button beside Export writes just that file, which is
 quicker when it is all you want. If it opens with the cameras there and the
 bodies missing, that CAD system does not read AP242 tessellated geometry —
 **shift-click STEP** for the wireframe instead (or `--step-shape wireframe`

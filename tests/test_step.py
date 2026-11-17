@@ -51,6 +51,7 @@ from multispy.project import (
     ObjectAnchor,
     ObjectInstance,
     ObjectTemplate,
+    ReferencePlane,
     OpticalFrame,
     Project,
     TiePoint,
@@ -304,6 +305,8 @@ ARITY = {
     "REPRESENTATION_RELATIONSHIP": 4,
     "REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION": 1,
     "SHAPE_REPRESENTATION_RELATIONSHIP": 0,
+    "OPEN_SHELL": 2,
+    "SHELL_BASED_SURFACE_MODEL": 2,
     "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION": 2,
     "COLOUR_RGB": 4,
     "DRAUGHTING_PRE_DEFINED_CURVE_FONT": 1,
@@ -836,8 +839,9 @@ def test_wireframe(model: Model, project: Project) -> list[str]:
         not model.of_type("TRIANGULATED_FACE") and not model.of_type("FACE_SURFACE"),
         "wireframe mode wrote face geometry",
     )
-    # a cube's twelve edges are all creases, so they must all be there
-    body = model.representation_items("widget")
+    # a cube's twelve edges are all creases, so they must all be there -- and
+    # they live in the body node now, not in the template that locates it
+    body = model.representation_items("widget_body")
     sets = [e for e in body if "GEOMETRIC_CURVE_SET" in e.parts]
     bad += check(bool(sets), "the body has no curve set in wireframe mode")
     if sets:
@@ -1031,10 +1035,227 @@ def test_missing_mesh_still_places_the_body(root: Path) -> list[str]:
         "array_camera" in model.products(),
         "a body with no mesh file lost its node",
     )
-    items = model.representation_items("array_camera")
+    kept = [
+        name
+        for name in ("array_camera_anchors", "array_camera_optical")
+        if name in model.products()
+    ]
     bad += check(
-        any("GEOMETRIC_CURVE_SET" in e.parts for e in items),
+        bool(kept),
         "a body with no mesh kept neither its anchors nor its optical frame",
+    )
+    bad += check(
+        "array_camera_body" not in model.products(),
+        "a template with no mesh file still produced a body node",
+    )
+    return bad
+
+
+def test_bodies_are_swappable(model: Model, project: Project) -> list[str]:
+    """A body is a leaf of its own, under the transform that located it.
+
+    This is the structure the export exists for. The mesh sits at the identity
+    in the model file's own coordinates, and the one thing between it and part
+    space is a rigid transform on the node above. Flatten those two together
+    and replacing a CAD model with a better one of the same part means
+    rebuilding the placement by hand -- which is the measurement, and the only
+    expensive thing in the file.
+    """
+    bad: list[str] = []
+    placed = model.placements()
+    products = model.products()
+
+    for template in ("widget", "array_camera"):
+        body = f"{template}_body"
+        bad += check(body in products, f"{body} is not a product of its own")
+        bad += check(body in placed, f"{body} is not placed under its template")
+        if body not in placed:
+            continue
+        R, t = placed[body]
+        # identity, or the geometry is not in the model's own frame any more
+        bad += check(
+            np.allclose(R, np.eye(3), atol=1e-12) and np.allclose(t, 0.0, atol=1e-12),
+            f"{body} sits at {t} rather than at its model origin",
+        )
+        # and the body node holds geometry while the node above holds none
+        items = model.representation_items(template)
+        geometry = [
+            e
+            for e in items
+            if any(
+                k in e.parts
+                for k in (
+                    "TESSELLATED_SHELL",
+                    "FACETED_BREP",
+                    "GEOMETRIC_CURVE_SET",
+                    "SHELL_BASED_SURFACE_MODEL",
+                )
+            )
+        ]
+        bad += check(
+            not geometry,
+            f"{template} carries geometry itself; it should only carry its children",
+        )
+
+    # the mesh is in model-local coordinates, so a 40 mm cube is still 40 mm
+    # wide inside its body node however its instance was rotated
+    for entity in model.of_type("COORDINATES_LIST"):
+        pts = np.array(entity.parts["COORDINATES_LIST"][2], dtype=float)
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        bad += check(
+            np.allclose(lo, 0.0, atol=1e-6) and np.allclose(hi, 40.0, atol=1e-6),
+            f"#{entity.id} spans {lo}..{hi}; the cube is no longer in its own frame",
+        )
+    return bad
+
+
+def test_unplaced_templates(root: Path) -> list[str]:
+    """A template nobody has placed is still in the file, and says so."""
+    project = build_scene(root)
+    project.templates["spare"] = ObjectTemplate(
+        id="spare",
+        name="spare_bracket",
+        mesh_path="models/cube.obj",
+        units="mm",
+        unit_scale=0.001,
+    )
+    out = export.export_step(project, root / "unplaced.step")
+    model = Model(out)
+    placed = model.placements()
+    bad = check(
+        "spare_bracket (unplaced)" in placed,
+        f"an unplaced template is missing from the tree: {sorted(placed)}",
+    )
+    if "spare_bracket (unplaced)" in placed:
+        R, t = placed["spare_bracket (unplaced)"]
+        bad += check(
+            np.allclose(R, np.eye(3)) and np.allclose(t, 0.0),
+            "an unplaced template was given a pose it has not got",
+        )
+    bad += check(
+        "spare_bracket_body" in model.products(),
+        "an unplaced template brought no body with it",
+    )
+
+    # and it can be turned off, for a file that states only what was measured
+    strict = Model(export.export_step(project, root / "strict.step", unplaced=False))
+    bad += check(
+        not any("unplaced" in name for name in strict.placements()),
+        "unplaced=False still wrote unplaced templates",
+    )
+    return bad
+
+
+def test_reference_planes(root: Path) -> list[str]:
+    """Datums come through as real planar surfaces, where the drawing puts them."""
+    project = build_scene(root)
+    project.reference_planes = [
+        ReferencePlane(id="pl0", label="datum A", normal=[0, 0, 1], offset=995.0),
+        ReferencePlane(id="pl1", label="datum B", normal=[1, 0, 0], offset=1510.0, size=400.0),
+        ReferencePlane(id="pl2", normal=[1, 1, 0], offset=100.0, size=50.0),
+    ]
+    out = export.export_step(project, root / "planes.step")
+    model = Model(out)
+    bad: list[str] = []
+
+    faces = model.of_type("SHELL_BASED_SURFACE_MODEL")
+    bad += check(
+        len(faces) == 3, f"expected 3 reference surfaces, found {len(faces)}"
+    )
+    products = model.products()
+    for name in ("datum A", "datum B"):
+        bad += check(name in products, f"{name} is not a named product")
+
+    # the unnamed one falls back to stating itself
+    bad += check(
+        any("=" in name or "n=" in name for name in products),
+        "a plane with no label did not fall back to describing itself",
+    )
+
+    # geometry: nominal units (mm here) land on the same numbers as a nominal
+    by_name = {}
+    for entity in model.of_type("PLANE"):
+        R, origin = model.placement(entity.parts["PLANE"][1])
+        by_name[entity.parts["PLANE"][0]] = (R[:, 2], origin)
+
+    for name, normal, point in (
+        ("datum A", [0, 0, 1], [0, 0, 995]),
+        ("datum B", [1, 0, 0], [1510, 0, 0]),
+    ):
+        if name not in by_name:
+            bad.append(f"{name} has no PLANE surface")
+            continue
+        n, o = by_name[name]
+        bad += check(np.allclose(n, normal, atol=1e-9), f"{name} normal is {n}")
+        bad += check(
+            abs(float((o - np.array(point, dtype=float)) @ np.array(normal, dtype=float)))
+            < 1e-6,
+            f"{name} passes through {o}, not {point}",
+        )
+
+    # a bounded face, or there is nothing for CAD to select
+    for entity in model.of_type("FACE_OUTER_BOUND"):
+        loop = model.deref(entity.parts["FACE_OUTER_BOUND"][1])
+        if "POLY_LOOP" not in loop.parts:
+            continue
+        verts = loop.parts["POLY_LOOP"][1]
+        if len(verts) == 4:
+            break
+    else:
+        bad.append("no four-cornered face bound; the planes are not patches")
+
+    # size: the one given 400 must measure 800 across
+    sized = None
+    for entity in model.of_type("FACE_SURFACE"):
+        if entity.parts["FACE_SURFACE"][0] != "datum B":
+            continue
+        bound = model.deref(entity.parts["FACE_SURFACE"][1][0])
+        loop = model.deref(bound.parts["FACE_OUTER_BOUND"][1])
+        pts = np.array([model.point(v) for v in loop.parts["POLY_LOOP"][1]])
+        sized = float(np.max(pts.max(axis=0) - pts.min(axis=0)))
+    bad += check(
+        sized is not None and abs(sized - 800.0) < 1e-6,
+        f"datum B measures {sized} across, expected 800",
+    )
+
+    # and they can be left out
+    without = Model(export.export_step(project, root / "noplanes.step", planes=False))
+    bad += check(
+        not without.of_type("SHELL_BASED_SURFACE_MODEL"),
+        "planes=False still wrote reference surfaces",
+    )
+    return bad
+
+
+def test_planes_round_trip(root: Path) -> list[str]:
+    """A plane survives the project file, which is where the UI leaves it."""
+    project = build_scene(root)
+    project.reference_planes = [
+        ReferencePlane(id="pl0", label="datum A", normal=[0, 0, 1], offset=995.0),
+        ReferencePlane(id="pl1", label="", normal=[0, 1, 0], offset=-612.5, size=250.0),
+    ]
+    back = Project.from_dict(project.to_dict())
+    bad = check(
+        len(back.reference_planes) == 2,
+        f"{len(back.reference_planes)} planes survived the file, expected 2",
+    )
+    for before, after in zip(project.reference_planes, back.reference_planes):
+        bad += check(
+            (before.id, before.label, before.offset, before.size)
+            == (after.id, after.label, after.offset, after.size),
+            f"{before.id} came back as {after}",
+        )
+        bad += check(
+            np.allclose(before.unit_normal(), after.unit_normal()),
+            f"{before.id} changed direction in the file",
+        )
+    bad += check(
+        back.reference_planes[0].describe("mm") == "Z = 995 mm",
+        f"describe() says {back.reference_planes[0].describe('mm')!r}",
+    )
+    bad += check(
+        back.next_plane_id() == "pl2",
+        f"next_plane_id gave {back.next_plane_id()}, which collides",
     )
     return bad
 
@@ -1114,8 +1335,15 @@ def test_optical_frame(root: Path) -> list[str]:
     project = build_scene(root)
     out = export.export_step(project, root / "optical.step")
     model = Model(out)
-    items = model.representation_items("array_camera")
-    sets = [e for e in items if "GEOMETRIC_CURVE_SET" in e.parts]
+    sets = []
+    for node in ("array_camera_anchors", "array_camera_optical"):
+        if node not in model.products():
+            continue
+        sets += [
+            e
+            for e in model.representation_items(node)
+            if "GEOMETRIC_CURVE_SET" in e.parts
+        ]
     bad = check(
         len(sets) == 2,
         f"expected an anchor set and an optical set, found {len(sets)}",
@@ -1156,6 +1384,7 @@ def main() -> int:
             ("assembly tree", test_tree(model, project, "mm")),
             ("shared templates", test_templates_are_shared(model, project)),
             ("tessellated mesh", test_tessellated_mesh(model, project)),
+            ("bodies are swappable", test_bodies_are_swappable(model, project)),
             ("mesh in file units", test_mesh_is_in_file_units(model, project, "mm")),
             ("colours", test_colours(model, project)),
             ("units", test_units(model, "mm")),
@@ -1229,6 +1458,9 @@ def main() -> int:
             ("a missing mesh file", test_missing_mesh_still_places_the_body(root)),
             ("optical frame", test_optical_frame(root)),
             ("the front end's two routes", test_front_end_paths(root)),
+            ("unplaced templates", test_unplaced_templates(root)),
+            ("reference planes", test_reference_planes(root)),
+            ("planes survive the file", test_planes_round_trip(root)),
         ):
             print(f"  {'ok  ' if not result else 'FAIL'} {name}")
             failures += result

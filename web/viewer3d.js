@@ -40,6 +40,7 @@ const Viewer3D = (() => {
     optical: '#ffd24a',
     anchor: '#4dd0e1',
     anchorPicked: '#ffd24a',
+    plane: '#d2aa50',
     corner: '#8891a0',
     centre: '#8ee06a',
     virtual: '#c89bff',
@@ -469,7 +470,49 @@ const Viewer3D = (() => {
     if (state.hooks.onViewChange) state.hooks.onViewChange();
   }
 
+  /* Reference planes: an outline, a cross through it and a stub along the
+   * normal.
+   *
+   * The stub is there because an outline alone is ambiguous about which way a
+   * plane faces, and in CAD the answer decides which side an offset lands on.
+   * The cross is there because a square seen edge-on is a line, and without
+   * something inside it you cannot tell a plane you are looking along from one
+   * that failed to draw. */
+  function drawPlanes(ctx, P, planes, extent) {
+    for (const pl of planes || []) {
+      const n = pl.normal;
+      const k = Math.abs(n[0]) <= Math.abs(n[1]) && Math.abs(n[0]) <= Math.abs(n[2])
+        ? 0 : (Math.abs(n[1]) <= Math.abs(n[2]) ? 1 : 2);
+      const seed = [0, 0, 0];
+      seed[k] = 1;
+      const d = seed[0] * n[0] + seed[1] * n[1] + seed[2] * n[2];
+      let u = [seed[0] - n[0] * d, seed[1] - n[1] * d, seed[2] - n[2] * d];
+      const ul = Math.hypot(u[0], u[1], u[2]) || 1;
+      u = u.map((v) => v / ul);
+      const v = [
+        n[1] * u[2] - n[2] * u[1],
+        n[2] * u[0] - n[0] * u[2],
+        n[0] * u[1] - n[1] * u[0],
+      ];
+      const h = pl.size != null ? pl.size : Math.max(extent * 0.6, 1e-6);
+      const at = (a, b) => [0, 1, 2].map((i) => pl.origin[i] + u[i] * a + v[i] * b);
+      const verts = [at(-h, -h), at(h, -h), at(h, h), at(-h, h),
+                     at(-h, 0), at(h, 0), at(0, -h), at(0, h),
+                     pl.origin, [0, 1, 2].map((i) => pl.origin[i] + n[i] * h * 0.25)];
+      drawEdges(ctx, P, verts,
+        [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [6, 7], [8, 9]],
+        COLOR.plane, 1.1);
+      const s = P.project(pl.origin);
+      if (s && pl.label) {
+        ctx.fillStyle = COLOR.plane;
+        ctx.font = '11px sans-serif';
+        ctx.fillText(pl.label, s.x + 6, s.y - 6);
+      }
+    }
+  }
+
   function renderScene(ctx, P, scene, extent) {
+    drawPlanes(ctx, P, scene.planes, extent);
     drawPoints(ctx, P, scene.points || [], COLOR.point, 2);
 
     /* Glyphs are sized from how far apart the marks are, not from the scene
