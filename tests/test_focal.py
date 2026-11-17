@@ -308,13 +308,28 @@ def test_the_bound_is_a_setting_and_says_so():
     # free to sit outside the tighter one it would otherwise have been held to
     tight, true, _rep, _p = solved_focal(1.5, "scattered", seed=2)
     wide, _true, _rep2, _p2 = solved_focal(6.0, "scattered", seed=2)
+
+    # What the window promises, and all it promises: the focal it returns is
+    # inside the window it was given. That is deterministic, because it is a
+    # clamp and not an outcome.
     assert true / 1.5 - 1e-6 <= tight <= true * 1.5 + 1e-6, (tight, true)
-    assert not (true / 1.5 <= wide <= true * 1.5), (
-        "with a 6x window this scene is expected to leave the 1.5x one; if it no "
-        "longer does, the wall is not what was holding it",
-        wide,
-        true,
-    )
+    assert true / 6.0 - 1e-6 <= wide <= true * 6.0 + 1e-6, (wide, true)
+
+    # This used to assert that the 6x run *left* the 1.5x window, on the reasoning
+    # that otherwise the wall was not what had been holding it. That contradicted
+    # the paragraph above -- "a wider setting is not asserted to produce a worse
+    # answer" -- and it was an assertion about where an optimiser lands, which is
+    # not a property of this code. It passed on Windows and failed on Linux CI at
+    # 1916.9 px against a true 2100, comfortably inside the tighter window: a
+    # different scipy found a better answer without needing the wall, which is
+    # good news being reported as a regression.
+    #
+    # That the wall is load-bearing is already established, and established far
+    # more sharply, by test_a_mismarked_body_cannot_collapse_the_focal: it sets
+    # focal_bound_factor to 0 and watches the focal collapse to single digits. So
+    # nothing is lost here beyond a false alarm, and no replacement assertion is
+    # put in its place: there is nothing true to say about where the wide run
+    # lands, and a tautology dressed as a check is worse than an honest absence.
 
 
 def main() -> int:
