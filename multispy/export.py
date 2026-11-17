@@ -4,6 +4,11 @@ The solve is only useful if it lands somewhere, so the outputs deliberately
 target the tools already in the pipeline: a COLMAP sparse model (which Meshroom,
 GLOMAP and ``ns-process-data`` all read), a Blender scene script, a nerfstudio
 ``transforms.json``, and a PLY of the tie points for a quick sanity look.
+
+:func:`export_step` is the odd one out and the one a measurement job ends on: a
+single STEP assembly holding the whole scene -- cameras, tie points, drawing
+nominals and every placed CAD body, in the part's own frame and in millimetres
+-- for a CAD seat rather than a reconstruction tool.
 """
 
 from __future__ import annotations
@@ -14,8 +19,10 @@ from pathlib import Path
 
 import numpy as np
 
+from . import mesh as meshlib
 from .geometry import Intrinsics, project as project_points
-from .project import Project
+from .project import UNIT_SCALES, Project
+from .stepfile import STEP_UNITS, StepFile
 
 # CV camera (x right, y down, z forward) -> OpenGL/Blender camera (x right, y up, z back)
 CV_TO_GL = np.diag([1.0, -1.0, -1.0])
@@ -601,4 +608,359 @@ def export_ply(project: Project, out_path: str | Path, include_cameras: bool = T
         fh.write("end_header\n")
         for xyz, rgb in verts:
             fh.write(f"{xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f} {rgb[0]} {rgb[1]} {rgb[2]}\n")
+    return out_path
+
+
+# --------------------------------------------------------------------------
+# STEP: the whole scene in one CAD file
+# --------------------------------------------------------------------------
+
+STEP_SHAPES = ("tessellated", "wireframe", "brep", "none")
+"""How a placed CAD body is carried into the file.
+
+``tessellated``
+    Every triangle, as one AP242 ``TESSELLATED_SHELL``. Two entities for a
+    whole body, so a 180,000-triangle casting is a few megabytes rather than a
+    few hundred. Needs a reader that does AP242 tessellated geometry:
+    OpenCASCADE 7.5+ (FreeCAD and most viewers), NX, CATIA, Creo.
+``wireframe``
+    The body's feature edges as polylines -- the same edges MultiSpy draws over
+    a photograph. Tiny, and read by everything back to AP203, at the cost of
+    having no faces to snap or section. The fallback when ``tessellated`` opens
+    empty.
+``brep``
+    A real faceted solid, one planar face per triangle. Universally read and
+    properly solid, but about nine entities per triangle, so it is capped and
+    is only sensible for a machined part rather than a scanned one.
+``none``
+    Placements only: the tree, the poses, the cameras and the points, with no
+    body geometry at all.
+"""
+
+STEP_COLOURS = {
+    "part": (170, 175, 180),
+    "object": (120, 160, 200),
+    "camera": (255, 90, 60),
+    "optical": (255, 215, 60),
+    "point": (240, 240, 240),
+    "nominal": (80, 200, 110),
+    "anchor": (90, 200, 255),
+    "origin": (150, 150, 150),
+}
+"""One colour per kind of thing, matching the PLY export where they overlap.
+
+Colour is not decoration here. A scene holding solved points, the drawing's
+nominals for those same points, camera frustums and the part is four kinds of
+claim in one file, and in a CAD tree they are otherwise four identical shades
+of grey."""
+
+STEP_FACETED_LIMIT = 40000
+"""Triangles past which ``shape="brep"`` refuses rather than writes.
+
+Forty thousand triangles is roughly a third of a million entities and some
+twenty megabytes, which is already slow to open. Past that the honest answer is
+that faceted B-rep is the wrong carrier, not that the export needs patience."""
+
+
+def _step_frustum(
+    half_x: float, half_y: float, depth: float, center=(0.0, 0.0, 0.0), axis=None, up=None
+) -> list[list[np.ndarray]]:
+    """Polyline point-lists for a camera frustum, in the camera's own frame.
+
+    Four rays from the pupil to the corners of the image, the rectangle they
+    land on, and a notch on the top edge -- without which a frustum drawn in a
+    CAD viewer is a symmetric pyramid that gives away nothing about roll.
+    """
+    c = np.asarray(center, dtype=float)
+    z = np.array([0.0, 0.0, 1.0]) if axis is None else np.asarray(axis, dtype=float)
+    z = z / max(float(np.linalg.norm(z)), 1e-12)
+    y = np.array([0.0, -1.0, 0.0]) if up is None else np.asarray(up, dtype=float)
+    y = y - z * float(y @ z)
+    if np.linalg.norm(y) < 1e-9:
+        fallback = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        y = fallback - z * float(fallback @ z)
+    y = y / max(float(np.linalg.norm(y)), 1e-12)
+    x = np.cross(y, z)
+
+    corners = [
+        c + z * depth + x * sx * half_x + y * sy * half_y
+        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1))
+    ]
+    lines = [[c, corner] for corner in corners]
+    lines.append([*corners, corners[0]])
+    # the notch sits on the -y edge, i.e. the top of the image
+    mid = (corners[0] + corners[1]) / 2.0
+    peak = mid - y * half_y * 0.5
+    lines.append([corners[0], peak, corners[1]])
+    return lines
+
+
+def _step_point_group(
+    step: StepFile,
+    root,
+    entries: list[tuple[str, np.ndarray]],
+    size: float,
+    colour: tuple[int, int, int],
+    lumped_name: str,
+    label_limit: int,
+) -> None:
+    """Marked positions, either one named node each or one lumped node.
+
+    One product per point is what makes the CAD tree list ``p4`` beside the
+    part, which is the whole reason a metrology scene is worth exporting; it
+    also costs a dozen entities each, so a dense cloud is lumped instead of
+    turning a tree into a scrolling list.
+    """
+    if not entries:
+        return
+    if len(entries) <= label_limit:
+        for name, xyz in entries:
+            marks = step.cross(size)
+            items = [*marks, step.point((0.0, 0.0, 0.0))]
+            comp = step.component(name, [step.curve_set(items, name)])
+            step.colour(comp.items[1:], colour)
+            step.place(root, comp, np.eye(3), xyz)
+        return
+    items: list[int] = []
+    for _name, xyz in entries:
+        items.extend(step.cross(size, xyz))
+        items.append(step.point(xyz))
+    comp = step.component(lumped_name, [step.curve_set(items, lumped_name)])
+    step.colour(comp.items[1:], colour)
+    step.place(root, comp)
+
+
+def _step_body(
+    step: StepFile,
+    name: str,
+    mesh,
+    scale: float,
+    shape: str,
+    crease_angle: float,
+    faceted_limit: int,
+) -> int | None:
+    """One template's geometry as a single representation item, in file units."""
+    verts = mesh.vertices * scale
+    if shape == "tessellated":
+        return step.mesh_tessellated(verts, mesh.faces, name)
+    if shape == "brep":
+        if mesh.n_faces > faceted_limit:
+            raise ValueError(
+                f"{name} has {mesh.n_faces} triangles, past the {faceted_limit} a "
+                "faceted B-rep can carry sensibly -- export it with "
+                'shape="tessellated" (AP242) or shape="wireframe" instead'
+            )
+        return step.mesh_faceted(verts, mesh.faces, name)
+    if shape == "wireframe":
+        edges = mesh.feature_edges(crease_angle)
+        if not len(edges):
+            return None
+        lines = [step.polyline([verts[a], verts[b]]) for a, b in edges]
+        return step.curve_set(lines, name)
+    return None
+
+
+def export_step(
+    project: Project,
+    out_path: str | Path,
+    *,
+    shape: str = "tessellated",
+    units: str = "mm",
+    frustum: float | None = None,
+    marker: float | None = None,
+    nominals: bool = True,
+    anchors: bool = True,
+    origin: bool = True,
+    label_limit: int = 400,
+    faceted_limit: int = STEP_FACETED_LIMIT,
+) -> Path:
+    """The whole solved scene as one STEP assembly.
+
+    Cameras, tie points, the drawing's nominals and every placed CAD body in a
+    single file, in one coordinate system, each a named node in the assembly
+    tree. The other exporters each answer one tool -- COLMAP for the
+    reconstruction chain, a script for Blender, ``transforms.json`` for
+    nerfstudio. This one answers the question a metrology job actually ends on:
+    show me where the cameras were relative to the part, in the part's own
+    frame, in something a CAD seat can open.
+
+    The file is written in ``units`` (millimetres by default, which is what a
+    drawing is dimensioned in) while the scene is solved in metres, so every
+    coordinate is converted on the way out and the STEP unit context says so.
+    Coordinates are the scene's own: once the point nominals have put the solve
+    into part space, that is the part's frame and the part sits at the origin
+    by definition -- which is exactly what makes the export comparable with the
+    drawing rather than merely pretty.
+
+    ``shape`` picks how bodies are carried; see :data:`STEP_SHAPES`, and reach
+    for ``"wireframe"`` if a CAD system opens the default with the cameras
+    present and the bodies missing.
+    """
+    if shape not in STEP_SHAPES:
+        raise ValueError(f"shape must be one of {STEP_SHAPES}, not {shape!r}")
+    if units not in STEP_UNITS:
+        raise ValueError(f"units must be one of {list(STEP_UNITS)}, not {units!r}")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    images = _solved_images(project)
+    points = [p for p in project.points if p.xyz is not None]
+    instances = project.placed_instances()
+    if not images and not points and not instances:
+        raise ValueError("nothing solved yet")
+
+    # metres (the scene) -> the file's units (a drawing's)
+    scale = 1.0 / UNIT_SCALES[units]
+
+    # everything that is somewhere, so markers and frustums can be sized
+    # against the scene instead of against a guess
+    spread: list[np.ndarray] = [p.xyz for p in points]
+    spread += [im.center() for im in images if im.center() is not None]
+    for inst in instances:
+        template = project.template_of(inst)
+        if template is None:
+            continue
+        spread.append(inst.t)
+        for local in template.anchor_points().values():
+            spread.append(inst.R @ local + inst.t)
+    if len(spread) > 1:
+        extent = float(np.linalg.norm(np.ptp(np.array(spread), axis=0)))
+    else:
+        extent = 1.0
+    extent = max(extent, 1e-3) * scale
+    mark = marker * scale if marker is not None else max(extent * 0.012, 1e-3)
+    depth = frustum * scale if frustum is not None else max(extent * 0.15, 1e-3)
+
+    step = StepFile(
+        out_path.name,
+        schema="ap242" if shape == "tessellated" else "ap214",
+        units=units,
+        description=f"MultiSpy scene: {project.name}",
+    )
+    root = step.component(f"MultiSpy_{project.name}")
+
+    if origin:
+        triad = [
+            step.polyline([(0.0, 0.0, 0.0), tuple(d * depth * 0.5 for d in axis)])
+            for axis in ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+        ]
+        comp = step.component("MS_Origin", [step.curve_set(triad, "MS_Origin")])
+        step.colour(comp.items[1:], STEP_COLOURS["origin"])
+        step.place(root, comp)
+
+    # ----------------------------------------------------------- the photos
+    for im in images:
+        cam = _intrinsics_for(project, im)
+        name = f"cam_{Path(im.path).stem}"
+        lines = _step_frustum(
+            half_x=depth * im.width / (2.0 * cam.f),
+            half_y=depth * im.height / (2.0 * cam.f),
+            depth=depth,
+        )
+        items = [step.polyline(pts) for pts in lines]
+        comp = step.component(name, [step.curve_set(items, name)])
+        step.colour(comp.items[1:], STEP_COLOURS["camera"])
+        # camera-to-world: the local frame is the CV camera frame, x right,
+        # y down, z along the optical axis, so the frustum needs no flipping
+        step.place(root, comp, im.R.T, im.center() * scale)
+
+    # ------------------------------------------------- points, and nominals
+    _step_point_group(
+        step,
+        root,
+        [(p.label or p.id, p.xyz * scale) for p in points],
+        mark,
+        STEP_COLOURS["point"],
+        "MS_TiePoints",
+        label_limit,
+    )
+    if nominals:
+        stated = [
+            (
+                f"{p.label or p.id}_nominal",
+                np.array(p.nominal, dtype=float) * project.nominal_scale * scale,
+            )
+            for p in project.points
+            if p.nominal and len(p.nominal) == 3 and all(v is not None for v in p.nominal)
+        ]
+        _step_point_group(
+            step,
+            root,
+            stated,
+            mark,
+            STEP_COLOURS["nominal"],
+            "MS_Nominals",
+            label_limit,
+        )
+
+    # -------------------------------------------------------- the CAD bodies
+    # one component per template, placed once per instance: ten identical
+    # cameras in an array share one mesh instead of carrying ten copies of it
+    built: dict[str, object] = {}
+    for inst in instances:
+        template = project.template_of(inst)
+        if template is None:
+            continue
+        comp = built.get(inst.template)
+        if comp is None:
+            name = template.name or inst.template
+            body = None
+            if shape != "none":
+                mesh_path = project.resolve_mesh_path(template)
+                if mesh_path is not None and mesh_path.exists():
+                    body = _step_body(
+                        step,
+                        name,
+                        meshlib.load_mesh(mesh_path),
+                        template.unit_scale * scale,
+                        shape,
+                        template.crease_angle,
+                        faceted_limit,
+                    )
+            items = [] if body is None else [body]
+            tessellated = shape == "tessellated" and body is not None
+            comp = step.component(name, items, tessellated=tessellated)
+            if body is not None:
+                step.colour([body], STEP_COLOURS["part" if inst.is_part else "object"])
+
+            if anchors:
+                marks: list[int] = []
+                for local in template.anchor_points().values():
+                    marks.extend(step.cross(mark, local * scale))
+                if marks:
+                    held = step.curve_set(marks, f"{name}_anchors")
+                    comp.items.append(held)
+                    step.colour([held], STEP_COLOURS["anchor"])
+
+            if template.optical is not None:
+                fov = template.optical.fov_deg or 50.0
+                half = depth * math.tan(math.radians(fov) / 2.0)
+                lines = _step_frustum(
+                    half_x=half,
+                    half_y=half * 0.75,
+                    depth=depth,
+                    center=np.array(template.optical.center, dtype=float)
+                    * template.unit_scale
+                    * scale,
+                    axis=template.optical.forward,
+                    up=template.optical.up,
+                )
+                held = step.curve_set(
+                    [step.polyline(pts) for pts in lines], f"{name}_optical"
+                )
+                comp.items.append(held)
+                step.colour([held], STEP_COLOURS["optical"])
+            built[inst.template] = comp
+
+        label = inst.label or inst.id
+        step.place(
+            root,
+            comp,
+            inst.R,
+            inst.t * scale,
+            name=f"{label} (part)" if inst.is_part else label,
+        )
+
+    out_path.write_text(step.dumps(), encoding="utf-8")
     return out_path

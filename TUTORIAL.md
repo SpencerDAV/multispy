@@ -218,9 +218,16 @@ Press **Export**. Next to the project you get:
 | `export/import_cameras.py` | Blender script; run it via Scripting → Open → Run Script |
 | `export/transforms.json` | nerfstudio / instant-ngp |
 | `export/tiepoints.ply` | quick look in MeshLab or CloudCompare |
+| `export/scene.step` | the whole scene — cameras, points, nominals and CAD bodies — for a CAD seat |
 
 The Blender script wires each photo up as its camera's background image, so you
 can eyeball the alignment immediately in 3D.
+
+`scene.step` is the one to hand to anybody who works in CAD: one assembly, in
+millimetres, with every camera, tie point and body a named node you can measure
+between. If it opens with the cameras there and the bodies missing, that CAD
+system does not read AP242 tessellated geometry — re-export from the command
+line with `--step-shape wireframe`.
 
 **You have now done the whole job.** Everything below is either a stronger way to
 do it, or how to recover when it goes wrong.
@@ -529,6 +536,8 @@ Two failure modes worth recognising before you shoot:
 .venv\Scripts\python.exe -m multispy                       open the UI
 .venv\Scripts\python.exe -m multispy solve   <project>     solve, print the report
 .venv\Scripts\python.exe -m multispy export  <project>     write the exports
+  --step-shape tessellated|wireframe|brep|none             how scene.step carries CAD bodies
+  --step-units mm|cm|m|in|ft                               units scene.step is written in
 .venv\Scripts\python.exe -m multispy rig     <project>     print the object layout
 .venv\Scripts\python.exe -m multispy exif    <project>     what the photos claim
 ```

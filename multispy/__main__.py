@@ -126,6 +126,22 @@ def main(argv: list[str] | None = None) -> int:
     p_export = sub.add_parser("export", help="export a solved project")
     p_export.add_argument("project")
     p_export.add_argument("out_dir", nargs="?", default=None)
+    p_export.add_argument(
+        "--step-shape",
+        choices=exporters.STEP_SHAPES,
+        default="tessellated",
+        help=(
+            "how the STEP export carries CAD bodies: tessellated (AP242, every "
+            "triangle, compact), wireframe (feature edges, opens anywhere), brep "
+            "(faceted solid, small parts only), none (placements only)"
+        ),
+    )
+    p_export.add_argument(
+        "--step-units",
+        choices=exporters.STEP_UNITS,
+        default="mm",
+        help="units the STEP file is written in (default mm)",
+    )
 
     p_exif = sub.add_parser("exif", help="show what EXIF says about focal length")
     p_exif.add_argument("project")
@@ -222,6 +238,14 @@ def main(argv: list[str] | None = None) -> int:
     print(exporters.export_blender(project, out_dir / "import_cameras.py"))
     print(exporters.export_transforms_json(project, out_dir / "transforms.json"))
     print(exporters.export_ply(project, out_dir / "tiepoints.ply"))
+    print(
+        exporters.export_step(
+            project,
+            out_dir / "scene.step",
+            shape=args.step_shape,
+            units=args.step_units,
+        )
+    )
     if project.placed_instances():
         print(exporters.export_rig(project, out_dir / "rig.json"))
         print(exporters.export_rig_csv(project, out_dir / "rig.csv"))

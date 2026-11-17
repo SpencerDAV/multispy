@@ -914,6 +914,7 @@ is otherwise invisible.
 | `export/import_cameras.py` | Blender script. Builds the cameras with each photo wired up as that camera's background image, and imports every placed object's CAD model at its solved pose, with a camera object for each declared optical frame. Run via Scripting → Open → Run Script. |
 | `export/transforms.json` | nerfstudio / instant-ngp. |
 | `export/tiepoints.ply` | Tie points, camera centres and object anchors, each in its own colour, for a quick look in MeshLab or CloudCompare. |
+| `export/scene.step` | **The whole scene as one STEP assembly** — see below. |
 | `export/rig.json` | Every placed object's pose and optical frame, plus the pairwise layout. Written only when something is placed. |
 | `export/rig.csv` | The same layout as a flat table — position, optical axis, yaw and pitch per object — for a spreadsheet or a spec sheet. |
 
@@ -923,6 +924,51 @@ refine further.
 
 Verified end to end — `colmap model_analyzer` on the demo export reports 6
 registered images, 17 points, 70 observations, 0.487 px mean reprojection error.
+
+### The STEP scene
+
+`export/scene.step` is the one to open in CAD. Everything the solve knows, in
+one file and one coordinate system, each a named node in the assembly tree:
+
+| Node | What it is |
+|---|---|
+| `cam_<photo>` | One camera per solved photo, drawn as its frustum at the solved pose. The notch on the frustum marks the top of the image, so roll is visible rather than implied. |
+| `P4`, `p7`, … | One node per tie point, named as you named it, at its solved position. |
+| `P4_nominal`, … | The same points where the drawing states them, in green. The gap between the two *is* the residual, measurable with the CAD system's own dimension tool. |
+| `<part> (part)` | The part, at the origin — which is where it is by definition once the nominals have put the scene into part space. |
+| placed bodies | Every placed object at its solved pose, with its anchors marked and a frustum for any declared optical frame. |
+| `MS_Origin` | The world axis triad. |
+
+Written in **millimetres** by default, because that is what a drawing is
+dimensioned in, while the scene is solved in metres; the file's unit context
+says which, so a CAD system converts rather than guesses. Colour separates the
+kinds: cameras red, points white, nominals green, anchors blue, the part grey.
+
+How CAD bodies are carried is a choice, because no single answer is read by
+everything:
+
+| `--step-shape` | Geometry | Schema | Read by |
+|---|---|---|---|
+| `tessellated` *(default)* | Every triangle, as one AP242 tessellated shell — two entities for a whole body, so a 84,000-triangle casting is a few megabytes | AP242 | OpenCASCADE 7.5+ (FreeCAD, most viewers), NX, CATIA, Creo |
+| `wireframe` | The body's feature edges as polylines — the same edges MultiSpy draws over a photo | AP214 | everything, back to AP203 |
+| `brep` | A real faceted solid, one planar face per triangle — about nine entities per triangle, so it is capped at 40,000 | AP214 | everything, and properly solid |
+| `none` | Placements only: the tree, the poses, the cameras and the points | AP214 | everything |
+
+If a CAD seat opens the default with the cameras present and the bodies
+missing, it does not do AP242 tessellated geometry — re-export with
+`--step-shape wireframe`:
+
+```
+.venv\Scripts\python.exe -m multispy export projects\mypart\project.multispy --step-shape wireframe
+```
+
+`--step-units mm|cm|m|in|ft` picks the file's units.
+
+Verified by reading the output back with OpenCASCADE 7.9: zero schema errors on
+a full check, every camera centre within 5 nm and every camera axis within
+4e-10 of the solve, and the same scene written in mm, cm, m and inches reading
+back to identical coordinates. The writer is pure Python — no geometry kernel,
+no new dependency.
 
 ---
 
@@ -1052,7 +1098,9 @@ multispy/
   solve.py      calibration, linear initialisation, known-object placement,
                 bundle adjustment
   project.py    data model and JSON persistence
-  export.py     COLMAP, Blender, nerfstudio, PLY, rig layout
+  stepfile.py   a small ISO 10303-21 writer: assembly tree, placements,
+                wireframe, tessellated meshes, faceted solids, colour
+  export.py     COLMAP, Blender, nerfstudio, PLY, STEP scene, rig layout
   webapp.py     every operation behind the UI, independent of transport --
                 shared by the local server and the browser build
   server.py     local HTTP server: transport only, JSON in and out

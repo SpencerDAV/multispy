@@ -56,6 +56,7 @@ PY_MODULES = (
     "nominalcheck",
     "viewpoint",
     "cadguard",
+    "stepfile",
     "export",
     "webapp",
 )

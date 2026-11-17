@@ -49,7 +49,7 @@ MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _SAFE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- ()")
 
-EXPORT_FORMATS = ("colmap", "blender", "transforms", "ply", "rig")
+EXPORT_FORMATS = ("colmap", "blender", "transforms", "ply", "step", "rig")
 
 SHARED_ROUTES = frozenset(
     {
@@ -361,6 +361,11 @@ def write_exports(project: Project, out_dir: str | Path, formats=None) -> dict[s
         )
     if "ply" in formats:
         written["ply"] = str(export.export_ply(project, out_dir / "tiepoints.ply"))
+    if "step" in formats:
+        # the shape mode is deliberately not a front-end choice: tessellated is
+        # right unless a particular CAD seat cannot read AP242, which is a thing
+        # you find out at the other end and then re-export for from the CLI
+        written["step"] = str(export.export_step(project, out_dir / "scene.step"))
     # only worth writing when there is something placed to describe
     if "rig" in formats and project.placed_instances():
         written["rig"] = str(export.export_rig(project, out_dir / "rig.json"))
