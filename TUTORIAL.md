@@ -26,7 +26,7 @@ cd "C:\Animation Studio\MultiSpy"
 No arguments. It opens your most recent project (or an empty one) and serves the
 UI at `http://127.0.0.1:8777/`. Leave this terminal running; `Ctrl+C` stops it.
 
-> **You can read this page inside the app.** The **Help** button in the toolbar
+> **You can read this page inside the app.** The **?** button in the toolbar
 > (or the `?` key) opens it in a second tab, so you can keep it beside the
 > window while you work through the steps. The **Reference** tab at the top of
 > that page is the README.
@@ -41,7 +41,7 @@ If that fails, the install is one line:
 
 | Where | What |
 |---|---|
-| **Toolbar** | Project name (click to switch or create), mode buttons, axis buttons, overlay toggles, **3D**, **Save**, **Export**, **Solve**. |
+| **Toolbar** | Project name (click to switch or create), mode buttons, axis buttons (only while drawing lines, which is the only mode they do anything in), the **show** menu of overlay toggles, **3D**, **Save**, **Export**, **Solve**. |
 | **Left strip** | Every photo. A coloured dot shows how that photo is doing; **×** removes it; **+ add photos** at the bottom. |
 | **Centre** | The photo. Wheel zooms at the cursor, space-drag pans, **F** fits. |
 | **Right panels** | Solve · This image · Focal check · Known objects · Tie points · Constraints · Per-image residuals. |
@@ -111,7 +111,8 @@ Four rules, in order of how often they are broken:
 4. **Longer is much better.** A 2 px slip on a 1000 px line matters a tenth as
    much as on a 100 px one, and the solver weights it that way.
 
-Keep **VP rays** on (the default). Each line is extended to where its family
+Keep **VP rays** on (the default; the overlays are in the toolbar's **show**
+menu). Each line is extended to where its family
 converges. If one ray refuses to converge with its neighbours, that line is on an
 edge that is not actually parallel — fix it now.
 
@@ -168,7 +169,8 @@ across many photos is a mis-clicked corner — the Tie points panel flags it.
 
 ### Step 6 — Check it with your eyes
 
-Turn on **Grid**. A ground-plane grid is drawn using the solved camera.
+Turn on **Grid**, from the toolbar's **show** menu. A ground-plane grid is
+drawn using the solved camera.
 
 This is the check no number gives you. If the grid lies flat along the box's base
 and converges correctly into the distance, the solve is right. If it skews or

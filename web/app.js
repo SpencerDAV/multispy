@@ -389,6 +389,41 @@ function nudgeDepth(inst, im, factor) {
   for (let k = 0; k < 3; k++) inst.t[k] += ax.forward[k] * (want - depth);
 }
 
+/** Axis-aligned bounds of a list of world points, or null if there are none. */
+function bboxOf(pts) {
+  if (!pts || !pts.length) return null;
+  return [
+    [0, 1, 2].map((k) => Math.min(...pts.map((p) => p[k]))),
+    [0, 1, 2].map((k) => Math.max(...pts.map((p) => p[k]))),
+  ];
+}
+
+/** World bounds of a placed object's actual geometry.
+ *
+ *  The mesh's own bounds, carried through the placement, rather than anything
+ *  derived from ``t``. A CAD file's origin is very often nowhere near the body
+ *  it describes -- an assembly zero, a machine datum, a corner of the stock --
+ *  and for tooling the gap is routinely larger than the part being positioned,
+ *  so ``t`` says almost nothing about where the geometry is. Falls back to the
+ *  anchors for a model with no mesh, which are at least on the body. */
+function placedBoxWorld(inst, template) {
+  const mesh = meshFor(inst.template);
+  const pts = [];
+  if (mesh && mesh.bounds) {
+    const [lo, hi] = mesh.bounds;
+    for (let i = 0; i < 8; i++) {
+      pts.push(objectToWorld(inst, template, [
+        i & 1 ? hi[0] : lo[0],
+        i & 2 ? hi[1] : lo[1],
+        i & 4 ? hi[2] : lo[2],
+      ]));
+    }
+  } else {
+    for (const a of template.anchors || []) pts.push(objectToWorld(inst, template, a.xyz));
+  }
+  return bboxOf(pts);
+}
+
 /** Centre of the model in its own units, from the mesh if there is one and the
  *  anchors otherwise. Only ever a pivot, so the bounding-box centre is the
  *  right answer rather than a centroid weighted by vertex density. */
@@ -408,6 +443,75 @@ function modelCentreLocal(template) {
   if (!anchors.length) return [0, 0, 0];
   return [0, 1, 2].map(
     (k) => anchors.reduce((s, a) => s + a.xyz[k], 0) / anchors.length);
+}
+
+/** The model's longest side, in its own file units.
+ *
+ *  What the size box on the model card writes against, so that a fixture can
+ *  be sized by typing the one dimension anybody actually knows -- "it is 2.4 m
+ *  across" -- instead of a scale factor nobody holds in their head. Mesh
+ *  bounds when there is a mesh, the anchor spread otherwise, since a model
+ *  with no geometry still has points a real distance apart. */
+function modelSpanLocal(template) {
+  const mesh = meshFor(template.id);
+  const box = mesh && mesh.bounds
+    ? mesh.bounds
+    : bboxOf((template.anchors || []).map((a) => a.xyz));
+  if (!box) return 0;
+  return Math.max(box[1][0] - box[0][0], box[1][1] - box[0][1], box[1][2] - box[0][2]);
+}
+
+/** Resize the model, keeping every copy of it where it looks like it is.
+ *
+ *  ``unit_scale`` multiplies model-space coordinates, so changing it alone
+ *  moves the geometry along the line from the CAD file's own origin -- and a
+ *  tooling origin is routinely further from the body than the body is wide, an
+ *  assembly zero or a machine datum rather than anything on the part. A ten
+ *  percent resize then throws the body clean out of frame, which makes the
+ *  gesture unusable and makes a typed size look like it did something else.
+ *  Correcting each placement's translation so the model's own centre stays put
+ *  is what makes a resize read as a resize, from any view and at any
+ *  orientation.
+ *
+ *  Returns false when nothing changed, so callers can skip the redraw. */
+function setTemplateScale(t, unitScale) {
+  /* Refused, not clamped. `clamp(+x || 0, 1e-9, 1e9)` turns a NaN into 1e-9,
+   * which is a positive number that passes every later check and silently
+   * shrinks the model to nothing -- the one outcome worse than doing nothing
+   * at all, because it also drags every placement along with it. */
+  const asked = +unitScale;
+  const was = +t.unit_scale;
+  if (!Number.isFinite(asked) || asked <= 0) return false;
+  if (!Number.isFinite(was) || was <= 0) return false;
+  const want = clamp(asked, 1e-9, 1e9);
+  if (Math.abs(want - was) <= 1e-15 * Math.max(want, was)) return false;
+  const c = modelCentreLocal(t);
+  const k = was - want;
+  for (const inst of instanceList()) {
+    if (inst.template !== t.id || !isPlaced(inst)) continue;
+    const d = mat3.apply(inst.R, [c[0] * k, c[1] * k, c[2] * k]);
+    for (let j = 0; j < 3; j++) inst.t[j] += d[j];
+  }
+  t.unit_scale = want;
+  // A model resized by hand no longer sits on a named unit, and saying "mm"
+  // when it is not one is a lie the real-size readout beside it contradicts.
+  const named = Object.keys(UNIT_SCALES).find((u) => Math.abs(UNIT_SCALES[u] - want) < 1e-12);
+  t.units = named || 'custom';
+  markDirty();
+  return true;
+}
+
+/** Multiply the model's size, for the drag handle. */
+function nudgeTemplateScale(t, factor) {
+  return setTemplateScale(t, t.unit_scale * factor);
+}
+
+/** What the resize gesture and the size box report back: the longest side in
+ *  the project's own nominal units, which is the number being set. */
+function modelSpanNominal(template) {
+  const span = modelSpanLocal(template);
+  if (!span) return null;
+  return (span * template.unit_scale) / nominalScale();
 }
 
 /** World position the body spins about: the centre of its own model, not its
@@ -2726,7 +2830,20 @@ canvas.addEventListener('mousedown', (ev) => {
         inst: inst.id,
         last: p,
         depth: ev.button === 0 && state.depthDown,
+        // Shift makes it a resize. Deliberately its own gesture rather than a
+        // second meaning for the depth drag: in one photograph a body 1.25x
+        // larger and 1.25x further away project identically, so the two have
+        // to be told apart by the hand, not by the picture. Shift also keeps
+        // it out of reach of an ordinary drag, because this one writes the
+        // MODEL's size and so changes every copy of it in every photo.
+        size: ev.button === 0 && ev.shiftKey && !state.depthDown,
         rotate: ev.button === 2 || ev.ctrlKey || ev.metaKey,
+        // Shift on the turn drag rolls the body about the direction the photo
+        // is looking. It is the third turn, and without it the two the eye can
+        // judge leave one degree of freedom reachable only through the X/Y/Z
+        // locks -- which is fine for a part square to the fixture and useless
+        // for one that is not.
+        roll: (ev.button === 2 || ev.ctrlKey || ev.metaKey) && ev.shiftKey,
         axisKey: state.axisKey,
       };
       renderPanels();
@@ -2850,6 +2967,23 @@ window.addEventListener('mousemove', (ev) => {
         // the silhouette on screen cannot distinguish it from size
         setStatus(`${inst.label || inst.id} at `
           + `${bodyDepth(inst, im).toFixed(2)} m`, 'ok');
+      } else if (d.size) {
+        /* One axis and multiplicative, like depth: "a bit bigger" is a
+         * fraction of the current size, and a handle that also answered to
+         * vertical movement would change the answer every time the hand
+         * wandered. Being a screen-space horizontal drag is also what makes it
+         * work from any view -- the gesture never consults the camera, so it
+         * means the same thing from the front, from underneath, and with the
+         * view rolled over. */
+        const t = templateOf(inst);
+        if (t && nudgeTemplateScale(t, Math.exp(sdx * 0.004))) {
+          const span = modelSpanNominal(t);
+          setStatus(`${t.name || t.id} now ${span ? span.toPrecision(4) : '?'} `
+            + `${nominalUnits()} on its longest side — this is the MODEL's size, so `
+            + `every copy of it changed`, 'warn');
+          // the card's size box and the derived readouts are now stale
+          state.poseScaleDirty = true;
+        }
       } else if (d.rotate && d.axisKey) {
         // One axis at a time, chosen by the key held down. Free rotation is
         // quick to get close with and hopeless to finish with: every drag
@@ -2858,14 +2992,29 @@ window.addEventListener('mousemove', (ev) => {
         // fixture never quite lands. Constraining it is what makes the last
         // few degrees reachable at all.
         rotateInPlace(inst, WORLD_AXIS[d.axisKey], sdx * 0.006);
+      } else if (d.roll) {
+        // about the direction this photo is looking, so the body spins in the
+        // picture plane -- the one turn that reads the same from every camera
+        const ax = cameraAxes(im);
+        rotateInPlace(inst, ax.forward, sdx * 0.006);
       } else if (d.rotate) {
         const ax = cameraAxes(im);
-        // horizontal drag yaws about world up, which is what a body standing on
-        // a floor actually does; vertical drag tips it about the screen
-        // horizontal, which is the only other turn an eye can judge
-        // half a turn per ~500 px of screen, so a whole revolution is a
-        // comfortable two drags rather than a flick
-        if (Math.abs(sdx) > 0) rotateInPlace(inst, [0, 0, 1], sdx * 0.006);
+        /* Horizontal drag yaws about world up, which is what a body standing
+         * on a floor actually does; vertical drag tips it about the screen
+         * horizontal, which is the only other turn an eye can judge. Half a
+         * turn per ~500 px of screen, so a whole revolution is a comfortable
+         * two drags rather than a flick.
+         *
+         * World up is the right default and the wrong only option. It assumes
+         * the body has a floor, and inverted tooling does not: looking up at a
+         * fixture from underneath, a world-Z yaw turns the body the opposite
+         * way round the screen from the hand, and the turn the eye actually
+         * wants -- about what is up in THIS picture -- is not on offer at all.
+         * So the free tumble the 3D view got is the same switch here: T. */
+        const yawAxis = Viewer3D.orbitMode() === 'trackball'
+          ? [-ax.down[0], -ax.down[1], -ax.down[2]]
+          : [0, 0, 1];
+        if (Math.abs(sdx) > 0) rotateInPlace(inst, yawAxis, sdx * 0.006);
         if (Math.abs(sdy) > 0) rotateInPlace(inst, ax.right, sdy * 0.006);
       } else {
         nudgeInPlane(inst, im, dx, dy);
@@ -2890,6 +3039,15 @@ window.addEventListener('mouseup', () => {
   const im = currentImage();
   const d = state.drag;
   state.drag = null;
+  // the size box, the real-size readout and the units-vs-nominal check all
+  // move with a resize; rebuilding the panel per frame while dragging would
+  // blow focus around, so it happens once, here
+  if (state.poseScaleDirty) {
+    state.poseScaleDirty = false;
+    renderPanels();
+    syncViewer();
+    refreshRig();
+  }
   if (!d || !im) return;
 
   if (d.kind === 'newline') {
@@ -2968,10 +3126,60 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'enter') { ev.preventDefault(); solveNow(); return; }
   if (k === '?' || (k === '/' && ev.shiftKey)) { ev.preventDefault(); openDocs(); return; }
 
+  if (k === 'escape' && !$('showmenu').hidden) {
+    $('showmenu').hidden = true;
+    $('btn-show').classList.remove('on');
+    return;
+  }
   if (k === 'escape' && Viewer3D.isOn()) { toggleViewer(false); return; }
   if (k === 'd') { toggleViewer(!Viewer3D.isOn()); return; }
-  // while the 3D view is up it owns fit, since the 2D fit would be invisible
-  if (k === 'f' && Viewer3D.isOn()) { Viewer3D.frameAll(); return; }
+
+  /* One switch for every free turn in the app: the 3D orbit and the body's own
+   * rotate drag read the same mode, so "horizontal means world Z" or
+   * "horizontal means whatever is up on screen" is answered once rather than
+   * learned twice. It is bound outside the viewer block because the body
+   * gizmo is used with the viewer closed. */
+  if (k === 't') {
+    Viewer3D.setOrbitMode(Viewer3D.orbitMode() === 'trackball' ? 'turntable' : 'trackball');
+    updateViewerBar();
+    updateHint();
+    setStatus(Viewer3D.orbitMode() === 'trackball'
+      ? 'free tumble — a horizontal drag turns about whatever is up on screen, '
+        + 'for the view and for the body'
+      : 'turntable — a horizontal drag turns about world Z, for the view and '
+        + 'for the body', 'ok');
+    return;
+  }
+
+  /* While the 3D view is up it owns the view keys outright.
+   *
+   * It covers the whole canvas, so the 2D bindings underneath it act on
+   * something nobody can see -- F fitting the invisible photo was the first
+   * case of that, and the axis and roll keys below would be the next. Claiming
+   * them here, with a return, is also what makes X/Y/Z mean "put the eye on
+   * that axis" in the viewer and "turn the body about that axis" on the photo
+   * without the two ever colliding. */
+  if (Viewer3D.isOn()) {
+    if (k === 'f') {
+      if (ev.shiftKey) fitSelection(); else Viewer3D.frameAll();
+      return;
+    }
+    if (k === 'x' || k === 'y' || k === 'z') {
+      // Shift takes the far side, so the six axis views need three keys. The
+      // Z pair is the point of the exercise: Shift+Z looks straight up the +Z
+      // axis at the underside of an inverted fixture, which is the view the
+      // old pitch clamp could get within a few degrees of and never reach.
+      const key = (ev.shiftKey ? '-' : '') + k;
+      Viewer3D.setAxisView(key);
+      setStatus(`eye on ${key.toUpperCase()}`, 'ok');
+      return;
+    }
+    if (k === 'r') { Viewer3D.levelRoll(); return; }
+    if (k === 'q' || k === 'e') {
+      Viewer3D.rollBy(((ev.shiftKey ? 15 : 5) * (k === 'e' ? 1 : -1) * Math.PI) / 180);
+      return;
+    }
+  }
 
   if (k === '1' || k === '2' || k === '3') { setAxis(+k - 1); return; }
   /* 4 steps through the direction groups and back out to the axes, so a set of
@@ -3127,7 +3335,11 @@ function step(delta) {
 function setMode(mode) {
   state.mode = mode;
   for (const b of $('modes').children) b.classList.toggle('on', b.dataset.mode === mode);
-  $('axes').style.opacity = mode === 'lines' ? '1' : '.4';
+  // The axis buttons draw control lines and do nothing in any other mode.
+  // They used to be dimmed rather than removed, which still spent four slots
+  // on four inert buttons; the flexible spacer sits immediately to their
+  // right, so hiding them moves nothing else on the bar.
+  $('axes').hidden = mode !== 'lines';
   // marking anchors means looking at the photo, so step out of the 3D view
   if ((mode === 'objects' || mode === 'pose')
       && Viewer3D.isOn() && Viewer3D.mode() === 'template') toggleViewer(false);
@@ -3205,6 +3417,13 @@ function updateHint() {
         + `The next unmarked anchor follows automatically; <b>Tab</b> jumps to the next photo. `
         + `${escapeHtml(placementAdvice(inst))}.`;
 
+  const tumble = Viewer3D.orbitMode() === 'trackball';
+  const turnNote = tumble
+    ? `<b>T</b>: a turn drag now yaws about screen-up — the mode for inverted tooling. `
+      + `<b>Shift</b> on it rolls in the picture plane.`
+    : `<b>T</b>: a turn drag yaws about world Z — switch it to a free tumble for `
+      + `inverted tooling. <b>Shift</b> on it rolls in the picture plane.`;
+
   const poseHint = !inst
     ? `No object selected. Add a model and an object in the <b>Known objects</b> panel.`
     : state.axisKey
@@ -3217,24 +3436,25 @@ function updateHint() {
         + `status line shows the distance in metres as you go. This moves <i>this body</i> `
         + `and leaves the model's size alone — but in this one photo the two look the `
         + `same, so settle it against a photo 60–120° away. The model's own size is `
-        + `the <b>units</b> dropdown in Known objects.`
+        + `<b>Shift-drag</b>, or the <b>size</b> box in Known objects.`
       : isPlaced(inst) && currentImage() && bodyVisibility(inst, currentImage()) === 0
       ? `<b>${escapeHtml(inst.label || inst.id)} is outside this photo.</b> That is normal `
         + `on the second view — these were taken metres apart, so a body a little off in `
         + `one is off the edge in another. Press <b>H</b> to bring it onto this view at `
         + `the same distance; its turn and size are kept.`
       : !((templateOf(inst) || {}).anchors || []).length
-      ? `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> for its `
-        + `distance, <b>hold X/Y/Z</b> to turn about one axis. But this model has no anchors yet, `
+      ? `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> for distance, `
+        + `<b>Shift</b>+left-drag for the model's size. But this model has no anchors yet, `
         + `so the fit stays an eye-fit and nothing can refine it — press `
         + `<b>use model features</b> in Known objects to take the ones the model already `
         + `offers.`
-      : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> for its `
-        + `distance, <b>hold X/Y/Z</b> to turn about one world axis only. `
-        + `Watch the filmstrip: the body has one pose, so every photo `
-        + `updates as you drag. When it looks right here, <b>snap anchors</b>, then do `
-        + `the next photo and snap again — <b>Enter</b> then reconciles all of them into `
-        + `one measured pose, and moves the cameras to match.`;
+      : `<b>Left-drag</b> moves it, <b>right-drag</b> turns it, <b>hold S</b> for distance, `
+        + `<b>hold X/Y/Z</b> for one world axis. <b>Shift</b>+left-drag resizes the `
+        + `<i>model</i> — every copy, every photo — and <b>Shift</b>+right-drag rolls it. `
+        + turnNote + ` `
+        + `The body has one pose, so every photo in the filmstrip moves as you drag. When it `
+        + `looks right here, <b>snap anchors</b>, then the next photo — <b>Enter</b> `
+        + `reconciles them into one measured pose and moves the cameras to match.`;
 
   const tally = state.dirGroup ? groupTally(state.dirGroup) : null;
   const linesHint = state.dirGroup
@@ -4781,7 +5001,14 @@ function renderObjectsPanel() {
     } else if (mesh && mesh.error) {
       html += `<div class="note bad">${escapeHtml(mesh.error)}</div>`;
     } else if (mesh) {
-      const real = mesh.size.map((v) => (v * t.unit_scale).toFixed(3));
+      /* The model's real size, in the project's own units rather than metres.
+       * "50 x 100 x 185 mm" is read at a glance where "0.050 x 0.100 x 0.185 m"
+       * has to be decoded, it is the same unit as the size box on this row, and
+       * the largest of the three IS that box -- so the row checks itself. */
+      const real = mesh.size.map(
+        (v) => +((v * t.unit_scale) / nominalScale()).toPrecision(3));
+      const spanLocal = modelSpanLocal(t);
+      const spanNom = spanLocal > 0 ? modelSpanNominal(t) : null;
       html += `<div class="msg">${mesh.n_faces} faces, ${mesh.n_feature_edges} of `
             +   `${mesh.n_all_edges || mesh.n_feature_edges} edges drawn</div>`
             // the angle that decides which edges those are. A filleted or finely
@@ -4798,8 +5025,25 @@ function renderObjectsPanel() {
             +   `<span class="est">edges sharper than ${creaseOf(t)}\u00b0</span>`
             + `</div>`
             + `<div class="unitrow">`
-            +   `<span class="k">units</span>`
-            +   `<select class="tplunit" data-tpl="${escapeHtml(tid)}">`
+            /* One row for how big the model is: the box is its longest side,
+             * the dropdown sets that from a declared CAD unit. These were two
+             * rows stating the same fact three ways -- a units picker, a
+             * "1 model unit = 1.000 mm" ratio and a real-size readout -- which
+             * is more arithmetic than anyone wants on a card they are only
+             * glancing at. */
+            +   `<span class="k">size</span>`
+            +   (spanNom === null ? ''
+                  : `<input class="tplspan" type="text" inputmode="decimal" `
+                    + `data-tpl="${escapeHtml(tid)}" value="${spanNom.toPrecision(6)}" `
+                    + `title="Longest side, in ${escapeHtml(nominalUnits())}. Type any size `
+                    + `at all — every copy of the model keeps its own centre, so nothing `
+                    + `jumps.">`
+                    // named only when it is not the unit the dropdown beside it
+                    // already shows, which is almost never
+                    + (nominalUnits() === t.units
+                        ? '' : `<span class="k">${escapeHtml(nominalUnits())}</span>`))
+            +   `<select class="tplunit" data-tpl="${escapeHtml(tid)}" `
+            +     `title="Set the scale from the units the CAD file is drawn in">`
             // a model resized by hand no longer sits on any named unit, and
             // showing it as "mm" when it is not would be a lie the real-size
             // readout beside it immediately contradicts
@@ -4808,8 +5052,21 @@ function renderObjectsPanel() {
             +     Object.keys(UNIT_SCALES).map((u) =>
                     `<option value="${u}"${u === t.units ? ' selected' : ''}>${u}</option>`).join('')
             +   `</select>`
-            +   `<span class="est">= ${real.join(' × ')} m</span>`
+            +   `<span class="est">= ${real.join(' × ')} ${escapeHtml(nominalUnits())}</span>`
             + `</div>`;
+      /* How far the file's own zero is from the body it describes. Silent
+       * until it matters, and then worth one line: a tooling origin further
+       * from the geometry than the geometry is wide is why a fit-all opens on
+       * empty space and why the world triad is nowhere near the model. */
+      const ob = mesh.bounds || [[0, 0, 0], [0, 0, 0]];
+      const far = Math.max(...[0, 1, 2].map((kk) => Math.max(
+        Math.abs(ob[0][kk]), Math.abs(ob[1][kk]))));
+      if (spanLocal > 0 && far > spanLocal * 1.5) {
+        html += `<div class="msg">origin sits `
+              + `${fmtRadius((far * t.unit_scale) / nominalScale())} `
+              + `${escapeHtml(nominalUnits())} off the geometry — use `
+              + `<b>fit selection</b> in the 3D view, not <b>fit</b></div>`;
+      }
       if (mesh.units_note) {
         html += `<div class="msg">${escapeHtml(mesh.units_note)}</div>`;
       }
@@ -5005,13 +5262,40 @@ function wireObjectsPanel(el) {
       ensureMeshes();
     };
   }
+  for (const box of el.querySelectorAll('input.tplspan')) {
+    const commit = () => {
+      const t = templates()[box.dataset.tpl];
+      if (!t) return;
+      const span = modelSpanLocal(t);
+      const want = parseFloat(box.value);
+      if (!(want > 0) || !(span > 0)) {
+        setStatus('size must be a positive number', 'warn');
+        renderObjectsPanel();
+        return;
+      }
+      if (setTemplateScale(t, (want * nominalScale()) / span)) {
+        setStatus(`${t.name || t.id} scaled to ${want} ${nominalUnits()} on its longest `
+                  + `side — every copy kept its centre`, 'ok');
+      }
+      renderObjectsPanel();
+      syncViewer();
+      render();
+      refreshRig();
+    };
+    box.onchange = commit;
+    box.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); box.blur(); } };
+  }
   for (const sel of el.querySelectorAll('select.tplunit')) {
     sel.onchange = (e) => {
       const t = templates()[sel.dataset.tpl];
       if (!(e.target.value in UNIT_SCALES)) return;   // "custom" is a readout
-      t.units = e.target.value;
-      t.unit_scale = UNIT_SCALES[e.target.value];
-      markDirty();
+      // through setTemplateScale, so switching units holds each copy's centre
+      // the same way the size box and the drag handle do -- otherwise mm to m
+      // would fling every body a thousand times its origin offset away
+      if (!setTemplateScale(t, UNIT_SCALES[e.target.value])) {
+        t.units = e.target.value;
+        markDirty();
+      }
       renderObjectsPanel();
       syncViewer();
       render();
@@ -5846,6 +6130,7 @@ function buildScene() {
     const template = templateOf(inst);
     const placed = isPlaced(inst);
     return {
+      box: placed && template ? placedBoxWorld(inst, template) : null,
       id: inst.id,
       label: inst.label || inst.id,
       placed,
@@ -5870,19 +6155,48 @@ function buildScene() {
     };
   });
 
-  const all = [
+  /* How big the scene is.
+   *
+   * This used to be measured from the tie points, the camera centres and each
+   * object's *centre* -- never from how big the objects themselves are. The
+   * difference is invisible while every object is small next to the camera
+   * walk, and wrong the moment a fixture bigger than the walk is dropped in:
+   * the grid step, the frustum size and the opening fit were then all derived
+   * from a box the fixture hung a long way outside of, and the view opened
+   * buried inside it. Each placed object now contributes its own corners. */
+  const marks = [
     ...points,
     ...cameras.map((c) => c.center),
     ...objects.filter((o) => o.placed).map((o) => o.center || o.t),
   ];
+  const all = [...marks, ...objects.flatMap((o) => o.box || [])];
+  const whole = bboxOf(all);
+  /* How far apart the things that merely MARK a position are -- the old
+   * extent, before placed geometry started counting towards it.
+   *
+   * The viewer needs both numbers and they are not the same number. Framing
+   * and the grid want the box that holds everything, geometry included.
+   * Camera pyramids and optical-axis stubs are glyphs: they say where
+   * something is, not how big it is, and sizing them from a box that a
+   * fifty-metre fixture is inflating draws every camera several metres long. */
+  const markBox = bboxOf(marks);
+  const markScale = markBox
+    ? Math.max(Math.hypot(...[0, 1, 2].map((k) => markBox[1][k] - markBox[0][k])), 1e-6)
+    : 0;
   let center = [0, 0, 0];
   let extent = 1;
-  if (all.length) {
-    const lo = [0, 1, 2].map((k) => Math.min(...all.map((p) => p[k])));
-    const hi = [0, 1, 2].map((k) => Math.max(...all.map((p) => p[k])));
+  if (whole) {
+    const [lo, hi] = whole;
     center = [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2);
     extent = Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]), 1e-6);
   }
+  /* What "fit selection" frames: the selected object if there is one, and
+   * otherwise the marked points, which are the part when a part is what is
+   * being positioned inside a fixture. Having this separate from ``extent`` is
+   * the other half of the fixture problem -- the whole-scene box is the right
+   * thing to size a grid from and the wrong thing to open the view on. */
+  const selBox = (objects.find((o) => o.selected && o.box) || {}).box;
+  const focus = selBox || bboxOf(points) || whole;
   /* The part's own zero, for the viewer to draw the way the photo overlay
    * does. Sent only when the nominals have actually pinned the frame, so the
    * viewer never has to decide whether the origin means anything -- and only
@@ -5896,7 +6210,7 @@ function buildScene() {
                                label: `${fmtRadius(sph.radius)} ${sph.units}` };
   }
 
-  return { points, cameras, objects, center, extent, origin };
+  return { points, cameras, objects, center, extent, markScale, focus, origin };
 }
 
 /** In model mode the viewer works in the model's own units, so the scene it
@@ -5910,6 +6224,9 @@ function templateScene() {
     objects: [],
     center: mesh.centroid,
     extent: Math.max(Math.hypot(...mesh.size), 1e-6),
+    // in model mode the geometry IS the selection, which is the useful thing
+    // to frame when the file's own origin sits far off the body
+    focus: mesh.bounds || null,
   };
 }
 
@@ -5937,6 +6254,23 @@ function updateViewerBar() {
   $('view3dtitle').textContent = model ? `Model: ${t ? t.name || t.id : 'none'}` : 'Scene';
   $('v3-scene').classList.toggle('on', !model);
   $('v3-template').classList.toggle('on', model);
+  const trackball = Viewer3D.orbitMode() === 'trackball';
+  $('v3-orbit').textContent = trackball ? 'trackball' : 'turntable';
+  $('v3-orbit').classList.toggle('on', trackball);
+  // Only shown once it is non-zero. A roll of 0 is the state the view is in
+  // almost all the time, and a permanent "roll 0" readout would be noise --
+  // whereas a view that has been rolled and then left that way is exactly the
+  // thing that later looks like a broken render, so it says so.
+  /* The roll readout and the button that undoes it are both meaningless at
+   * zero, which is where the view sits almost all the time -- so they are not
+   * drawn at all until there is a roll to report. A view left rolled is
+   * exactly the thing that later looks like a broken render, so when there IS
+   * one it says so and offers the way out, right next to it. */
+  const roll = Viewer3D.rollDegrees();
+  const rolled = Math.abs(roll) >= 0.5;
+  $('v3-roll').hidden = !rolled;
+  $('v3-level').hidden = !rolled;
+  if (rolled) $('v3-roll').textContent = `roll ${roll.toFixed(0)}°`;
 }
 
 function toggleViewer(on) {
@@ -6188,6 +6522,24 @@ $('calibinput').onchange = (ev) => {
 $('btn-3d').onclick = () => toggleViewer(!Viewer3D.isOn());
 $('v3-close').onclick = () => toggleViewer(false);
 $('v3-fit').onclick = () => Viewer3D.frameAll();
+function fitSelection() {
+  if (!Viewer3D.frameSelection()) {
+    setStatus('nothing selected to frame — pick an object in Known objects', 'warn');
+  }
+}
+$('v3-axis').onchange = (ev) => {
+  // one picker for the two things that reframe without moving anything: what
+  // to look at, and where to look from
+  if (ev.target.value === 'fitsel') fitSelection();
+  else Viewer3D.setAxisView(ev.target.value);
+  ev.target.value = '';          // a momentary action, not a persistent state
+  ev.target.blur();
+};
+$('v3-orbit').onclick = () => {
+  Viewer3D.setOrbitMode(Viewer3D.orbitMode() === 'trackball' ? 'turntable' : 'trackball');
+  updateViewerBar();
+};
+$('v3-level').onclick = () => Viewer3D.levelRoll();
 $('v3-scene').onclick = () => { Viewer3D.setMode('scene'); updateViewerBar(); };
 $('v3-template').onclick = () => openTemplatePicker();
 
@@ -6205,6 +6557,7 @@ Viewer3D.attach($('canvas3d'), {
     renderPanels();
     syncViewer();
   },
+  onViewChange: () => updateViewerBar(),
   onPickCandidate: (index) => addAnchorFromPick(index),
   onPickAnchor: (name) => {
     state.activeAnchor = name;
@@ -6216,7 +6569,47 @@ Viewer3D.attach($('canvas3d'), {
 document.addEventListener('click', (ev) => {
   const menu = $('projmenu');
   if (!menu.hidden && !$('projwrap').contains(ev.target)) menu.hidden = true;
+  const show = $('showmenu');
+  if (!show.hidden && !$('showwrap').contains(ev.target)) {
+    show.hidden = true;
+    $('btn-show').classList.remove('on');
+  }
 });
+
+/** The overlay menu.
+ *
+ *  Its contents are the same checkboxes as before, with the same ids, so every
+ *  shortcut that reaches them by `$('showvp').click()` and every read of
+ *  `.checked` goes on working untouched -- a hidden checkbox is still a
+ *  checkbox. Only where they are drawn has changed. */
+$('btn-show').onclick = (ev) => {
+  ev.stopPropagation();
+  const menu = $('showmenu');
+  menu.hidden = !menu.hidden;
+  $('btn-show').classList.toggle('on', !menu.hidden);
+  if (!menu.hidden) $('projmenu').hidden = true;
+};
+
+/* What is on, in the button's tooltip: the labels left the toolbar, so the
+ * answer to "why can I not see the residuals" has to stay reachable without
+ * opening anything. */
+function updateShowButton() {
+  const on = [...$('showmenu').querySelectorAll('input[type=checkbox]')]
+    .filter((b) => b.checked)
+    // the label's own text nodes only: the checkbox and the shortcut chip are
+    // elements, so this cannot chew a letter out of the name the way stripping
+    // the chip's text by value did ("VP rays V" lost its first V)
+    .map((b) => [...b.parentElement.childNodes]
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => n.textContent)
+      .join(' ')
+      .trim());
+  $('btn-show').title = on.length
+    ? `Drawing on the photo: ${on.join(', ')}. Click to change.`
+    : 'Nothing is drawn on the photo. Click to change.';
+}
+$('showmenu').addEventListener('change', updateShowButton);
+updateShowButton();
 $('projectinput').onchange = (ev) => {
   if (ev.target.files.length) openProjectFile(ev.target.files[0]);
   ev.target.value = '';

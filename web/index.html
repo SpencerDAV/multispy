@@ -40,6 +40,8 @@
     border-bottom: 1px solid var(--border);
   }
   #toolbar .title { font-weight: 600; letter-spacing: .2px; }
+  /* the spacer sits to its right, so this costs no layout shift anywhere */
+  #axes[hidden] { display: none; }
   #toolbar .title span { color: var(--text-dim); font-weight: 400; margin-left: 6px; }
   .spacer { flex: 1; }
   .group { display: flex; align-items: center; gap: 1px; }
@@ -62,6 +64,8 @@
   button.action.primary { background: var(--accent); border-color: var(--accent); color: #0d1016; font-weight: 600; }
   button.action.primary:hover { filter: brightness(1.1); }
   button.action:disabled { opacity: .45; cursor: default; }
+  .group > button:disabled { opacity: .45; cursor: default; }
+  .group > button:disabled:hover { background: var(--surface-2); }
   .toggle { display: flex; align-items: center; gap: 5px; color: var(--text-dim); cursor: pointer; }
   .toggle input { accent-color: var(--accent); }
 
@@ -255,6 +259,32 @@
   #projmenu .path { color: var(--text-dim); font-size: 10px; word-break: break-all;
     padding: 4px 2px 0; border-top: 1px solid var(--border); margin-top: 7px; }
 
+  /* ---------------------------------------------------------- show menu */
+  /* Seven checkboxes sat open across the toolbar, which is seven decisions
+     offered at once to answer a question -- "what is drawn on the photo" --
+     that is asked perhaps twice a session. They are the same controls, with
+     their shortcut letters now shown beside them, one click away. */
+  #showwrap { position: relative; }
+  #showmenu {
+    position: absolute; top: 100%; right: 0; margin-top: 5px; z-index: 40;
+    min-width: 210px; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 6px; box-shadow: 0 10px 28px #000a; padding: 6px;
+  }
+  #showmenu[hidden] { display: none; }
+  #showmenu .head {
+    color: var(--text-dim); font-size: 10px; text-transform: uppercase;
+    letter-spacing: .6px; margin: 5px 4px 3px;
+  }
+  #showmenu .toggle {
+    padding: 4px 6px; border-radius: 4px; color: var(--text);
+    display: grid; grid-template-columns: auto 1fr auto; gap: 7px;
+  }
+  #showmenu .toggle:hover { background: #2f3540; }
+  #showmenu .sk {
+    color: var(--text-dim); font-size: 10px; font-family: ui-monospace, monospace;
+    border: 1px solid var(--border); border-radius: 3px; padding: 0 4px;
+  }
+
   /* --------------------------------------------------------------- dialog */
   /* Stands in for window.confirm and window.prompt, which an embedded webview
      may decline to show at all. See the dialog section in app.js. */
@@ -344,6 +374,19 @@
   #view3dtitle { font-weight: 600; color: var(--text); margin-right: 4px; }
   #view3dbar .est { font-style: italic; }
   #view3dbar .smallbtn.on { background: var(--accent); border-color: var(--accent); color: #0d1016; }
+  /* the bar is one line and stays one line: the global select rule is
+     width:100%, which stretched the view picker across half the viewport and
+     wrapped every button onto two rows */
+  #view3dbar { white-space: nowrap; }
+  #view3dbar .smallbtn { white-space: nowrap; flex: none; }
+  #view3dbar select {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; font-size: 11px; padding: 1px 3px; width: auto; flex: none;
+  }
+  /* the shortcut reminder is the first thing to give up room */
+  #view3dbar .est { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #view3dbar .roll { font-variant-numeric: tabular-nums; flex: none; }
+  #view3dbar .roll[hidden], #view3dbar .smallbtn[hidden] { display: none; }
 
   /* ------------------------------------------------------ known objects */
   .objlist { max-height: 300px; overflow-y: auto; }
@@ -369,6 +412,11 @@
   .tpl .tplhead b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .unitrow { display: flex; gap: 4px; margin-top: 5px; align-items: center; }
   .unitrow select { width: 68px; flex: none; }
+  .unitrow input.tplspan {
+    width: 68px; flex: none; background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; font-size: 11px;
+    padding: 1px 4px; font-variant-numeric: tabular-nums;
+  }
   .unitrow .est { flex: 1; min-width: 0; font-size: 10px; color: var(--text-dim); font-style: italic; }
 
   .anchorlist { max-height: 170px; overflow-y: auto; margin-top: 5px; }
@@ -436,35 +484,46 @@
 
     <div class="spacer"></div>
 
-    <label class="toggle" title="Extend control lines to their vanishing point (V)">
-      <input type="checkbox" id="showvp" checked> VP rays
-    </label>
-    <label class="toggle" title="Show reprojection error vectors (R)">
-      <input type="checkbox" id="showresid" checked> Residuals
-    </label>
-    <label class="toggle" title="Where the solve expects points this photo has no mark for (E)">
-      <input type="checkbox" id="showexpected" checked> Expected
-    </label>
-    <label class="toggle" title="Overlay the solved ground plane grid">
-      <input type="checkbox" id="showgrid"> Grid
-    </label>
-    <label class="toggle" id="originlabel"
-           title="Overlay the part-space origin and axes, once three nominals pin the frame">
-      <input type="checkbox" id="showorigin" checked> Origin
-    </label>
-    <label class="toggle" title="Overlay each placed object's model, projected through this camera (M)">
-      <input type="checkbox" id="showmodels" checked> Models
-    </label>
-    <label class="toggle" title="Fill the model's faces instead of only its edges, so which way round it sits is not a guess (H)">
-      <input type="checkbox" id="showshaded"> Shaded
-    </label>
+    <div id="showwrap">
+      <button class="action" id="btn-show" title="What the overlay draws on the photo">show &#9662;</button>
+      <div id="showmenu" hidden>
+        <div class="head">draw on the photo</div>
+        <label class="toggle" title="Extend control lines to their vanishing point">
+          <input type="checkbox" id="showvp" checked> VP rays <span class="sk">V</span>
+        </label>
+        <label class="toggle" title="Show reprojection error vectors">
+          <input type="checkbox" id="showresid" checked> Residuals <span class="sk">R</span>
+        </label>
+        <label class="toggle" title="Where the solve expects points this photo has no mark for">
+          <input type="checkbox" id="showexpected" checked> Expected <span class="sk">E</span>
+        </label>
+        <label class="toggle" title="Overlay the solved ground plane grid">
+          <input type="checkbox" id="showgrid"> Grid
+        </label>
+        <label class="toggle" id="originlabel"
+               title="Overlay the part-space origin and axes, once three nominals pin the frame">
+          <input type="checkbox" id="showorigin" checked> Origin
+        </label>
+        <div class="head">placed objects</div>
+        <label class="toggle" title="Overlay each placed object's model, projected through this camera">
+          <input type="checkbox" id="showmodels" checked> Models <span class="sk">M</span>
+        </label>
+        <label class="toggle" title="Fill the model's faces instead of only its edges, so which way round it sits is not a guess">
+          <input type="checkbox" id="showshaded"> Shaded <span class="sk">H</span>
+        </label>
+      </div>
+    </div>
 
     <button class="action" id="btn-3d" title="Orbit the solved scene (D)">3D</button>
-    <button class="action" id="btn-help" title="Tutorial and reference (?)">Help</button>
-    <button class="action" id="btn-undo" title="Undo (Ctrl+Z)" disabled>&#8630;</button>
-    <button class="action" id="btn-redo" title="Redo (Ctrl+Shift+Z)" disabled>&#8631;</button>
-    <button class="action" id="btn-save" title="Ctrl+S">Save</button>
-    <button class="action" id="btn-export">Export</button>
+    <button class="action" id="btn-help" title="Tutorial and reference (?)">?</button>
+    <div class="group">
+      <button id="btn-undo" title="Undo (Ctrl+Z)" disabled>&#8630;</button>
+      <button id="btn-redo" title="Redo (Ctrl+Shift+Z)" disabled>&#8631;</button>
+    </div>
+    <div class="group">
+      <button id="btn-save" title="Ctrl+S">Save</button>
+      <button id="btn-export">Export</button>
+    </div>
     <button class="action primary" id="btn-solve" title="Enter">Solve</button>
   </div>
 
@@ -479,9 +538,24 @@
           <span id="view3dtitle">Scene</span>
           <button class="smallbtn" id="v3-scene">scene</button>
           <button class="smallbtn" id="v3-template">model</button>
-          <button class="smallbtn" id="v3-fit">fit</button>
+          <button class="smallbtn" id="v3-fit" title="Frame everything (F)">fit</button>
+          <select id="v3-axis" title="Frame the selection, or put the eye on one axis">
+            <option value="">view&hellip;</option>
+            <option value="fitsel">fit selection &nbsp;&#8679;F</option>
+            <option value="-y">front &nbsp;eye on &minus;Y</option>
+            <option value="y">back &nbsp;eye on +Y</option>
+            <option value="-x">left &nbsp;eye on &minus;X</option>
+            <option value="x">right &nbsp;eye on +X</option>
+            <option value="z">top &nbsp;looking down &minus;Z</option>
+            <option value="-z">bottom &nbsp;looking up +Z</option>
+          </select>
+          <button class="smallbtn" id="v3-orbit"
+                  title="T switches between turntable (horizontal drag turns about world Z) and free tumble (horizontal drag turns about whatever is up on screen). Neither is clamped at the poles.">turntable</button>
+          <span class="roll" id="v3-roll" hidden></span>
+          <button class="smallbtn" id="v3-level" hidden
+                  title="Put world +Z back towards screen-up without moving the eye (R)">level</button>
           <span class="spacer" style="flex:1"></span>
-          <span class="est">drag orbit &middot; shift-drag pan &middot; wheel zoom</span>
+          <span class="est">drag orbit &middot; wheel zoom &middot; &#8679; pan &middot; ctrl roll</span>
           <button class="smallbtn" id="v3-close">close</button>
         </div>
       </div>

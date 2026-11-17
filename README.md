@@ -188,7 +188,8 @@ choose which world axis you are tracing: X, Y, Z.
 - **Longer is better and is weighted accordingly.** A 2 px slip on a 100 px
   segment says far less about a direction than the same slip on a 1000 px one,
   and the solver weights by segment length to match.
-- Keep **VP rays** on. Each control line is extended to its vanishing point.
+- Keep **VP rays** on (it is, by default; it and the other overlays live in the
+  **show** menu in the toolbar). Each control line is extended to its vanishing point.
   If one ray does not converge with its neighbours, that line is on an edge that
   is not actually parallel to the others — the single most common mistake.
 
@@ -480,6 +481,17 @@ has split the difference, so neither is now exactly right. A near-round factor
 almost always means the model's declared units are wrong.
 ```
 
+Fixing it is the **size** row on the model's card in Known objects: the dropdown
+sets the scale from a named unit, and the box beside it takes the model's longest
+side as a plain number, in your nominal units, for the models the dropdown cannot
+help with — a fixture whose file is in some drawing unit that is none of the five,
+or a mesh somebody already scaled on the way out of CAD. Either one is also
+`Shift`+left-drag while posing, when all you have is the silhouette against the
+photograph. Whichever you use, every copy of the model keeps its own centre, so a
+resize does not also fling the bodies across the scene — which it otherwise would,
+since model coordinates are scaled about the CAD file's origin and a tooling
+origin is routinely further from the body than the body is wide.
+
 That comparison is made at **initialisation**, before the refinement runs, which
 is the only point it means anything. Afterwards the bundle adjustment has already
 traded the two sources of scale against each other, so a disagreement shows up as
@@ -504,7 +516,7 @@ mistake into a global one.
 | **scale** | `arbitrary` until you add a distance constraint or place a known object. The solve panel names which one set it. |
 | **constraint error** | Per constraint, what the solve delivered against what you asked for, in world units. The only reading here that compares against something you asserted rather than clicked — and a datum missed by a millimetre is invisible in every other number on this list. |
 
-Turn on **Grid** after solving. It draws the world XY plane anchored to the
+Turn on **Grid** after solving, from the **show** menu in the toolbar. It draws the world XY plane anchored to the
 floor of the point cloud, plus an axis gizmo. If the grid lies flat along the
 real ground in the photo and converges correctly, the solve is right. (Draw your
 vertical edges as **Z** for this to land on the ground.)
@@ -918,22 +930,46 @@ registered images, 17 points, 70 observations, 0.487 px mean reprojection error.
 
 | Key | |
 |---|---|
-| `1` `2` `3` | X / Y / Z axis |
-| `L` `P` `O` `S` | Lines / Points / Objects / Select mode |
+| `L` `P` `O` `G` `S` | Lines / Points / Objects / Pose / Select mode |
+| `1` `2` `3` | X / Y / Z axis, for control lines |
+| `4` | Step through the direction groups |
 | `N` | New tie point |
 | `Tab` | Next photo missing the active point, or the active object's anchors |
 | `←` `→` or `[` `]` | Previous / next photo |
+| `V` `R` `E` `M` `H` | VP rays / residuals / expected / models / shaded, from the **show** menu. Grid and Origin are in that menu too and have no key — `G` is pose mode. |
 | `D` | 3D view (orbit the scene, or a model to pick anchors off) |
 | `F` | Fit view — the 3D view when it is open, otherwise the photo |
-| `V` `R` `G` `M` | Toggle VP rays / residuals / grid / object models |
 | `Enter` | Solve |
 | `Ctrl+S` | Save |
-| `?` | Open the tutorial (also the **Help** button) |
+| `?` | Open the tutorial (also the **?** button) |
 | `Delete` | Remove whatever is under the cursor |
 | wheel | Zoom at cursor |
 | space-drag, middle-drag, alt-drag | Pan |
 | right-click | Delete a marker or line |
 | left-click a drawn line | Reverse its direction — the sign of that axis |
+
+**In the 3D view**, which claims these keys while it is open:
+
+| Key | |
+|---|---|
+| `X` `Y` `Z` | Put the eye on that axis; `Shift` for the far side, so `Shift+Z` looks straight up the +Z axis at the underside of inverted tooling |
+| `Shift+F` | Frame the selection only — the one to use when a fixture, or a CAD origin far from its own geometry, makes the whole-scene box mostly empty |
+| `T` | Turntable (horizontal drag turns about world Z) ↔ free tumble (about whatever is up on screen) |
+| `Q` `E` | Roll the view, `Shift` for bigger steps |
+| `R` | Level the horizon |
+| drag · ctrl-drag · shift-drag · wheel | Orbit · roll · pan · zoom. The orbit is not clamped: it passes through straight-up and straight-down and carries on. |
+
+**Posing a body** (`G`), where the drags act on the object rather than the view:
+
+| | |
+|---|---|
+| left-drag · right-drag | Move it in the image plane · turn it |
+| hold `S` + drag | Its distance along the view ray — this placement only, not the model's size |
+| hold `X`/`Y`/`Z` + drag, or `←` `→` | Turn about one world axis; the arrows step exactly 15°, with `Shift` exactly 90° |
+| `Shift`+left-drag | Resize the **model** — every copy of it, in every photo. Each copy keeps its own centre, so nothing jumps, and the gesture is the same from any view. Type an exact figure in the **size** box in Known objects when you know one. |
+| `Shift`+right-drag | Roll it in the picture plane |
+| `T` | Switches the free turn between world Z and a free tumble, the same switch the 3D view uses |
+| `H` | Bring a body that has drifted off this photo back into frame |
 
 ---
 

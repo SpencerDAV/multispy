@@ -51,8 +51,21 @@ const Viewer3D = (() => {
     hooks: {},
     on: false,
     mode: 'scene',
-    yaw: 0.6,
-    pitch: 0.5,
+    /* Camera orientation as three orthonormal world-space vectors -- the rows
+     * of a world-to-camera rotation, the same convention a solved camera's R
+     * uses here.
+     *
+     * This replaces the yaw/pitch pair the viewer started with. A turntable
+     * cannot cover the sphere: its up vector has to be chosen, it degenerates
+     * where the view direction meets that up vector, and the usual patch for
+     * that -- clamping pitch just short of vertical -- removes exactly the
+     * views an inverted fixture is read from, straight up and straight down
+     * the Z axis. Carrying the basis itself has no poles to clamp and no up
+     * vector to lose, so every orientation is reachable, roll included, and
+     * the two orbit gestures below are then just a choice of which axis the
+     * horizontal drag turns about. */
+    cam: null,       // {right, down, forward}; set by resetCam()
+    orbit: 'turntable',   // 'turntable' (world Z) | 'trackball' (camera up)
     dist: 4,
     target: [0, 0, 0],
     drag: null,
@@ -77,6 +90,23 @@ const Viewer3D = (() => {
     return [a[0] / n, a[1] / n, a[2] / n];
   };
 
+  /** Turn ``v`` about ``axis`` by ``ang`` (Rodrigues). The one rotation
+   *  primitive the camera needs, since every gesture here is "spin the rig
+   *  about some world-space line through the target". */
+  function spin(v, axis, ang) {
+    if (!ang) return v.slice();
+    const k = norm(axis);
+    const c = Math.cos(ang);
+    const s = Math.sin(ang);
+    const kv = cross(k, v);
+    const kd = dot(k, v) * (1 - c);
+    return [
+      v[0] * c + kv[0] * s + k[0] * kd,
+      v[1] * c + kv[1] * s + k[1] * kd,
+      v[2] * c + kv[2] * s + k[2] * kd,
+    ];
+  }
+
   /** Apply a stored 3x3 (row-major) rotation: out = M @ v. */
   function rot(M, v) {
     return [
@@ -86,22 +116,93 @@ const Viewer3D = (() => {
     ];
   }
 
+  /** Pull the basis back onto the rotation group.
+   *
+   *  Each drag composes small rotations onto the stored basis rather than
+   *  rebuilding it from angles, so without this the rows would drift out of
+   *  square over a long session. Forward is kept as the authority because it
+   *  is what the user is aiming, and right is squared against it; down then
+   *  follows from the other two, so the frame stays right-handed by
+   *  construction instead of by luck. */
+  function orthonormalize() {
+    const forward = norm(state.cam.forward);
+    let right = sub(state.cam.right, scale(forward, dot(state.cam.right, forward)));
+    if (Math.hypot(right[0], right[1], right[2]) < 1e-9) {
+      // degenerate only if the stored basis was already broken; any axis not
+      // parallel to forward restores a usable frame
+      right = Math.abs(forward[2]) < 0.9 ? cross(forward, [0, 0, 1]) : cross(forward, [0, 1, 0]);
+    }
+    right = norm(right);
+    state.cam = { right, down: cross(forward, right), forward };
+  }
+
+  /** Spin the whole rig about a world-space axis through the target. */
+  function rotateCam(axis, ang) {
+    if (!ang) return;
+    const c = state.cam;
+    state.cam = {
+      right: spin(c.right, axis, ang),
+      down: spin(c.down, axis, ang),
+      forward: spin(c.forward, axis, ang),
+    };
+    orthonormalize();
+  }
+
+  /** The basis the old yaw/pitch pair would have produced, plus roll.
+   *
+   *  Kept so the default view and the named axis views can be written as the
+   *  angles they obviously are. The up vector is the analytic one for this
+   *  spherical frame rather than world Z, which is what lets pitch be exactly
+   *  +/- 90 degrees -- the top and bottom views -- instead of the almost-90
+   *  the old clamp allowed. */
+  function basisFromAngles(yaw, pitch, roll) {
+    const cp = Math.cos(pitch);
+    const sp = Math.sin(pitch);
+    const sy = Math.sin(yaw);
+    const cy = Math.cos(yaw);
+    const forward = [-cp * sy, cp * cy, -sp];
+    // the derivative of the eye direction with respect to pitch: the way the
+    // top of the frame travels as the eye climbs. Getting its sign wrong is
+    // invisible at small pitch, where it still spans the right plane and only
+    // the normalisation differs, and mirrors the view past 45 degrees -- so
+    // the top and bottom views came out rolled through 180 degrees.
+    const up = [-sp * sy, sp * cy, cp];
+    const right = norm(cross(forward, up));
+    state.cam = { right, down: cross(forward, right), forward };
+    orthonormalize();
+    if (roll) rotateCam(state.cam.forward, roll);
+  }
+
+  function resetCam() {
+    basisFromAngles(0.6, 0.45, 0);
+  }
+
   /** World is Z-up here, matching the 2D grid overlay and the advice to draw
-   *  vertical edges as Z. */
+   *  vertical edges as Z -- but only as the default and as the turntable's
+   *  axis, never as a limit on where the eye may go. */
   function eyePosition() {
-    const cp = Math.cos(state.pitch);
-    const dir = [cp * Math.sin(state.yaw), -cp * Math.cos(state.yaw), Math.sin(state.pitch)];
-    return add(state.target, scale(dir, state.dist));
+    if (!state.cam) resetCam();
+    return sub(state.target, scale(state.cam.forward, state.dist));
   }
 
   function viewBasis() {
     const eye = eyePosition();
-    const forward = norm(sub(state.target, eye));
-    let up = [0, 0, 1];
-    if (Math.abs(dot(forward, up)) > 0.999) up = [0, 1, 0];
-    const right = norm(cross(forward, up));
-    const down = cross(forward, right);
+    const { right, down, forward } = state.cam;
     return { eye, right, down, forward };
+  }
+
+  /** How far the view is tilted off level, for the readout and for levelling.
+   *
+   *  Zero when the horizon is horizontal and world +Z projects upwards. It is
+   *  undefined looking straight along Z, where there is no horizon to be level
+   *  with; there the sign of the dot product is all the orientation there is,
+   *  so it reports 0 and levelling leaves the view alone. */
+  function rollAngle() {
+    const { right, down, forward } = state.cam;
+    const up = [0, 0, 1];
+    const flat = sub(up, scale(forward, dot(up, forward)));
+    if (Math.hypot(flat[0], flat[1], flat[2]) < 1e-6) return 0;
+    return Math.atan2(dot(flat, right), -dot(flat, down));
   }
 
   function projector() {
@@ -134,11 +235,20 @@ const Viewer3D = (() => {
 
   /** A ground grid on the world XY plane, stepped to a round number.
    *
+   *  The step comes from how far away the eye is, not from how big the scene
+   *  is. Those agree while the scene is one part, and stop agreeing the moment
+   *  a two-metre fixture is dropped in beside a hundred-millimetre part: a
+   *  step sized for the fixture leaves the part sitting inside a single grid
+   *  cell with nothing to judge it against, at every zoom level, because the
+   *  scene's size does not change when you zoom into it. Tying the step to the
+   *  view distance instead means the grid is always readable at whatever is
+   *  currently on screen, which is the only thing it was ever for.
+   *
    *  ``hasPartOrigin`` suppresses the plain gizmo: in part space the origin is
    *  drawn properly, with a ring and a dimension, and two triads sharing one
    *  point would only make the honest one look like a rendering artefact. */
-  function drawGrid(ctx, P, extent, hasPartOrigin) {
-    const step = Math.pow(10, Math.round(Math.log10(Math.max(extent, 1e-6) / 6)));
+  function drawGrid(ctx, P, hasPartOrigin) {
+    const step = Math.pow(10, Math.round(Math.log10(Math.max(state.dist, 1e-6) / 6)));
     const reach = step * 12;
     const cx = Math.round(state.target[0] / step) * step;
     const cy = Math.round(state.target[1] / step) * step;
@@ -343,7 +453,7 @@ const Viewer3D = (() => {
 
     const extent = Math.max(scene.extent || 1, 1e-6);
     const partOrigin = state.mode === 'template' ? null : scene.origin;
-    drawGrid(ctx, P, extent, !!partOrigin);
+    drawGrid(ctx, P, !!partOrigin);
 
     if (state.mode === 'template') {
       renderTemplate(ctx, P, extent);
@@ -354,12 +464,21 @@ const Viewer3D = (() => {
       if (partOrigin) drawPartOrigin(ctx, P, partOrigin);
     }
     drawLegend(ctx, P, scene);
+    // the bar carries the orbit mode and the roll, both of which a drag can
+    // change without touching a control
+    if (state.hooks.onViewChange) state.hooks.onViewChange();
   }
 
   function renderScene(ctx, P, scene, extent) {
     drawPoints(ctx, P, scene.points || [], COLOR.point, 2);
 
-    const camSize = extent * 0.06;
+    /* Glyphs are sized from how far apart the marks are, not from the scene
+     * box. The two used to be the same number; they stopped being the same
+     * once placed geometry started counting towards the scene box, and a
+     * fixture larger than the camera walk would otherwise draw every camera
+     * pyramid metres long over the cameras it is meant to mark. */
+    const markScale = Math.max(scene.markScale || extent, 1e-6);
+    const camSize = markScale * 0.06;
     for (const cam of scene.cameras || []) {
       const { verts, edges } = frustumEdges(
         cam.center,
@@ -406,7 +525,14 @@ const Viewer3D = (() => {
       if (obj.optical) {
         const eye = add(rot(obj.R, scale(obj.optical.center, obj.unitScale)), obj.t);
         const axis = rot(obj.R, obj.optical.forward);
-        const tip = add(eye, scale(norm(axis), extent * 0.12));
+        // as long as the body it comes out of, so a 100 mm camera body keeps a
+        // 100 mm stub whatever else is in the scene
+        const span = obj.box
+          ? Math.hypot(obj.box[1][0] - obj.box[0][0],
+                       obj.box[1][1] - obj.box[0][1],
+                       obj.box[1][2] - obj.box[0][2])
+          : 0;
+        const tip = add(eye, scale(norm(axis), span > 0 ? span * 0.6 : markScale * 0.12));
         const a = P.project(eye);
         const b = P.project(tip);
         if (a && b) {
@@ -590,9 +716,51 @@ const Viewer3D = (() => {
       state.target = scene.center || [0, 0, 0];
       state.dist = Math.max((scene.extent || 1) * 1.8, 1e-3);
     }
-    state.yaw = 0.6;
-    state.pitch = 0.45;
+    resetCam();
     render();
+  }
+
+  /* Frame one thing instead of everything.
+   *
+   * Fitting the whole scene is the wrong move as soon as the scene contains a
+   * large fixture, or a model whose CAD origin sits a metre from its geometry:
+   * the box that holds everything is then mostly empty space, and the part
+   * actually being positioned ends up a few pixels across in the middle of it.
+   * The scene supplies a focus box for whatever is selected, and this frames
+   * that box and nothing else. The orientation is deliberately left alone --
+   * it is a zoom, not a reset, and the view you were working from is usually
+   * the view you still want. */
+  function frameSelection() {
+    const scene = state.hooks.getScene ? state.hooks.getScene() : null;
+    const box = scene && scene.focus;
+    if (!box) return false;
+    const lo = box[0];
+    const hi = box[1];
+    state.target = [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2);
+    // A box with no size -- one anchor and no mesh -- says where the thing is
+    // and nothing about how big it is. Re-centre on it and leave the distance
+    // alone, rather than diving to the 0.1 mm the clamp would otherwise pick.
+    const span = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+    if (span > 1e-9) state.dist = Math.max(span * 1.6, 1e-4);
+    render();
+    return true;
+  }
+
+  /** The six axis views, by where the eye is put. ``z`` looks straight down
+   *  the -Z axis and ``-z`` straight up the +Z axis -- the pair the old pitch
+   *  clamp could only ever approach. */
+  const AXIS_VIEWS = {
+    x: [Math.PI / 2, 0], '-x': [-Math.PI / 2, 0],
+    y: [Math.PI, 0], '-y': [0, 0],
+    z: [0, Math.PI / 2], '-z': [0, -Math.PI / 2],
+  };
+
+  function setAxisView(key) {
+    const a = AXIS_VIEWS[key];
+    if (!a) return false;
+    basisFromAngles(a[0], a[1], 0);
+    render();
+    return true;
   }
 
   function attach(canvas, hooks) {
@@ -613,10 +781,17 @@ const Viewer3D = (() => {
       state.drag = {
         x: ev.clientX,
         y: ev.clientY,
-        yaw: state.yaw,
-        pitch: state.pitch,
+        cam: state.cam,
         target: [...state.target],
-        pan: ev.button === 1 || ev.shiftKey,
+        // alt pans here because alt pans on the photograph, and one key
+        // meaning "pan" on one canvas and "roll" on the other is the kind of
+        // difference nobody discovers deliberately
+        pan: ev.button === 1 || ev.shiftKey || ev.altKey,
+        // roll gets a modifier of its own rather than a second axis on the
+        // orbit drag: it is the one view angle you set once and then leave,
+        // and having it ride along on every orbit would mean never being able
+        // to orbit without disturbing it
+        roll: !(ev.button === 1 || ev.shiftKey || ev.altKey) && (ev.ctrlKey || ev.metaKey),
       };
     });
 
@@ -641,8 +816,28 @@ const Viewer3D = (() => {
           add(scale(right, -dx * k), scale(down, -dy * k))
         );
       } else {
-        state.yaw = state.drag.yaw + dx * 0.008;
-        state.pitch = Math.max(-1.5, Math.min(1.5, state.drag.pitch + dy * 0.008));
+        /* Replayed from the basis captured at press rather than accumulated
+         * frame to frame, so the same hand position always gives the same
+         * view: a drag can be walked back by moving the mouse back, which an
+         * accumulating orbit cannot offer. */
+        state.cam = state.drag.cam;
+        if (state.drag.roll) {
+          // right is clockwise, matching E; see rollBy for the negation
+          rotateCam(state.cam.forward, -dx * 0.008);
+        } else {
+          // Horizontal turns about world Z (turntable) or about the camera's
+          // own up (trackball). Vertical always turns about the camera's
+          // right, taken AFTER the horizontal turn so the two compose the way
+          // a hand expects. Neither is clamped: the view passes through
+          // straight-down and straight-up and carries on, and at those poles
+          // the horizontal drag spins the image, which is how an inverted
+          // fixture gets squared up.
+          const hAxis = state.orbit === 'trackball'
+            ? scale(state.cam.down, -1)
+            : [0, 0, 1];
+          rotateCam(hAxis, dx * 0.008);
+          rotateCam(state.cam.right, -dy * 0.008);
+        }
       }
       render();
     });
@@ -668,6 +863,47 @@ const Viewer3D = (() => {
     attach,
     render,
     frameAll,
+    frameSelection,
+    setAxisView,
+    orbitMode: () => state.orbit,
+    setOrbitMode(mode) {
+      state.orbit = mode === 'trackball' ? 'trackball' : 'turntable';
+      render();
+    },
+    /** Turn the view about the direction it is already looking.
+     *
+     *  Negated because spinning the rig one way tilts the world the other:
+     *  ``rotateCam(forward, t)`` leaves ``rollAngle()`` reading ``-t``, so
+     *  without this a roll of +15 degrees reported itself as -15 and
+     *  levelling doubled the tilt instead of removing it. */
+    rollBy(ang) {
+      if (!state.cam) resetCam();
+      rotateCam(state.cam.forward, -ang);
+      render();
+    },
+    /** Put world +Z back towards screen-up without moving the eye. */
+    levelRoll() {
+      if (!state.cam) resetCam();
+      rotateCam(state.cam.forward, rollAngle());
+      render();
+    },
+    rollDegrees: () => (state.cam ? (rollAngle() * 180) / Math.PI : 0),
+    /** The camera, read-only, for tests and for anything that needs to know
+     *  where the eye actually is. Copies out, so nothing can reach in and
+     *  leave the basis un-orthonormal behind the module's back. */
+    view() {
+      if (!state.cam) resetCam();
+      return {
+        dist: state.dist,
+        target: [...state.target],
+        eye: eyePosition(),
+        right: [...state.cam.right],
+        down: [...state.cam.down],
+        forward: [...state.cam.forward],
+        orbit: state.orbit,
+        roll: (rollAngle() * 180) / Math.PI,
+      };
+    },
     isOn: () => state.on,
     setVisible(on) {
       state.on = !!on;
