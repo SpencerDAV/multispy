@@ -241,6 +241,128 @@ def test_the_two_readings_differ_and_the_mixed_one_answers_another_question() ->
     )
 
 
+def test_a_mark_the_bodies_cost_the_solve_convicts_on_its_own() -> None:
+    """The hole this module shipped with, pinned so it cannot reopen.
+
+    Restricting the RMS comparison to marks surviving both culls makes the
+    average fair and makes a cull invisible: the mark leaves the comparison
+    instead of counting against the bodies. Asked about PRM1 with 260 restored
+    anchor marks, the first version answered "improves, 1.99 to 1.66 px, no image
+    worse" about a solve that had gone from 2.03 px to 13.09 px and had culled
+    eleven tie-point marks, three on nominal'd points. The 1.66 px was an average
+    over 57 marks where the 1.99 px was over 67.
+
+    The stub below is that shape exactly, and deliberately *flattering*: every
+    mark still in the comparison fits better with the bodies than without. A
+    verdict of anything but "worsens" means the cull is being ignored again.
+    """
+    import multispy.solve as solve_mod
+
+    class Stub:
+        ok = True
+        focals = {"cam0": 2750.0}
+
+        def __init__(self, rows):
+            self.residual_lines = rows
+
+    # Ids taken from the fixture rather than invented. _tie_ids filters the
+    # residuals to labels that really are tie points -- correctly, since a point
+    # id is whatever the user typed -- so a made-up label is silently ignored and
+    # the trap never fires. That is how the first draft of this test passed the
+    # broken code.
+    project = rig()
+    a, b, doomed = [pt.id for pt in project.points[:3]]
+
+    without = Stub([
+        {"image": "img0", "point": a, "error_px": 1.0, "culled": False},
+        {"image": "img0", "point": b, "error_px": 1.0, "culled": False},
+        # fits badly, but it is in the solve
+        {"image": "img0", "point": doomed, "error_px": 4.0, "culled": False},
+    ])
+    with_bodies = Stub([
+        # the survivors each improve...
+        {"image": "img0", "point": a, "error_px": 0.5, "culled": False},
+        {"image": "img0", "point": b, "error_px": 0.5, "culled": False},
+        # ...because the one that disagreed was thrown out
+        {"image": "img0", "point": doomed, "error_px": 40.0, "culled": True},
+    ])
+
+    calls = []
+
+    def fake_solve(project, *a, **kw):
+        calls.append(project)
+        # check_cad_bodies solves with the bodies first, then without
+        return with_bodies if len(calls) == 1 else without
+
+    real = solve_mod.solve
+    try:
+        solve_mod.solve = fake_solve
+        r = check_cad_bodies(project)
+    finally:
+        solve_mod.solve = real
+
+    assert len(calls) == 2, f"expected a solve with the bodies and one without; got {len(calls)}"
+    assert r.ok, r.reason
+    assert r.after_rms_px < r.before_rms_px, (
+        "the stub is meant to look like an improvement on the surviving marks; if it does "
+        "not, the test is not exercising the trap"
+    )
+    assert r.verdict == "worsens", (
+        f"a lost tie point must convict however good the remaining average looks; got "
+        f"{r.verdict!r} with {r.before_rms_px:.2f} -> {r.after_rms_px:.2f} px"
+    )
+    assert r.n_newly_culled == 1, r.n_newly_culled
+    assert r.n_marks_before == 3 and r.n_marks_after == 2, (r.n_marks_before, r.n_marks_after)
+    img0 = next(v for v in r.images if v.image == "img0")
+    assert img0.newly_culled == [doomed], img0.newly_culled
+    assert img0.worsened, "and the image that lost it must be named"
+    assert any("cost the solve" in n for n in r.notes), f"and said in words: {r.notes}"
+
+
+def test_a_cull_is_not_excused_by_the_tolerance() -> None:
+    """No allowance applies to a lost mark.
+
+    The tolerances are for how far a fit may drift. A mark the solver gave up on
+    has not drifted inside anything -- it is gone -- so a generous tolerance must
+    not buy it back.
+    """
+    import multispy.solve as solve_mod
+
+    class Stub:
+        ok = True
+        focals = {"cam0": 2750.0}
+
+        def __init__(self, rows):
+            self.residual_lines = rows
+
+    project = rig()
+    a, b = [pt.id for pt in project.points[:2]]
+    without = Stub([
+        {"image": "img0", "point": a, "error_px": 1.0, "culled": False},
+        {"image": "img0", "point": b, "error_px": 1.0, "culled": False},
+    ])
+    with_bodies = Stub([
+        {"image": "img0", "point": a, "error_px": 1.0, "culled": False},
+        {"image": "img0", "point": b, "error_px": 99.0, "culled": True},
+    ])
+    calls = []
+
+    def fake_solve(project, *a, **kw):
+        calls.append(project)
+        return with_bodies if len(calls) == 1 else without
+
+    real = solve_mod.solve
+    try:
+        solve_mod.solve = fake_solve
+        r = check_cad_bodies(project, tolerance_px=1000.0, tolerance_fraction=1000.0)
+    finally:
+        solve_mod.solve = real
+    assert r.verdict == "worsens", (
+        f"a tolerance of a thousand pixels must not excuse a culled mark; got {r.verdict!r}"
+    )
+    assert r.n_newly_culled == 1
+
+
 def test_only_tie_points_enter_the_comparison() -> None:
     """Anchors excluded, culls excluded, by label and by flag."""
 

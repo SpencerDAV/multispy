@@ -59,6 +59,24 @@ body-laden solve culls a mark the body-free one kept, the two RMS figures are
 taken over different populations, and dropping the worst mark is an easy way to
 look better while being worse.
 
+And that restriction, on its own, was a hole big enough to drive the whole
+failure through -- recorded here because it is the most useful thing this module
+has learned about itself. Restricting to the intersection makes the *average*
+fair and makes a cull **invisible**: a mark the bodies push out of the solve
+simply leaves the comparison, instead of counting against them. Asked to judge
+PRM1 with 260 restored anchor marks, the first version of this module answered
+"improves, 1.99 to 1.66 px, no image worse". The real solve had gone from 2.03 px
+to 13.09 px and had culled eleven tie-point marks, three of them on nominal'd
+points. The 1.66 px was an average over 57 marks where the 1.99 px was over 67.
+It had not improved the fit; it had discarded the evidence that disagreed and
+reported the remainder.
+
+So a cull is now damage in its own right. ``newly_culled`` convicts on sight, no
+allowance applies to it, and the mark counts either side are reported next to the
+pixels with instructions to read them first. A mark the solver has given up on
+has not drifted within tolerance -- it is gone, it constrains nothing, and if it
+carried a nominal the part space is a link short.
+
 What this does and does not do
 ------------------------------
 It measures, and it can put the body-free cameras back. It does not place the
@@ -126,6 +144,16 @@ class ImageVerdict:
     """The tie point whose own error grew most in this image. Where to look
     first, and usually an anchor clicked on the wrong feature nearby."""
     worst_point_delta_px: float = 0.0
+    newly_culled: list[str] = field(default_factory=list)
+    """Tie points this photograph kept without the bodies and lost with them.
+
+    Damage, and the worst kind, which is why it convicts on its own without
+    reference to any RMS. A culled mark is a mark the solver gave up on: the
+    feature stops constraining anything, and if it carried a nominal the part
+    space loses a link. It also *flatters* every average it leaves, since the
+    marks that drop out are the ones fitting worst -- which is how the first
+    version of this module reported an improvement while ten marks fell out of
+    the solve."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -150,10 +178,20 @@ class CadReport:
     """The shared focal either side. Carried because it is the quantity a bad
     body attacks first, and a focal that moved several percent is a stronger
     signal than any single image's RMS."""
+    n_marks_before: int = 0
+    """Tie-point marks the body-free solve kept."""
+    n_marks_after: int = 0
+    """And how many survived with the bodies in. A drop is the first thing to
+    read: the RMS figures below are averages, and an average taken over fewer
+    marks is not comparable with one taken over more however the arithmetic is
+    restricted."""
+    n_newly_culled: int = 0
+    """Tie-point marks lost to the bodies, across all images."""
     images: list[ImageVerdict] = field(default_factory=list)
     """Worst first."""
     worsened: list[str] = field(default_factory=list)
-    """Images whose tie-point fit the bodies made worse past the allowance."""
+    """Images whose tie-point fit the bodies made worse past the allowance, or
+    which lost a tie point to them."""
     worst_image: str = ""
     notes: list[str] = field(default_factory=list)
 
@@ -172,24 +210,36 @@ def _tie_ids(project: Project) -> set[str]:
     return {p.id for p in project.points}
 
 
-def _per_image(report: Any, tie_ids: set[str]) -> dict[str, dict[str, float]]:
-    """``{image: {point: error_px}}`` for uncradled tie-point marks only.
+def _marks(
+    report: Any, tie_ids: set[str]
+) -> tuple[dict[str, dict[str, float]], dict[str, set[str]]]:
+    """Tie-point marks this solve kept, and the ones it culled.
 
-    Anchors are excluded here rather than subtracted later: this is the whole
-    correction the module docstring describes.
+    Both, because the kept ones alone are not enough to judge a body -- see
+    :func:`check_cad_bodies` on why a cull is damage rather than an absence.
+    Anchors are excluded from both: that is the correction the module docstring
+    describes.
     """
-    out: dict[str, dict[str, float]] = {}
+    kept: dict[str, dict[str, float]] = {}
+    culled: dict[str, set[str]] = {}
     for row in getattr(report, "residual_lines", None) or []:
-        if row.get("culled"):
-            continue
         label = row.get("point")
         if label not in tie_ids:
+            continue
+        iid = row.get("image", "")
+        if row.get("culled"):
+            culled.setdefault(iid, set()).add(label)
             continue
         err = row.get("error_px")
         if err is None:
             continue
-        out.setdefault(row.get("image", ""), {})[label] = float(err)
-    return out
+        kept.setdefault(iid, {})[label] = float(err)
+    return kept, culled
+
+
+def _per_image(report: Any, tie_ids: set[str]) -> dict[str, dict[str, float]]:
+    """Kept tie-point marks only. Retained for callers that want just those."""
+    return _marks(report, tie_ids)[0]
 
 
 def _rms(values: list[float]) -> float:
@@ -267,24 +317,38 @@ def check_cad_bodies(
         )
         return rep
 
-    before = _per_image(before_report, tie_ids)
-    after = _per_image(after_report, tie_ids)
+    before, culled_before = _marks(before_report, tie_ids)
+    after, culled_after = _marks(after_report, tie_ids)
+    rep.n_marks_before = sum(len(v) for v in before.values())
+    rep.n_marks_after = sum(len(v) for v in after.values())
     rep.focal_before_px = _shared_focal(before_report)
     rep.focal_after_px = _shared_focal(after_report)
 
     all_before: list[float] = []
     all_after: list[float] = []
-    for iid in sorted(set(before) | set(after)):
+    for iid in sorted(set(before) | set(after) | set(culled_after)):
         b, a = before.get(iid, {}), after.get(iid, {})
         shared = sorted(set(b) & set(a))
-        if not shared:
+        # Kept without the bodies, culled with them. Taken before the `shared`
+        # guard below, because an image can lose every mark it had and would
+        # otherwise drop out of the report entirely -- silence where the damage
+        # is total.
+        lost = sorted((culled_after.get(iid, set()) - culled_before.get(iid, set())) & set(b))
+        if not shared and not lost:
             continue
-        v = ImageVerdict(image=iid, n_points=len(shared))
+        v = ImageVerdict(image=iid, n_points=len(shared), newly_culled=lost)
+        if not shared:
+            v.worsened = True
+            rep.images.append(v)
+            continue
         v.before_px = _rms([b[p] for p in shared])
         v.after_px = _rms([a[p] for p in shared])
         v.delta_px = v.after_px - v.before_px
         v.allowed_px = max(float(tolerance_px), float(tolerance_fraction) * v.before_px)
-        v.worsened = v.delta_px > v.allowed_px
+        # A lost mark convicts on its own. No allowance applies to it: the
+        # tolerances above are for how much a fit may drift, and a mark the
+        # solver has given up on has not drifted, it has gone.
+        v.worsened = v.delta_px > v.allowed_px or bool(v.newly_culled)
         worst = max(shared, key=lambda p: a[p] - b[p])
         v.worst_point, v.worst_point_delta_px = worst, a[worst] - b[worst]
         rep.images.append(v)
@@ -301,12 +365,28 @@ def check_cad_bodies(
 
     rep.before_rms_px = _rms(all_before)
     rep.after_rms_px = _rms(all_after)
-    rep.images.sort(key=lambda v: -v.delta_px)
+    rep.images.sort(key=lambda v: (-len(v.newly_culled), -v.delta_px))
     rep.worsened = [v.image for v in rep.images if v.worsened]
+    rep.n_newly_culled = sum(len(v.newly_culled) for v in rep.images)
     rep.worst_image = rep.images[0].image
     rep.ok = True
 
-    if rep.worsened:
+    if rep.n_newly_culled:
+        rep.verdict = "worsens"
+        lost = ", ".join(
+            f"{v.image}:{'/'.join(v.newly_culled)}" for v in rep.images if v.newly_culled
+        )
+        rep.notes.append(
+            f"the bodies cost the solve {rep.n_newly_culled} tie-point mark(s), dropped as "
+            f"outliers with them in and kept without: {lost}. That is the clearest form of "
+            f"damage there is -- a culled mark constrains nothing, and one on a nominal'd "
+            f"point costs the part space a link. It also flatters every average it leaves "
+            f"behind, since the marks that fall out are the worst-fitting ones: the RMS "
+            f"figures below are over {rep.n_marks_after} marks against "
+            f"{rep.n_marks_before} without the bodies, so read the counts before the "
+            f"pixels."
+        )
+    elif rep.worsened:
         rep.verdict = "worsens"
         rep.notes.append(
             f"the bodies make {len(rep.worsened)} of {len(rep.images)} image(s) fit their own "
@@ -316,6 +396,18 @@ def check_cad_bodies(
             f"{rep.images[0].worst_point_delta_px:+.2f} px. Look at that point's "
             f"neighbourhood in that photo: an anchor clicked on the wrong one of two similar "
             f"corners is the usual cause, and a model at the wrong scale is the next."
+        )
+    elif rep.n_marks_after < rep.n_marks_before:
+        # A belt to the per-image braces above: if the totals disagree and no
+        # image could name which marks it lost, something has gone out of the
+        # solve that this code cannot account for, and an improvement must not be
+        # announced over it.
+        rep.verdict = "worsens"
+        rep.notes.append(
+            f"the solve kept {rep.n_marks_after} tie-point marks with the bodies against "
+            f"{rep.n_marks_before} without them, and the per-image tables cannot say which "
+            f"went. Treat the comparison as void rather than favourable: an average over "
+            f"fewer marks is not a better average."
         )
     elif rep.after_rms_px < rep.before_rms_px - IMPROVEMENT_PX:
         rep.verdict = "improves"
