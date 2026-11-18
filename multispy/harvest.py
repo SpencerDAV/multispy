@@ -58,7 +58,12 @@ times, by less than the measurement can resolve.  Freeing ``lock_focal`` and
 ``lock_k1`` changes nothing either way: every one of the six variants lands
 between 19.42 and 19.68, while changing only the fold seed moves the *same*
 baseline from 17.83 to 19.42.  The differences between variants are seven
-times smaller than the noise in the measurement of them.
+times smaller than the noise in the measurement of them.  Freeing the principal
+point as well widens the band only to 19.80, and its worst row is the one with
+the most evidence *and* the most freedom: the harvest supplies enough
+observations to let more intrinsics float without anything breaking, and
+floating them buys nothing, because the error they would have to absorb is not
+in the camera model.
 
 Anyone reading the in-solve figure alone would conclude this feature worked,
 and would be wrong; that is exactly the trap ``crossval.py`` was written to
