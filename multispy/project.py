@@ -445,6 +445,32 @@ class ObjectInstance:
     locked: bool = False
     """Hold this placement fixed during the bundle adjustment. Useful once one
     body is trusted and you want it to define the frame for the rest."""
+    anchors_off: bool = False
+    """This body's anchor marks are not evidence about where the cameras are.
+
+    The body stays in the scene, keeps every anchor the user clicked, and is
+    still placed and still reported with its shape error -- but its marks are
+    out of the solve entirely: out of the connectivity graph, out of the linear
+    initialisation, out of the bundle. The cameras and the tie points come out
+    exactly as they would if the body had never been marked, and the body is
+    then fitted to those cameras rather than allowed to move them.
+
+    This is the setting the CAD guard's verdict leads to. ``cadguard`` could
+    already measure the damage a bad body does and put the body-free cameras
+    back, but the marks stayed live, so the next press of Solve re-made the
+    mess: the restore was a snapshot, not a decision. A flag on the instance is
+    the decision, and it survives the file.
+
+    It is deliberately per *instance* rather than per template, because the
+    thing that goes wrong is one placement's marks -- an anchor clicked on the
+    wrong one of two similar corners -- and the same model placed nine other
+    times may be marked perfectly. :data:`Settings.anchors_in_solve` is the
+    blunt instrument for when none of them should vote.
+
+    Distinct from deleting the marks, which is the only way this could be done
+    before, and distinct in the way that matters: a deleted mark cannot be
+    re-examined, cannot be re-clicked against what it used to be, and takes its
+    body's placement with it. Nothing here is destructive."""
     is_part: bool = False
     """This is *the part itself*, not an object placed in the scene.
 
@@ -585,6 +611,27 @@ class Settings:
     """After a first pass, give each body a sigma measured from its own
     residuals, so an object that disagrees with the photos declares itself
     unreliable instead of dragging the cameras over to meet it."""
+    anchors_in_solve: bool = True
+    """Let known-object anchor marks be evidence about the cameras at all.
+
+    Turn it off and every body behaves as though :attr:`~ObjectInstance.anchors_off`
+    were set on it: the cameras and tie points are solved from tie points,
+    control lines and nominals alone, and the bodies are fitted to the result
+    afterwards. Nothing is deleted and nothing stops being drawn.
+
+    The blunt instrument, and the one the user asked for by name after the
+    per-body machinery kept being the long way round: on a cell with 28 bodies
+    and 582 anchor marks, "this fit was good before the models went in" is a
+    statement about all of them, and finding out which three are lying is a
+    separate afternoon's work. This is the switch that says *not now* to the
+    whole class without losing a single click.
+
+    Default on, because a correctly marked body is a stronger claim than any
+    tie point and is worth more than one -- see ``cadguard`` for the measured
+    difference between the two cases. Off is a position, not a repair: the
+    report says so on every solve, because a project quietly ignoring 582 marks
+    while reporting a lovely RMS would be the most misleading state this
+    program could be in."""
     sigma_nominal: float = 0.1
     """Default tolerance on a point nominal, in the project's nominal units.
 
@@ -623,6 +670,19 @@ class Settings:
     """Clicked marks worse than this many sigma after the first pass are dropped
     from the second. 0 disables culling. Guarded: nothing is dropped that would
     leave a track, an image or a body without enough marks to stay solvable."""
+    cull_ceiling_factor: float = 8.0
+    """Ceiling on the sigma an anchor mark is *culled* against, as a multiple of
+    the tie-point scale the same pass measured. 0 removes the ceiling.
+
+    A body's cull threshold is ``cull_sigma`` times its own sigma, and that
+    sigma widens when the body fits badly -- so without a ceiling, the worse a
+    body is marked the harder it becomes to catch any single bad mark on it.
+    On the rear-module cell that reached 879 px, and 23 of 28 bodies had every
+    mark beyond their own threshold: the check was still running and could no
+    longer fail. Pinning the ceiling to the tie points, which no one body can
+    widen, keeps a blunder catchable however loose its body has become. It does
+    not touch how the body is *weighted*; a badly marked body still declares
+    itself unreliable, it just stops excusing its own outliers."""
     huber_f_scale: float = 3.0
     """Robust loss knee, in multiples of sigma. Clicks beyond this get downweighted."""
     solve_principal_point: bool = False
@@ -1029,6 +1089,74 @@ class Project:
                 out[anchor_key(inst.id, name)] = xyz
         return out
 
+    def anchors_are_evidence(self, instance: ObjectInstance) -> bool:
+        """May this body's anchor marks say anything about where the cameras are?
+
+        False when the project switch is off or this placement's own flag is set
+        -- see :attr:`Settings.anchors_in_solve` and
+        :attr:`ObjectInstance.anchors_off`. The part is never evidence either,
+        for the separate reason :meth:`anchor_world_points` gives, but the part
+        is not a placed object so it does not reach here.
+        """
+        if not self.settings.anchors_in_solve:
+            return False
+        return not instance.anchors_off
+
+    def muted_instances(self) -> list[ObjectInstance]:
+        """Placed bodies whose anchors are out of the solve, in file order."""
+        return [
+            inst
+            for inst in self.placed_object_instances()
+            if not self.anchors_are_evidence(inst)
+        ]
+
+    def muted_anchor_keys(self) -> set[str]:
+        """Anchor keys the solve must not read as evidence.
+
+        Every key belonging to a muted body, whether or not anybody has marked
+        it. Taken from the templates rather than from the marks because this is
+        the set the solve *filters* against, and a filter built from the marks
+        would have to be rebuilt every time one was clicked.
+        """
+        muted = {inst.id for inst in self.muted_instances()}
+        if not muted:
+            return set()
+        return {
+            key
+            for key in self.anchor_world_points()
+            if split_anchor_key(key)[0] in muted
+        }
+
+    def solving_anchor_points(self) -> dict[str, np.ndarray]:
+        """:meth:`anchor_world_points`, less the bodies that are not voting.
+
+        What every stage of the solve that reads anchors *as evidence* should
+        use: connectivity, pruning, the linear initialisation, the scale fit and
+        the bundle. The unfiltered version stays for the two jobs that are not
+        about evidence -- deciding which marks are stale, which must never
+        delete a muted body's clicks, and placing the muted bodies afterwards
+        against the cameras the rest of the project produced.
+        """
+        muted = self.muted_anchor_keys()
+        points = self.anchor_world_points()
+        if not muted:
+            return points
+        return {k: v for k, v in points.items() if k not in muted}
+
+    def n_muted_anchor_marks(self) -> int:
+        """Anchor marks actually clicked on muted bodies, across active images.
+
+        Reported rather than inferred, because "the bodies are out of the solve"
+        and "582 clicks are out of the solve" land very differently on the
+        person who made them.
+        """
+        muted = self.muted_anchor_keys()
+        if not muted:
+            return 0
+        return sum(
+            sum(1 for key in im.anchor_obs if key in muted) for im in self.active_images()
+        )
+
     def part_anchor_keys(self) -> set[str]:
         """Observation keys that name the part.
 
@@ -1226,6 +1354,7 @@ class Project:
                     "template": o.template,
                     "label": o.label,
                     "locked": o.locked,
+                    "anchors_off": o.anchors_off,
                     "manual": o.manual,
                     "pose_in_part_space": o.pose_in_part_space,
                     "calibrated": o.calibrated,
@@ -1377,6 +1506,7 @@ class Project:
                 template=raw["template"],
                 label=raw.get("label", ""),
                 locked=bool(raw.get("locked", False)),
+                anchors_off=bool(raw.get("anchors_off", False)),
                 manual=bool(raw.get("manual", False)),
                 pose_in_part_space=bool(raw.get("pose_in_part_space", False)),
                 calibrated=str(raw.get("calibrated", "") or ""),

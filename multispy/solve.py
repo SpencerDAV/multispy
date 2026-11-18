@@ -149,6 +149,16 @@ class InstanceReport:
     ever checked."""
     manual: bool = False
     """This body carries a pose someone set by hand, with no anchors behind it."""
+    anchors_off: bool = False
+    """This body's anchors were out of the solve, so its pose was fitted to the
+    cameras rather than allowed to move them.
+
+    Carried in the report, not just on the instance, because every other number
+    in this row means something different when it is true. ``shape_rms`` is now
+    a pure *reading* -- how far the model sits from where the photographs put its
+    anchors, with no opportunity for the cameras to have bent to meet it -- which
+    makes it a better measurement than the voting version, not a worse one.
+    ``rms_px`` likewise describes marks that cost the solve nothing."""
     n_anchors_marked: int = 0
     n_anchors_used: int = 0
     """Anchors seen in 2+ photos. Three is the floor for a determined pose: two
@@ -244,6 +254,15 @@ class SolveReport:
     real units but leaves the origin and orientation arbitrary."""
     n_nominals: int = 0
     """Points carrying a nominal XYZ."""
+    n_muted_instances: int = 0
+    """Placed bodies whose anchors were kept out of the solve.
+
+    Reported on every solve, prominently, and that is the point of the field:
+    a project ignoring most of its clicks while printing a clean RMS is the most
+    misleading state this program can reach, so the state has to be visible in
+    the same report as the number it improves."""
+    n_muted_anchor_marks: int = 0
+    """And how many clicks that came to."""
     part_fit: dict[str, Any] | None = None
     """How well the part's own CAD model agrees with the reconstruction, when a
     part is designated and the solve reached part space.
@@ -271,6 +290,8 @@ class SolveReport:
             "scale_source": self.scale_source,
             "part_space": self.part_space,
             "n_nominals": self.n_nominals,
+            "n_muted_instances": self.n_muted_instances,
+            "n_muted_anchor_marks": self.n_muted_anchor_marks,
             "part_fit": self.part_fit,
             "focals": self.focals,
             "images": {k: vars(v) for k, v in self.images.items()},
@@ -660,15 +681,27 @@ def _transform_scene(
     for key in positions:
         positions[key] = scale * (Rg @ positions[key]) + tg
 
-    # Hand-placed bodies are carried along too. Every other pose here is
-    # recomputed from `positions` after this runs, so it needs no help; a manual
-    # pose is the one thing in the scene that nothing downstream reconstructs,
-    # and leaving it behind would silently detach it from the photographs it was
-    # aligned against. The rotation takes no scale factor: the body's own size is
-    # CAD truth, and this call is re-expressing the scene *into* those units, not
-    # resizing the object.
+    # Every body carrying a pose is carried along, hand-placed or measured.
+    #
+    # This used to transform only the hand-placed ones, on the reasoning that
+    # "every other pose here is recomputed from `positions` after this runs".
+    # That is true of the calls inside `fit_instances`, which run before it
+    # writes any pose -- and false of the one in `align_to_nominals`, which runs
+    # after. `fit_instances` measures each body in the *initialisation's* frame
+    # and clears `manual` as it does so, so the bodies it has just placed were
+    # exactly the set this loop skipped, and nothing downstream recomputed them:
+    # they stayed behind while the cameras and tie points moved into part space.
+    # On the rear-module cell that left the anchors starting the bundle a median
+    # of 5.4 million pixels out -- most bodies behind their cameras, pinned at
+    # the depth clamp -- which is 99.85% of the initial cost, and the refinement
+    # then spent its whole iteration budget hauling them back instead of
+    # refining anything. `pose_in_part_space` is the honest gate here, and it is
+    # the only one needed: it says whether this pose has already been through
+    # this transform, which is the actual question. The rotation takes no scale
+    # factor: the body's own size is CAD truth, and this call is re-expressing
+    # the scene *into* those units, not resizing the object.
     for inst in project.placed_object_instances():
-        if not inst.manual or inst.R is None or inst.t is None:
+        if inst.R is None or inst.t is None:
             continue
         # ...but only once. A pose already in part space came out of a previous
         # solve in this very frame; transforming it again moves it by the whole
@@ -839,10 +872,17 @@ def _clear_unbacked_poses(project: Project) -> int:
 
     A hand placement is the exception and is kept: nobody else made it and no
     later stage recreates it. So is a locked body's, which is the world frame.
+    So is a muted body's, and that one is the subtle exception: its anchors are
+    present and are about to place it, just not here -- see
+    :func:`place_muted_instances`. Clearing it would make muting a body look
+    exactly like deleting its marks, which is the one thing muting exists not to
+    be.
     """
     cleared = 0
     for inst in project.placed_object_instances():
         if inst.locked or inst.manual:
+            continue
+        if not project.anchors_are_evidence(inst):
             continue
         if inst.R is None and inst.t is None:
             continue
@@ -870,12 +910,17 @@ def fit_instances(
 
     Returns ``(scale_was_set, description)``.
     """
-    anchor_locals = project.anchor_world_points()
+    # Marked counts come from the full set, so a muted body still reports how
+    # many anchors it carries -- the marks exist, they are just not voting, and
+    # a row reading 0/0 would say the clicks were lost.
+    all_locals = project.anchor_world_points()
+    anchor_locals = project.solving_anchor_points()
+    muted_ids = {inst.id for inst in project.muted_instances()}
     by_instance: dict[str, list[tuple[str, np.ndarray, np.ndarray]]] = {}
     marked_count: dict[str, set[str]] = {}
     for im in project.active_images():
         for key in im.anchor_obs:
-            if key in anchor_locals:
+            if key in all_locals:
                 inst_id, name = split_anchor_key(key)
                 marked_count.setdefault(inst_id, set()).add(name)
     for key, local in anchor_locals.items():
@@ -900,6 +945,15 @@ def fit_instances(
             continue
         rep.n_anchors_marked = len(marked_count.get(inst.id, ()))
         rep.manual = bool(inst.manual and inst.R is not None and inst.t is not None)
+        # A muted body takes no part in any of this: not in the scale estimate,
+        # not in the gauge a locked body would set, and not in the pose fit here.
+        # It is placed afterwards, against the finished cameras, by
+        # `place_muted_instances` -- which is the honest order, since a body that
+        # is not allowed to move the cameras should be measured against where
+        # they ended up and not against the initialisation.
+        if inst.id in muted_ids:
+            rep.anchors_off = True
+            continue
         entries = sorted(by_instance.get(inst.id, []))
         rep.n_anchors_used = len(entries)
         if len(entries) < 2:
@@ -928,12 +982,25 @@ def fit_instances(
             )
 
     if not scaled:
+        voting = [
+            inst
+            for inst in project.placed_object_instances()
+            if project.anchors_are_evidence(inst)
+        ]
+        if not voting:
+            # Every body is muted, which is a chosen state and not a failure.
+            # Nothing is placed here and nothing is cleared; the scale comes from
+            # wherever it would have come from with no bodies at all, and
+            # `place_muted_instances` fits them to the finished cameras. Saying
+            # "no placeable anchors yet" here would be false and would read as a
+            # complaint about marks the user deliberately set aside.
+            return False, ""
         # Same rule the second pass applies below, which this return used to skip
         # entirely -- so removing the last anchor from every body left all their
         # poses standing. See _clear_unbacked_poses.
         stale = _clear_unbacked_poses(project)
         report.warnings.append(
-            f"{len(project.placed_object_instances())} known object(s) have no placeable anchors "
+            f"{len(voting)} known object(s) have no placeable anchors "
             "yet. Each needs "
             "3 anchors marked in 2+ photos each before its pose is determined."
         )
@@ -1030,6 +1097,8 @@ def fit_instances(
     # ---- second pass: the rigid pose each instance actually carries
     for inst in project.placed_object_instances():
         rep = report.instances.get(inst.id)
+        if inst.id in muted_ids:
+            continue      # placed later, against the finished cameras
         if inst.id not in scaled:
             # Clearing the pose is right for a fit that no longer has the
             # anchors behind it, and wrong for a placement someone made by eye:
@@ -1044,6 +1113,12 @@ def fit_instances(
         check = similarity_fit(source, target, allow_scale=True)
         inst.R, inst.t = rigid.R, rigid.t
         inst.manual = False
+        # This pose was just measured against `positions`, which are still in
+        # the initialisation's frame: `align_to_nominals` has not run yet. Say
+        # so, or `_transform_scene` will take the flag left over from the file
+        # at its word and leave this body behind when the scene moves into part
+        # space.
+        inst.pose_in_part_space = False
         if rep is not None:
             rep.placed = True
             rep.manual = False
@@ -1064,6 +1139,229 @@ def fit_instances(
                 )
 
     return True, description
+
+
+def place_muted_instances(
+    project: Project, problem: "_Problem", x: np.ndarray, report: SolveReport
+) -> int:
+    """Place the bodies whose anchors are out of the solve, against the cameras
+    the rest of the project produced.
+
+    The half that was missing. ``cadguard`` could already say a body had cost
+    the calibration, and could put the body-free cameras back, but it said so
+    with an apology in its own docstring: *it does not place the bodies against
+    locked cameras -- that would need a solve mode that does not exist yet*. So
+    the only ways to stop a bad body were to delete the clicks or to accept the
+    damage, and a restore lasted exactly until the next press of Solve. This is
+    that missing mode, and it is what makes muting a body a usable answer rather
+    than a way to make it disappear.
+
+    The arithmetic is the easy direction of the same problem ``fit_instances``
+    solves. There, the anchors' 3D positions and the camera poses are unknown
+    together, which is why a wrong anchor moves a camera. Here the cameras are
+    finished and fixed: each anchor is triangulated from its own marks alone,
+    the model is fitted rigidly to the result, and nothing the body does can
+    reach the cameras or the tie points. One bad anchor spoils its own body's
+    pose and stops there.
+
+    What it gives up, said plainly: the body no longer contributes scale, so a
+    project whose only metric reference was a known object and that mutes every
+    body has an arbitrary-scale reconstruction again. The report says so rather
+    than reporting a size in millimetres that nothing measured.
+
+    Returns how many bodies it placed.
+    """
+    # Local, and from harvest, because that is where the tested joint DLT lives
+    # -- `triangulate_views` returns the worst reprojection and the widest ray
+    # angle alongside the point, which are exactly the two numbers needed to say
+    # whether an anchor was worth triangulating at all.
+    from .harvest import _Cam, triangulate_views
+
+    muted = [
+        inst
+        for inst in project.muted_instances()
+        if project.template_of(inst) is not None
+    ]
+    if not muted:
+        return 0
+
+    poses, cams, _X, _objects = problem.unpack(x)
+    cameras: dict[str, Any] = {}
+    for iid in problem.image_ids:
+        im = project.image(iid)
+        R, t = poses[iid]
+        cameras[iid] = _Cam(
+            iid=iid,
+            R=R,
+            t=np.asarray(t, dtype=float),
+            cam=cams[problem.group_of_image[iid]],
+            width=im.width,
+            height=im.height,
+        )
+
+    # Marks are gathered per anchor key across every active image that has one,
+    # not per image, because triangulation is the whole point: an anchor marked
+    # in one photograph has no 3D position and is skipped rather than guessed at.
+    marks: dict[str, list[tuple[str, list[float]]]] = {}
+    for im in project.active_images():
+        if im.id not in cameras:
+            continue
+        for key, uv in im.anchor_obs.items():
+            marks.setdefault(key, []).append((im.id, list(uv)))
+
+    locals_all = project.anchor_world_points()
+    placed = 0
+    for inst in muted:
+        rep = report.instances.setdefault(
+            inst.id,
+            InstanceReport(id=inst.id, template=inst.template, label=inst.label),
+        )
+        rep.anchors_off = True
+
+        names: list[str] = []
+        source: list[np.ndarray] = []
+        target: list[np.ndarray] = []
+        worst_px = 0.0
+        thin = 0
+        for key, local in locals_all.items():
+            inst_id, name = split_anchor_key(key)
+            if inst_id != inst.id:
+                continue
+            seen = marks.get(key) or []
+            if len(seen) < 2:
+                continue
+            X, reproj, angle = triangulate_views(
+                [cameras[iid] for iid, _uv in seen],
+                [np.array(uv, dtype=float) for _iid, uv in seen],
+            )
+            if not np.all(np.isfinite(X)) or not math.isfinite(reproj):
+                continue
+            # A pair of rays a few hundredths of a degree apart triangulates to
+            # a point on the far side of the scene. Dropping those is not
+            # fussiness: one of them would dominate the rigid fit and put the
+            # body somewhere no photograph suggests.
+            if angle < 1.0:
+                thin += 1
+                continue
+            names.append(name)
+            source.append(np.asarray(local, dtype=float))
+            target.append(X)
+            worst_px = max(worst_px, float(reproj))
+
+        rep.n_anchors_used = len(names)
+        # Two, not three, because that is the floor `fit_instances` applies and
+        # the two must agree: a body that muting refused to place while voting
+        # would have placed it would make muting look like it had broken the
+        # body. Two determines a pose only up to a spin about the line joining
+        # them, so it is reported as degenerate below rather than accepted
+        # silently -- which is exactly what the voting path does too.
+        if len(names) < 2:
+            if not inst.locked and not inst.manual:
+                inst.R, inst.t = None, None
+                inst.pose_in_part_space = False
+            rep.placed = False
+            rep.notes.append(
+                f"anchors are out of the solve, and {len(names)} of "
+                f"{rep.n_anchors_marked} marked anchor(s) reached two photographs with enough "
+                f"separation to triangulate"
+                + (f" ({thin} too nearly parallel to use)" if thin else "")
+                + ". A pose fitted to the finished cameras needs at least two, and three before "
+                "it is determined. Mark another anchor, or mark an existing one in a second "
+                "photograph taken from somewhere else."
+            )
+            continue
+
+        rigid = similarity_fit(np.array(source), np.array(target), allow_scale=False)
+        check = similarity_fit(np.array(source), np.array(target), allow_scale=True)
+        inst.R, inst.t = rigid.R, rigid.t
+        inst.manual = False
+        # Placed against the final cameras, which `align_to_nominals` has already
+        # moved into part space -- so unlike `fit_instances`, this pose IS in part
+        # space, and saying otherwise would have `_transform_scene` move it again
+        # on the next solve. That bug cost a real placement three metres; see
+        # ObjectInstance.pose_in_part_space.
+        inst.pose_in_part_space = project.in_part_space()
+        rep.placed = True
+        rep.manual = False
+        rep.shape_rms = rigid.rms
+        rep.implied_scale = check.scale
+        center = project.instance_center(inst)
+        rep.center = None if center is None else center.tolist()
+        optical = project.instance_optical(inst)
+        if optical is not None:
+            rep.optical_center = optical[0].tolist()
+            rep.optical_forward = optical[1].tolist()
+        placed += 1
+
+        rep.notes.append(
+            f"placed against the finished cameras, with its anchors out of the solve: this "
+            f"body cannot have moved them. Its shape error of {rigid.rms * 1000:.2f} mm is "
+            f"therefore a measurement rather than a compromise -- the model against where the "
+            f"photographs put its anchors, with nothing having bent to meet it."
+        )
+        if rigid.degenerate or len(names) < 3:
+            rep.notes.append(
+                f"only {len(names)} anchor(s) placed it, so the rotation about the line joining "
+                f"them is not determined -- the body may be spun about that line and nothing "
+                f"here would notice. Mark a third anchor off that line."
+            )
+        if abs(check.scale - 1.0) > 0.05:
+            rep.notes.append(
+                f"this body triangulates {abs(check.scale - 1.0) * 100:.0f}% "
+                f"{'larger' if check.scale > 1 else 'smaller'} than its model. With its anchors "
+                f"muted that costs the solve nothing, but it still means an anchor is on the "
+                f"wrong feature or this is not the object the model describes -- and it is the "
+                f"reading to fix before letting this body vote again."
+            )
+        if worst_px > 5.0:
+            rep.notes.append(
+                f"its anchor rays miss each other by up to {worst_px:.1f} px after "
+                f"triangulation, so the marks do not agree about where these features are. "
+                f"Re-click the worst before trusting this placement."
+            )
+
+    return placed
+
+
+def _report_muting(project: Project, report: SolveReport, n_placed: int) -> None:
+    """Say, on every solve, that some bodies were not allowed to vote.
+
+    A message rather than a warning, because muting is a decision and not a
+    fault -- but never silence. The state this guards against is a project that
+    has quietly stopped reading 582 of its 615 clicks and reports a beautiful
+    RMS for the 33 that are left: the number would be true and the impression it
+    gives would be false. Whoever reads the report has to be told which
+    population it describes.
+    """
+    muted = project.muted_instances()
+    report.n_muted_instances = len(muted)
+    report.n_muted_anchor_marks = project.n_muted_anchor_marks()
+    if not muted:
+        return
+
+    total = len(project.placed_object_instances())
+    whole = not project.settings.anchors_in_solve
+    which = (
+        "every known object"
+        if whole
+        else ", ".join(inst.label or inst.id for inst in muted[:6])
+        + (f" and {len(muted) - 6} more" if len(muted) > 6 else "")
+    )
+    report.messages.append(
+        f"{len(muted)} of {total} known object(s) had their anchors out of the solve "
+        f"({which}), so {report.n_muted_anchor_marks} anchor mark(s) said nothing about where "
+        f"the cameras are. The cameras, the tie points and the focal are what the tie points, "
+        f"control lines and nominals alone make them; {n_placed} of those bodies were then "
+        f"fitted to that result. Nothing was deleted -- every mark is still there, and letting "
+        f"a body vote again is the same switch back."
+    )
+    if whole and not project.all_constraints() and total:
+        report.warnings.append(
+            "no known object is voting and no distance or nominal states a size, so this "
+            "reconstruction has no scale: the millimetres reported are arbitrary units. A known "
+            "object's own geometry was the only thing setting scale here, and muting them all "
+            "gives that up. Let one well-marked body vote, or state one real distance."
+        )
 
 
 def build_rig_report(project: Project, report: SolveReport) -> RigReport:
@@ -1156,7 +1454,12 @@ class _Problem:
         # Grouped that way because every observation in one such block shares
         # both a camera pose and a body pose, so the projection vectorises and
         # the Jacobian block structure falls out directly.
-        anchor_locals = project.anchor_world_points()
+        # The *solving* set, so a muted body contributes no residual block and
+        # therefore no pose parameters either -- `anchor_instances` below is
+        # derived from these blocks, and the parameter layout from that, so the
+        # whole body drops out of the problem rather than merely being weighted
+        # down. See Project.solving_anchor_points.
+        anchor_locals = project.solving_anchor_points()
         grouped: dict[tuple[str, str], list[tuple[str, np.ndarray, list[float]]]] = {}
         for iid in image_ids:
             im = project.image(iid)
@@ -1346,6 +1649,16 @@ class _Problem:
         self.anchor_sigma = {
             inst_id: float(self.s.sigma_anchor_px) for inst_id in self.anchor_instances
         }
+
+        # The robust knee is held here rather than read from settings at every
+        # evaluation, so the refinement can widen it and bring it back down --
+        # see `bundle_adjust`. Settings still state where it ends up.
+        self.huber_scale = float(self.s.huber_f_scale)
+        self._jac_sparsity: sparse.csr_matrix | None = None
+        self._jac_groups: int | None = None
+        # Marks the last cull wanted to drop but could not without starving a
+        # point, a photo or a body. Reported once at the end, not per round.
+        self.starved = 0
 
         # Marks per body, used to stop a densely marked object outvoting
         # everything else. One body is 6 unknowns no matter how many anchors
@@ -1748,7 +2061,7 @@ class _Problem:
         # Robust kernel on the clicked data only -- reprojections, anchors and
         # control lines. Constraints, the depth barrier and the gauge prior keep
         # their full weight.
-        out[: self.o_cons] = _huberize(out[: self.o_cons], self.s.huber_f_scale)
+        out[: self.o_cons] = _huberize(out[: self.o_cons], self.huber_scale)
         # Per-body count normalisation goes on *after* the kernel, deliberately:
         # the kernel asks "is this mark an outlier for its class?", which must be
         # judged against that class's sigma, while this asks "how much should one
@@ -1780,6 +2093,41 @@ class _Problem:
     # -------------------------------------------------------------- sparsity
 
     def jac_sparsity(self) -> sparse.csr_matrix:
+        """The sparsity pattern, built once and kept.
+
+        Cached because the refinement now asks for it several times -- once per
+        solve, plus once to count its column groups -- and rebuilding a pattern
+        that cannot change between those calls is pure cost.
+        """
+        if self._jac_sparsity is None:
+            self._jac_sparsity = self._build_jac_sparsity()
+        return self._jac_sparsity
+
+    def jac_group_count(self) -> int:
+        """How many finite-difference column groups the pattern needs.
+
+        The number of residual evaluations one Jacobian estimate costs, which is
+        what makes an iteration budget and an evaluation budget different
+        things. See :func:`_nfev_for`.
+        """
+        if self._jac_groups is None:
+            try:
+                from scipy.optimize._numdiff import group_columns
+
+                self._jac_groups = int(np.max(group_columns(self.jac_sparsity()))) + 1
+            except Exception:
+                # A private scipy helper, so it is allowed to move. The fallback
+                # is the worst case -- one group per column, what a dense
+                # difference would cost -- rather than anything cleverer: the
+                # count only ever sets a ceiling, and a ceiling that is too high
+                # costs nothing on a solve that converges, while one that is too
+                # low is exactly the bug this function exists to stop. The
+                # densest row would be the tempting guess and is a *lower*
+                # bound, which is the wrong direction to be wrong in.
+                self._jac_groups = max(1, self.n_params)
+        return self._jac_groups
+
+    def _build_jac_sparsity(self) -> sparse.csr_matrix:
         S = sparse.lil_matrix((self.n_residuals, self.n_params), dtype=np.int8)
 
         row = self.o_reproj
@@ -2016,6 +2364,9 @@ def _reweight_instances(
         problem.anchor_sigma[inst_id] = sigma
         rep = report.instances.setdefault(inst_id, InstanceReport(id=inst_id))
         rep.sigma_px = sigma
+        # The refinement measures more than once, so this note replaces the one
+        # a previous round left rather than stacking a second copy of it.
+        rep.notes = [n for n in rep.notes if not n.startswith("weighted at ")]
         if sigma > s.sigma_anchor_px * 1.5:
             rep.notes.append(
                 f"weighted at {sigma:.1f} px rather than the {s.sigma_anchor_px:g} px a body "
@@ -2049,8 +2400,14 @@ def _cull_outliers(
     # The scale is read off the *confident* marks only. Including the uncertain
     # ones would let them widen the very threshold they are supposed to be
     # judged against more harshly, which is backwards.
+    # Live marks only. The refinement calls this more than once, and a mark
+    # already dropped is not evidence about how well the rest were clicked --
+    # leaving it in would let the marks this pass removed widen the scale the
+    # next pass judges by, which is the cull slowly excusing itself.
     confident = [
-        e[c] for e, c in zip(point_errs, problem.obs_confident) if c.any()
+        e[c & (w > 0)]
+        for e, c, w in zip(point_errs, problem.obs_confident, problem.obs_weight)
+        if (c & (w > 0)).any()
     ]
     flat = np.concatenate(confident) if confident else np.zeros(0)
     point_sigma = _robust_scale(flat, s.sigma_px)
@@ -2071,6 +2428,10 @@ def _cull_outliers(
     for b, ((iid, _idx, _uv), errs) in enumerate(zip(problem.obs, point_errs)):
         sure = problem.obs_confident[b]
         for j, (pid, e) in enumerate(zip(problem.obs_pids[iid], errs)):
+            # Already dropped on an earlier round: it is neither a candidate nor
+            # something the starvation guards should count as support.
+            if problem.obs_weight[b][j] <= 0:
+                continue
             track_count[pid] = track_count.get(pid, 0) + 1
             image_count[iid] = image_count.get(iid, 0) + 1
             limit = (s.cull_sigma if sure[j] else doubt_sigma) * point_sigma
@@ -2080,8 +2441,15 @@ def _cull_outliers(
     for b, ((iid, inst_id, _l, _uv, keys), errs) in enumerate(
         zip(problem.anchor_blocks, anchor_errs)
     ):
+        # Judged against the body's own sigma, but not past a ceiling tied to
+        # the tie-point scale: a body that fits badly must not become the reason
+        # its own blunders cannot be caught. See Settings.cull_ceiling_factor.
         sigma = problem.anchor_sigma[inst_id]
+        if s.cull_ceiling_factor > 0:
+            sigma = min(sigma, max(s.cull_ceiling_factor * point_sigma, s.sigma_anchor_px))
         for j, (key, e) in enumerate(zip(keys, errs)):
+            if problem.anchor_weight[b][j] <= 0:
+                continue
             image_count[iid] = image_count.get(iid, 0) + 1
             inst_count[inst_id] = inst_count.get(inst_id, 0) + 1
             if e > s.cull_sigma * sigma:
@@ -2091,13 +2459,17 @@ def _cull_outliers(
     # endpoint slip in the same pixels, so splitting the estimate would judge the
     # two kinds against different ideas of what a well-drawn line looks like.
     sure_lines = [
-        problem.line_errs[problem.line_confident] if len(problem.lines) else np.zeros(0),
-        problem.dir_line_errs[problem.dir_line_confident]
+        problem.line_errs[problem.line_confident & (problem.line_weight > 0)]
+        if len(problem.lines)
+        else np.zeros(0),
+        problem.dir_line_errs[problem.dir_line_confident & (problem.dir_line_weight > 0)]
         if len(problem.dir_lines)
         else np.zeros(0),
     ]
     line_sigma = _robust_scale(np.concatenate(sure_lines), s.sigma_line_px)
     for i, (iid, axis, _line, _L, _ln) in enumerate(problem.lines):
+        if problem.line_weight[i] <= 0:
+            continue
         axis_count[(iid, axis)] = axis_count.get((iid, axis), 0) + 1
         limit = (s.cull_sigma if problem.line_confident[i] else doubt_sigma) * line_sigma
         if problem.line_errs[i] > limit:
@@ -2122,9 +2494,13 @@ def _cull_outliers(
     group_lines: dict[str, int] = {}
     group_images: dict[str, set[str]] = {}
     for i, (iid, gid, _line, _L, _ln) in enumerate(problem.dir_lines):
+        if problem.dir_line_weight[i] <= 0:
+            continue
         group_lines[gid] = group_lines.get(gid, 0) + 1
         group_images.setdefault(gid, set()).add(iid)
     for i, (iid, gid, _line, _L, _ln) in enumerate(problem.dir_lines):
+        if problem.dir_line_weight[i] <= 0:
+            continue
         limit = (s.cull_sigma if problem.dir_line_confident[i] else doubt_sigma) * line_sigma
         if problem.dir_line_errs[i] > limit:
             label = problem.project.direction_group(gid)
@@ -2145,6 +2521,15 @@ def _cull_outliers(
         return False
 
     candidates.sort(key=lambda c: -c[0])
+    # A fifth of the data, counted across the whole refinement rather than per
+    # round: the loop calls this several times, and a budget that reset each
+    # time would let four rounds quietly delete most of a project.
+    already = (
+        sum(int((w <= 0).sum()) for w in problem.obs_weight)
+        + sum(int((w <= 0).sum()) for w in problem.anchor_weight)
+        + int((problem.line_weight <= 0).sum())
+        + int((problem.dir_line_weight <= 0).sum())
+    )
     budget = max(
         1,
         int(
@@ -2156,7 +2541,9 @@ def _cull_outliers(
                 + len(problem.dir_lines)
             )
         ),
-    )
+    ) - already
+    if budget <= 0:
+        return 0
     dropped: list[tuple[str, str, float, float]] = []
     starved = 0
 
@@ -2210,36 +2597,41 @@ def _cull_outliers(
         report.images.setdefault(iid, ImageReport(id=iid)).n_culled += 1
         dropped.append((iid, label, err, n_sigma))
 
+    # The refinement calls this once per round, so the user-facing summary is
+    # left to `_report_culling` at the end: four rounds each announcing "14
+    # marks disagreed" reads as 56 bad marks rather than the 15 there actually
+    # are. The per-round line stays, because which round found what is real.
+    problem.starved = starved
     if not dropped:
-        if starved:
-            report.warnings.append(
-                f"{starved} mark(s) look like outliers but could not be dropped without leaving "
-                "a point, a photo or an object with too few marks to solve. Mark more features "
-                "in those photos, or re-click the bad ones -- the solve is carrying them."
-            )
-        return False
+        return 0
 
-    report.n_culled = len(dropped)
+    report.n_culled += len(dropped)
     worst = sorted(dropped, key=lambda d: -d[2])[:4]
     listed = ", ".join(f"{label} in {iid} ({err:.0f} px)" for iid, label, err, _n in worst)
     report.messages.append(
         f"dropped {len(dropped)} mark(s) beyond {s.cull_sigma:g} sigma and re-solved without "
         f"them; worst: {listed}"
     )
-    report.warnings.append(
-        f"{len(dropped)} mark(s) disagreed with everything else badly enough to be left out of "
-        "the final solve. They are still drawn in the residual view so you can see them -- "
-        "check each is on the feature you meant, then re-solve."
-    )
-    if starved:
-        report.warnings.append(
-            f"a further {starved} mark(s) look just as bad but were kept, because dropping them "
-            "would leave a point, a photo or an object with too few marks to solve at all."
-        )
-    return True
+    return len(dropped)
 
 
-def _solve_once(problem: _Problem, x0: np.ndarray, max_iterations: int):
+def _nfev_for(problem: _Problem, iterations: float) -> int:
+    """Turn a budget of solver *iterations* into a budget of residual calls.
+
+    ``max_nfev`` counts function evaluations, not iterations, and there is no
+    analytic Jacobian here -- scipy estimates it by finite differences, one
+    evaluation per column group of the sparsity pattern. So an iteration costs
+    ``groups + 1`` evaluations, not 1, and the two numbers differ by whatever
+    the sparsity happens to group to: 18 on the rear-module cell, which quietly
+    turned the old ``max_iterations=200`` into about ten real iterations of a
+    317-parameter bundle. Budgeting in iterations is the honest unit, and it
+    stops the ceiling moving when the project's shape does.
+    """
+    groups = problem.jac_group_count()
+    return max(1, int(iterations * (groups + 1)))
+
+
+def _solve_once(problem: _Problem, x0: np.ndarray, iterations: float):
     return least_squares(
         problem.residuals,
         x0,
@@ -2248,7 +2640,7 @@ def _solve_once(problem: _Problem, x0: np.ndarray, max_iterations: int):
         # the robust kernel is already baked into the residuals, see _huberize
         loss="linear",
         x_scale="jac",
-        max_nfev=max_iterations,
+        max_nfev=_nfev_for(problem, iterations),
         verbose=0,
     )
 
@@ -2259,51 +2651,219 @@ def bundle_adjust(
     image_ids: list[str],
     point_ids: list[str],
     report: SolveReport,
-    max_iterations: int = 200,
+    iterations: float = 120.0,
+    rounds: int = 2,
 ) -> tuple[_Problem, np.ndarray]:
     """Refine everything jointly, then do it again knowing what went wrong.
 
-    Two passes rather than one, because the weights that matter can only be
-    measured from a solution: how well each body's marks actually agree, and
-    which individual clicks are blunders rather than noise. The first pass is
-    the measurement, the second is the answer. Both start from the same
-    initialisation as far as the gauge prior is concerned, so it still pulls
-    towards where the linear stage put things rather than towards pass one's
-    mistakes.
+    Two passes, because the weights that matter can only be measured from a
+    solution: how well each body's marks actually agree, and which individual
+    clicks are blunders rather than noise. The first pass is the measurement,
+    the second is the answer.
+
+    What changed is not the number of passes but what the first one is worth.
+    A measurement is only as good as the pass it was taken from, and on the
+    rear-module cell that pass stopped a long way short: every body's residuals
+    were read off an unfinished state as if they described the marking, and the
+    resulting sigmas -- 9 to 176 px against a stated 2 -- weighted 582 anchor
+    marks down to a few percent of the solve and then, because the cull
+    threshold is a multiple of that same sigma, put 23 of 28 bodies beyond the
+    reach of the outlier check. So the first pass is now made to *converge*
+    before anything reads it: budgeted in iterations rather than evaluations,
+    extended if it runs out, and started from a scene whose bodies are in the
+    same frame as its cameras.
+
+    ``rounds`` is kept open past two because the alternation is well defined and
+    cheap to continue, but two is the default on measurement: a third round buys
+    nothing once the first one converges, and on a noisy scene re-measuring from
+    a solution the weights already shaped can start chasing its own tail.
+
+    Each round is warm-started, and the gauge prior still pulls towards the
+    initialisation rather than towards any round's mistakes.
     """
     problem = _Problem(project, intrinsics, image_ids, point_ids)
-    x0 = problem.pack()
+    x = problem.pack()
+    s = project.settings
 
-    result = _solve_once(problem, x0, max_iterations)
-    outcome = "converged" if result.status > 0 else "hit the iteration limit"
+    _anneal_in(problem, x, report)
+
+    weighting = bool(s.reweight_instances or s.cull_sigma > 0)
+    result = None
+    last = max(1, int(rounds)) - 1
+    for rnd in range(max(1, int(rounds))):
+        result, nfev = _converge(problem, x, iterations)
+        x = result.x
+        outcome = "converged" if result.status > 0 else "hit the iteration limit"
+        if rnd == 0:
+            label = "bundle adjustment"
+        elif rnd == 1:
+            # The wording two passes earned, kept: this is still the pass that
+            # answers what the pass before it measured.
+            label = "second pass after reweighting"
+        else:
+            label = f"refinement round {rnd + 1}"
+        report.messages.append(
+            f"{label}: {nfev} evaluations, cost {result.cost:.4g}, {outcome}"
+        )
+        # Nothing is measured after the final pass. A mark culled with no solve
+        # left to run would still be reported as "left out of the final solve"
+        # while having helped shape it, and a sigma measured there would
+        # describe a weighting that was never applied.
+        if not weighting or rnd == last:
+            break
+
+        point_errs, anchor_errs = _observation_errors(problem, x)
+        problem.line_errs = _line_errors(problem, x)
+        problem.dir_line_errs = _dir_line_errors(problem, x)
+
+        before = dict(problem.anchor_sigma)
+        if s.reweight_instances and problem.anchor_blocks:
+            _reweight_instances(problem, anchor_errs, report)
+        moved = max(
+            (
+                abs(problem.anchor_sigma[k] - before.get(k, 0.0)) / max(before.get(k, 0.0), 1e-9)
+                for k in problem.anchor_sigma
+            ),
+            default=0.0,
+        )
+        culled = 0
+        if s.cull_sigma > 0:
+            culled = _cull_outliers(problem, point_errs, anchor_errs, report)
+
+        # Stop when the weights have stopped being news. Convergence of the
+        # solve itself is part of it: re-measuring from a pass that ran out of
+        # iterations would repeat the mistake this loop exists to undo.
+        if moved < 0.05 and not culled and result.status > 0:
+            break
+
+    assert result is not None
+    _report_culling(problem, report)
+    _report_suspect_bodies(problem, report)
+    problem.write_back(x)
+    return problem, x
+
+
+def _report_culling(problem: _Problem, report: SolveReport) -> None:
+    """Say once what the whole refinement dropped, and what it had to carry."""
+    if report.n_culled:
+        report.warnings.append(
+            f"{report.n_culled} mark(s) disagreed with everything else badly enough to be left "
+            "out of the final solve. They are still drawn in the residual view so you can see "
+            "them -- check each is on the feature you meant, then re-solve."
+        )
+    if problem.starved:
+        kept = (
+            f"a further {problem.starved}" if report.n_culled else f"{problem.starved}"
+        )
+        report.warnings.append(
+            f"{kept} mark(s) look just as bad but were kept, because dropping them would leave "
+            "a point, a photo or an object with too few marks to solve at all. Mark more "
+            "features in those photos, or re-click the bad ones -- the solve is carrying them."
+        )
+
+
+def _converge(problem: _Problem, x: np.ndarray, iterations: float, extensions: int = 2):
+    """Solve, and keep going if it ran out of iterations rather than answers.
+
+    The whole weighting stage downstream reads this pass as a statement about
+    how well the marks were clicked, so handing it one that merely ran out of
+    budget is how a slow solve turns into a permanently mis-weighted one. An
+    extension is warm-started and costs nothing when it is not needed, which on
+    a healthy project is always: the first call converges and this returns it
+    untouched.
+    """
+    result = _solve_once(problem, x, iterations)
+    nfev = result.nfev
+    tries = 0
+    while result.status <= 0 and tries < extensions:
+        nxt = _solve_once(problem, result.x, iterations)
+        nfev += nxt.nfev
+        tries += 1
+        # No further forward: extending again would only spend time. Better to
+        # say "hit the iteration limit" honestly than to grind.
+        if nxt.cost >= result.cost * 0.999:
+            result = nxt
+            break
+        result = nxt
+    return result, nfev
+
+
+def _anneal_in(problem: _Problem, x: np.ndarray, report: SolveReport) -> None:
+    """Widen the robust knee for the first few passes when the start is far out.
+
+    ``_huberize`` folds the kernel into the residual, which means its gradient
+    falls away as ``k / sqrt(k(2r - k))`` past the knee: a mark 22 knees out
+    keeps about a seventh of its pull, and one a thousand knees out keeps a
+    thousandth. That is the right bargain near a solution and exactly the wrong
+    one far from it, because the residuals the kernel is throttling are the ones
+    the solve still has to walk out of. Starting wide and closing down is the
+    standard remedy, and it costs a few cheap passes.
+
+    Deliberately inert on a healthy start: a solve that begins within ten knees
+    of its answer anneals nothing and gets byte-identical numbers. The ladder is
+    only built when the initialisation is genuinely far away, which is the case
+    this is for.
+    """
+    target = problem.huber_scale
+    if target <= 0:
+        return
+    r0 = np.abs(problem.residuals(x)[: problem.o_cons])
+    r0 = r0[np.isfinite(r0)]
+    if r0.size == 0:
+        return
+    spread = float(np.median(r0))
+    if not np.isfinite(spread) or spread < 10.0 * target:
+        return
+
+    ladder: list[float] = []
+    k = spread
+    while k > target * 4.0 and len(ladder) < 6:
+        ladder.append(k)
+        k /= 10.0
+    if not ladder:
+        return
+    for k in ladder:
+        problem.huber_scale = k
+        x[:] = _solve_once(problem, x, max(problem.jac_group_count(), 20)).x
+    problem.huber_scale = target
     report.messages.append(
-        f"bundle adjustment: {result.nfev} evaluations, cost {result.cost:.4g}, {outcome}"
+        f"the initialisation started {spread / target:.0f}x beyond the robust knee, so the "
+        f"refinement opened the kernel to {ladder[0]:.0f} and closed it back to {target:g} over "
+        f"{len(ladder)} warm-up pass(es) before refining. Without that the kernel throttles the "
+        "very residuals the solve has to undo."
     )
 
-    s = project.settings
-    changed = False
-    if s.reweight_instances or s.cull_sigma > 0:
-        point_errs, anchor_errs = _observation_errors(problem, result.x)
-        problem.line_errs = _line_errors(problem, result.x)
-        problem.dir_line_errs = _dir_line_errors(problem, result.x)
-        if s.reweight_instances and problem.anchor_blocks:
-            changed |= _reweight_instances(problem, anchor_errs, report)
-        if s.cull_sigma > 0:
-            changed |= _cull_outliers(problem, point_errs, anchor_errs, report)
 
-    if changed:
-        # warm-started from the first pass: the reweighting is a correction to a
-        # solution that is already close, not a fresh problem
-        second = _solve_once(problem, result.x, max_iterations)
-        outcome = "converged" if second.status > 0 else "hit the iteration limit"
-        report.messages.append(
-            f"second pass after reweighting: {second.nfev} evaluations, "
-            f"cost {second.cost:.4g}, {outcome}"
-        )
-        result = second
+def _report_suspect_bodies(problem: _Problem, report: SolveReport) -> None:
+    """Name the bodies whose marks ended up far looser than the tie points.
 
-    problem.write_back(result.x)
-    return problem, result.x
+    The per-body sigma is doing its job when it widens a body that was marked
+    badly -- but a widened body is also a quiet one, and quiet is how the
+    rear-module cell lost 582 anchor marks without anything saying so. The
+    sigma is left exactly as measured; this only says out loud which bodies it
+    landed on, so "re-click these six" is a thing the report states rather than
+    something the user has to infer from a column of numbers.
+    """
+    if not problem.anchor_sigma:
+        return
+    floor = max(float(problem.s.sigma_anchor_px), 1e-9)
+    suspect = sorted(
+        ((iid, sg) for iid, sg in problem.anchor_sigma.items() if sg > 4.0 * floor),
+        key=lambda kv: -kv[1],
+    )
+    if not suspect:
+        return
+    names = ", ".join(
+        f"{(report.instances[iid].label or iid) if iid in report.instances else iid}"
+        f" ({sg:.0f} px)"
+        for iid, sg in suspect[:6]
+    )
+    more = f" and {len(suspect) - 6} more" if len(suspect) > 6 else ""
+    report.warnings.append(
+        f"{len(suspect)} object(s) had to be weighted looser than {4.0 * floor:.0f} px because "
+        f"their own anchor marks disagree by that much: {names}{more}. These are the bodies worth "
+        "re-marking -- every other object in the scene is being held to the stated click accuracy."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2737,7 +3297,12 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
         )
 
     report.stage = "checking what is solvable"
-    valid_anchors = set(project.anchor_world_points())
+    # The solving set, not every anchor there is: a muted body's marks take no
+    # part in connectivity, pruning, the initialisation, the scale fit or the
+    # bundle. Note the contrast with `prune_stale_anchor_obs` just above, which
+    # deliberately uses the full set -- muting a body must never look like a
+    # reason to delete its clicks.
+    valid_anchors = set(project.solving_anchor_points())
     tables = _observation_tables(project, set(intrinsics), valid_anchors)
     all_tracks = {p.id for p in project.points} | valid_anchors
 
@@ -2811,6 +3376,14 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     else:
         problem = _Problem(project, intrinsics, main, point_ids)
         x_final = problem.pack()
+
+    # After the bundle and after `align_to_nominals`, because the whole claim
+    # being made about a muted body is that it was fitted to a finished camera
+    # solution it had no hand in. Placing it any earlier would be placing it
+    # against cameras that were still moving.
+    report.stage = "placing the bodies that are not voting"
+    n_placed_muted = place_muted_instances(project, problem, x_final, report)
+    _report_muting(project, report, n_placed_muted)
 
     report.stage = "done"
     _fill_statistics(project, problem, x_final, report)
