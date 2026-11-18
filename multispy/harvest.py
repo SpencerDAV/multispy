@@ -93,7 +93,10 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy import ndimage
 
-from .geometry import Intrinsics
+# `_Cam` and `triangulate_views` live in geometry now: the solve places a
+# known object against finished cameras and needs both. Imported under the
+# old private name so nothing in this module reads differently.
+from .geometry import Intrinsics, SolvedCamera as _Cam, triangulate_views
 from .project import Project, TiePoint
 
 __all__ = [
@@ -298,54 +301,6 @@ class HarvestReport:
 # --------------------------------------------------------------------------
 
 
-@dataclass
-class _Cam:
-    """One solved camera, with the few derived quantities used over and over."""
-
-    iid: str
-    R: np.ndarray  # world -> camera
-    t: np.ndarray
-    cam: Intrinsics
-    width: int
-    height: int
-
-    @property
-    def center(self) -> np.ndarray:
-        return -self.R.T @ self.t
-
-    def normalize(self, uv: np.ndarray) -> np.ndarray:
-        """Pixels -> undistorted normalised image coordinates, homogeneous (N,3).
-
-        The distortion model is the forward one the rest of the project uses
-        (``xd = x (1 + k1 r^2)``), so undoing it is a fixed point rather than a
-        formula.  Three iterations is plenty for the magnitudes involved; with
-        ``k1 == 0`` the loop is skipped entirely.
-        """
-        uv = np.atleast_2d(np.asarray(uv, dtype=float))
-        x = (uv[:, 0] - self.cam.cx) / self.cam.f
-        y = (uv[:, 1] - self.cam.cy) / self.cam.f
-        if self.cam.k1 != 0.0:
-            xd, yd = x.copy(), y.copy()
-            for _ in range(5):
-                r2 = x * x + y * y
-                s = 1.0 + self.cam.k1 * r2
-                x, y = xd / s, yd / s
-        return np.stack([x, y, np.ones_like(x)], axis=1)
-
-    def project(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """World points (N,3) -> pixels (N,2) and camera-frame depth (N,)."""
-        X = np.atleast_2d(np.asarray(X, dtype=float))
-        Xc = X @ self.R.T + self.t
-        z = Xc[:, 2]
-        safe = np.where(np.abs(z) < 1e-12, 1e-12, z)
-        xn, yn = Xc[:, 0] / safe, Xc[:, 1] / safe
-        if self.cam.k1 != 0.0:
-            s = 1.0 + self.cam.k1 * (xn * xn + yn * yn)
-            xn, yn = xn * s, yn * s
-        return np.stack([self.cam.f * xn + self.cam.cx,
-                         self.cam.f * yn + self.cam.cy], axis=1), z
-
-
 def cameras_of(project: Project) -> dict[str, _Cam]:
     """Every enabled image that carries a solved pose."""
     out: dict[str, _Cam] = {}
@@ -531,46 +486,6 @@ def _triangulate_pair(cam_a: _Cam, cam_b: _Cam, xa: np.ndarray, xb: np.ndarray):
     za = (X @ cam_a.R.T + cam_a.t)[:, 2]
     zb = (X @ cam_b.R.T + cam_b.t)[:, 2]
     return X, angle, za, zb
-
-
-def triangulate_views(cams: list[_Cam], uvs: list[np.ndarray]) -> tuple[np.ndarray, float, float]:
-    """Joint DLT over every view of one track.
-
-    Returns ``(X, max_reprojection_px, max_ray_angle_deg)``.  The maximum rather
-    than the RMS on purpose: a track that fits three views beautifully and the
-    fourth by forty pixels is not a good track with one bad mark, it is two
-    different points that got merged, and an RMS over four views hides that
-    behind a factor of two.
-    """
-    rows = []
-    dirs = []
-    for cam, uv in zip(cams, uvs):
-        x = cam.normalize(uv)[0]
-        P = np.hstack([cam.R, cam.t[:, None]])
-        rows.append(x[0] * P[2] - x[2] * P[0])
-        rows.append(x[1] * P[2] - x[2] * P[1])
-        d = cam.R.T @ x
-        dirs.append(d / np.linalg.norm(d))
-    A = np.array(rows)
-    _u, _s, vt = np.linalg.svd(A)
-    h = vt[-1]
-    if abs(h[3]) < 1e-14:
-        return np.zeros(3), float("inf"), 0.0
-    X = h[:3] / h[3]
-
-    worst = 0.0
-    for cam, uv in zip(cams, uvs):
-        pix, z = cam.project(X[None, :])
-        if z[0] <= 0:
-            return X, float("inf"), 0.0
-        worst = max(worst, float(np.linalg.norm(pix[0] - np.asarray(uv, float))))
-
-    angle = 0.0
-    for i in range(len(dirs)):
-        for j in range(i + 1, len(dirs)):
-            angle = max(angle, math.degrees(math.acos(
-                float(np.clip(abs(dirs[i] @ dirs[j]), -1.0, 1.0)))))
-    return X, worst, angle
 
 
 # --------------------------------------------------------------------------

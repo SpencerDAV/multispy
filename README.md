@@ -456,6 +456,41 @@ The catch is that the whole scene now hangs off that one body's orientation, and
 orientation is the weak axis. On the demo, half a degree of frame rotation is
 8 mm of error 900 mm away. Lock the best-determined body, and prefer a large one.
 
+### Taking a body's anchors out of the solve
+
+A known object is a much stronger claim than a tie point: a tie point says "this
+feature is somewhere", a body says "these N features are in exactly this rigid
+arrangement, to the micron, because a CAD file says so". When the arrangement is
+right that is worth more than any number of marks. When it is wrong — an anchor
+on the wrong corner, a model at the wrong scale, a pose fitted to a mirror-image
+reading of a symmetric part — it is a lie told with enormous confidence, and the
+bundle will bend the cameras to accommodate it.
+
+So you can take the anchors out of the solve, per body in the objects panel or
+for the lot in **CAD vs the photographs**:
+
+- **Nothing is deleted.** Every click stays, the body stays in the scene and
+  stays drawn. The marks simply stop being evidence about where the cameras are
+  — out of the connectivity graph, out of the initialisation, out of the bundle.
+- **The body is still placed**, by triangulating its anchors against the
+  *finished* cameras and fitting the model to the result. Its shape error is
+  then a cleaner measurement than the voting version, because nothing had the
+  chance to bend towards it.
+- **It lasts.** The flag is in the project file, so Solve does not undo it.
+  Untick it and the body votes again.
+
+It costs you the scale that body was carrying — a known object's own geometry is
+what makes a solve metric without a tape measure — so muting every body in a
+project with no distance constraint and no nominals leaves the units arbitrary.
+The solve says so when it happens.
+
+What it is and is not worth, measured on an 8-photo cell with 28 bodies and 582
+anchor marks: muting every body took the fit from **9.37 px to 2.99 px** and the
+culled marks from 15 to 2, and left the bodies' agreement with CAD where it was
+(shape error median 3.49 mm → 3.74 mm, on one yardstick for both). It buys back
+the camera solution, not accuracy. Use it when the fit was good before the models
+went in; re-click the anchors when the bodies disagree with the drawing.
+
 ### What gets checked
 
 Because the shape is known in advance, the solve can tell you things a free point
@@ -463,7 +498,7 @@ cloud cannot:
 
 | Reading | Meaning |
 |---|---|
-| **shape error** | How far the marked anchors sit from the model's own geometry. A mis-clicked corner shows up here as a contradiction, instead of hiding inside an otherwise plausible reconstruction. |
+| **shape error** | How far the marked anchors sit from the model's own geometry. A mis-clicked corner shows up here as a contradiction, instead of hiding inside an otherwise plausible reconstruction. For a body whose anchors are out of the solve this is a pure reading: the cameras had no opportunity to move towards it. |
 | **solved size** | What this body came out as, relative to its model. Should be 1.000×. Anything else means an anchor is on the wrong feature, or this is not the object the model describes. |
 | **scale** | Now reads `known object geometry (mm)` rather than `arbitrary`. |
 | **stated vs object scale** | Only when you have *also* stated a real distance. Two independent measurements of the same thing, so their ratio is a genuine check rather than a restatement. 1.000× means they agree. |
@@ -1088,6 +1123,7 @@ the solved object layout on its own, or the whole payload with `--json`.
 .venv\Scripts\python.exe tests\test_synthetic.py
 .venv\Scripts\python.exe tests\test_rig.py
 .venv\Scripts\python.exe tests\test_exif.py
+.venv\Scripts\python.exe tests\test_muting.py
 ```
 
 `test_synthetic` builds a Manhattan-world scene with known ground truth,
@@ -1109,7 +1145,15 @@ anchors are refused as a placement rather than silently resolved.
 route, including the cases that must be *refused*: a cropped frame and a group
 whose lens was zoomed between shots.
 
-All three are pytest-compatible and all three run standalone.
+`test_muting` covers taking a body's anchors out of the solve. The two
+properties it exists for are that **nothing is deleted** — the marks survive the
+solve, the stale-mark sweep and a file round trip — and that **muted means out**
+rather than down-weighted, checked by insisting a muted solve agrees to
+floating-point noise with one whose marks were actually deleted. It also checks
+a muted body is still placed, that muting never loses a placement voting would
+have kept, and that the state is named in every report that carries it.
+
+All four are pytest-compatible and all four run standalone.
 
 ---
 

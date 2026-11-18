@@ -4521,8 +4521,13 @@ function renderCadPanel() {
  * be lost. */
 async function muteEverything() {
   pushUndoBefore('take the bodies’ anchors out of the solve');
-  state.project.settings.anchors_in_solve = false;
-  markDirty();
+  /* The switch is NOT set here, and that is not an oversight. The route reads
+   * the payload to decide whether there is anything to do, so setting it
+   * client-side first makes the server see a project that is already muted and
+   * answer "nothing changed" -- without re-solving, leaving the old
+   * body-dictated solution on screen under a panel saying the bodies are out of
+   * it. Exactly the mismatch this feature exists to end, reintroduced by an
+   * optimistic update. The server sets it, solves, and sends both back. */
   setStatus('taking the bodies’ anchors out of the solve and re-solving…');
   try {
     const data = await api('/api/mute_bodies', { project: projectPayload() });

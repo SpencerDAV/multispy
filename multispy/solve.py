@@ -43,10 +43,12 @@ from .dirgroup import (
 from .geometry import (
     AXIS_NAMES,
     Intrinsics,
+    SolvedCamera,
     calibrate_image,
     similarity_fit,
     so3_exp,
     so3_log,
+    triangulate_views,
 )
 from .project import (
     AxisLockConstraint,
@@ -1171,12 +1173,6 @@ def place_muted_instances(
 
     Returns how many bodies it placed.
     """
-    # Local, and from harvest, because that is where the tested joint DLT lives
-    # -- `triangulate_views` returns the worst reprojection and the widest ray
-    # angle alongside the point, which are exactly the two numbers needed to say
-    # whether an anchor was worth triangulating at all.
-    from .harvest import _Cam, triangulate_views
-
     muted = [
         inst
         for inst in project.muted_instances()
@@ -1190,7 +1186,7 @@ def place_muted_instances(
     for iid in problem.image_ids:
         im = project.image(iid)
         R, t = poses[iid]
-        cameras[iid] = _Cam(
+        cameras[iid] = SolvedCamera(
             iid=iid,
             R=R,
             t=np.asarray(t, dtype=float),
@@ -1217,6 +1213,28 @@ def place_muted_instances(
             InstanceReport(id=inst.id, template=inst.template, label=inst.label),
         )
         rep.anchors_off = True
+
+        # Locked and muted are a contradiction, and the honest response is to
+        # keep the pose and say so rather than resolve it quietly either way.
+        # `locked` means this body IS the world frame, so its pose is not a
+        # thing to measure; muting means its marks set nothing. Refitting it
+        # here would destroy the frame the rest of the scene is expressed in,
+        # and `fit_instances` has already skipped it, so the lock is doing
+        # nothing at all -- which is the part the user cannot see.
+        if inst.locked:
+            rep.placed = bool(inst.R is not None and inst.t is not None)
+            rep.notes.append(
+                "this body is locked AND its anchors are out of the solve, which cannot both "
+                "be meant: locked says it defines the world frame, muted says its marks set "
+                "nothing. Its pose is left exactly as it was and the lock is doing nothing -- "
+                "no frame is being taken from it. Untick one of the two."
+            )
+            report.warnings.append(
+                f"{inst.label or inst.id} is locked but its anchors are out of the solve, so "
+                f"it is not defining the frame it claims to. The scene's origin and "
+                f"orientation come from wherever they would have without it."
+            )
+            continue
 
         names: list[str] = []
         source: list[np.ndarray] = []
@@ -1275,16 +1293,45 @@ def place_muted_instances(
         check = similarity_fit(np.array(source), np.array(target), allow_scale=True)
         inst.R, inst.t = rigid.R, rigid.t
         inst.manual = False
-        # Placed against the final cameras, which `align_to_nominals` has already
-        # moved into part space -- so unlike `fit_instances`, this pose IS in part
-        # space, and saying otherwise would have `_transform_scene` move it again
-        # on the next solve. That bug cost a real placement three metres; see
-        # ObjectInstance.pose_in_part_space.
-        inst.pose_in_part_space = project.in_part_space()
+        # True unconditionally, and that is the whole reason this runs where it
+        # does. The flag asks one question -- has this pose already been through
+        # `_transform_scene`? -- and for a pose fitted here the answer is yes by
+        # construction: `align_to_nominals` ran before this and will not run
+        # again on this solve. Writing `project.in_part_space()` instead would be
+        # writing the answer to a different question, and would be wrong on a
+        # project whose two nominals move the scene without pinning it. Getting
+        # this wrong once cost a real placement 2.9 metres per solve, cumulative;
+        # see ObjectInstance.pose_in_part_space.
+        inst.pose_in_part_space = True
         rep.placed = True
         rep.manual = False
         rep.shape_rms = rigid.rms
         rep.implied_scale = check.scale
+
+        # The anchor RMS, measured rather than left at zero.
+        #
+        # `_fill_statistics` builds this from the bundle's anchor blocks, and a
+        # muted body has none -- so without this the panel would print "anchor
+        # RMS 0.00 px" beside a body whose marks it is ignoring, which reads as a
+        # flawless fit and is the exact opposite of the truth being told. It is
+        # the same quantity as a voting body's, computed the same way: each mark
+        # against where this pose puts its anchor in that photograph. The
+        # difference is only that nothing here had the chance to move a camera to
+        # make it smaller, which makes it the more honest of the two.
+        errs: list[float] = []
+        for name in names:
+            world = rigid.R @ locals_all[anchor_key(inst.id, name)] + rigid.t
+            for iid, uv in marks.get(anchor_key(inst.id, name), ()):
+                pix, z = cameras[iid].project(world[None, :])
+                if z[0] <= 0:
+                    continue
+                errs.append(float(np.linalg.norm(pix[0] - np.asarray(uv, dtype=float))))
+        if errs:
+            arr = np.array(errs)
+            rep.n_observations = len(arr)
+            rep.rms_px = float(np.sqrt(np.mean(arr**2)))
+            rep.max_px = float(arr.max())
+
         center = project.instance_center(inst)
         rep.center = None if center is None else center.tolist()
         optical = project.instance_optical(inst)

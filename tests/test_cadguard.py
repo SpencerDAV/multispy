@@ -421,14 +421,28 @@ def test_it_does_not_touch_the_project() -> None:
     )
 
 
-def test_body_free_copy_keeps_the_bodies_and_drops_only_their_marks() -> None:
+def test_body_free_copy_mutes_the_marks_rather_than_deleting_them() -> None:
+    """The "without" arm must be a state the user can actually be left in.
+
+    It used to clear ``anchor_obs``, which gave the right tie-point residuals --
+    that is all the comparison reads -- while describing a project nobody could
+    reach except by deleting their own work. Now it sets the same switch the
+    button sets, so the "without" column is what pressing that button produces,
+    parameter for parameter. Equal arithmetic, honest meaning.
+    """
     project = rig()
     free = body_free_copy(project)
     assert len(free.instances) == len(project.instances), (
         "the bodies stay in the scene; only their influence on the cameras goes"
     )
-    assert all(not im.anchor_obs for im in free.images), "and every anchor mark is gone"
-    assert any(im.anchor_obs for im in project.images), "without disturbing the original"
+    assert any(im.anchor_obs for im in free.images), (
+        "and every mark is still there -- muting is not deleting, which is the "
+        "whole difference between this and the only way it could be done before"
+    )
+    assert free.settings.anchors_in_solve is False, "they are simply not evidence"
+    assert not free.solving_anchor_points(), "so no anchor reaches the solve as evidence"
+    assert free.anchor_world_points(), "while the anchors themselves are untouched"
+    assert project.settings.anchors_in_solve is True, "without disturbing the original"
     assert free.path is None, "a trial project must never be able to save over the real one"
 
 
