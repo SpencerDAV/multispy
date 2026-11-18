@@ -131,12 +131,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_bytes(self, data: bytes, content_type: str, cache: bool = False) -> None:
+    def _send_bytes(
+        self, data: bytes, content_type: str, cache: bool = False, no_store: bool = False
+    ) -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         if cache:
             self.send_header("Cache-Control", "max-age=3600")
+        elif no_store:
+            self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(data)
 
@@ -203,13 +207,34 @@ class Handler(BaseHTTPRequestHandler):
         self._send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _serve_static(self, rel: str) -> None:
+        """The app's own source, served with caching refused.
+
+        These responses used to carry no ``Cache-Control``, no ``Last-Modified``
+        and no ``ETag``, which does not mean "do not cache" -- with no freshness
+        information and no validator, a browser is free to cache heuristically,
+        and Chrome does. The result is that an edit to ``app.js`` can be served
+        correctly by this process and still not reach a tab that was opened
+        before the edit, with nothing on either side to say so.
+
+        That is not a theoretical hazard. It cost two rounds of debugging a
+        working feature: the server was handing out the new file, ``curl``
+        confirmed it, and the page kept running the old one. Testing from a
+        fresh port each time hid it completely, because a new port is a new
+        cache key -- the one configuration that never reproduces it is the one
+        a developer naturally uses.
+
+        A local editing server has nothing to gain from caching its own source,
+        so it now refuses it outright. Photos still cache: they are large, they
+        are immutable once imported, and they are the only thing here that
+        a reload would be slow without.
+        """
         # keep the static handler inside web/ regardless of what was requested
         target = (WEB_DIR / rel).resolve()
         if not str(target).startswith(str(WEB_DIR.resolve())) or not target.is_file():
             self._send_json({"error": "not found"}, 404)
             return
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        self._send_bytes(target.read_bytes(), ctype)
+        self._send_bytes(target.read_bytes(), ctype, no_store=True)
 
     def _serve_photo(self, query: dict, thumb: bool) -> None:
         image_id = (query.get("id") or [""])[0]

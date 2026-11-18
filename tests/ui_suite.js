@@ -256,6 +256,82 @@ toggleViewer(false); key('t');
 ok('E3 T toggles the turn mode from either view', Viewer3D.orbitMode()!==tb, Viewer3D.orbitMode());
 Viewer3D.setOrbitMode('turntable');
 
+// ---- F. part space vs object space ---------------------------------------
+/* S carries two meanings now, told apart by whether the hold was dragged, so
+ * the thing most worth asserting is that giving it the second one did not cost
+ * it the first -- D6 covers the depth drag, and F3 covers the tap that used to
+ * do nothing at all. The rest is the frame itself: object X has to be the
+ * body's own axis rather than the scene's, and turning about it has to leave
+ * that axis where it was, or a drag would wander as it went. */
+const tapS = () => { key('s');
+  window.dispatchEvent(new KeyboardEvent('keyup',{key:'s',bubbles:true})); };
+setMode('pose');
+state.activeInstance = instId;
+state.transformSpace = 'part';
+const Rf = cp(INST().R), Tf = cp(INST().t);
+
+tapS();
+ok('F1 tapping S switches to object space', state.transformSpace==='object',
+   state.transformSpace);
+ok('F2 the tap does not fall through to select mode', state.mode==='pose', state.mode);
+tapS();
+ok('F3 tapping S again returns to part space', state.transformSpace==='part',
+   state.transformSpace);
+
+state.transformSpace='object';
+state.depthDown=true; drag2(40,0,{}); state.depthDown=false;
+window.dispatchEvent(new KeyboardEvent('keyup',{key:'s',bubbles:true}));
+ok('F4 a hold that dragged is not read as a tap', state.transformSpace==='object',
+   state.transformSpace);
+Object.assign(INST(), {R:cp(Rf), t:cp(Tf)});
+
+state.transformSpace='part';
+const partX = turnAxisWorld(INST(),'x');
+state.transformSpace='object';
+const objX = turnAxisWorld(INST(),'x');
+const col0 = [INST().R[0][0], INST().R[1][0], INST().R[2][0]];
+ok('F5 object X is the body\'s own axis',
+   Math.hypot(...[0,1,2].map(k=>objX[k]-col0[k]))<1e-12,
+   objX.map(v=>v.toFixed(3)).join(', '));
+ok('F6 part X is still the scene axis',
+   Math.abs(partX[0]-1)<1e-12 && Math.abs(partX[1])<1e-12, partX.join(', '));
+
+state.transformSpace='part';  rotateSteps(INST(),'x',90);
+const afterPart = cp(INST().R);
+Object.assign(INST(), {R:cp(Rf), t:cp(Tf)});
+state.transformSpace='object'; rotateSteps(INST(),'x',90);
+const afterObj = cp(INST().R);
+ok('F7 the two frames give different turns', mdiff(afterPart,afterObj)>1e-3,
+   mdiff(afterPart,afterObj).toFixed(4));
+const col1 = [INST().R[0][0], INST().R[1][0], INST().R[2][0]];
+ok('F8 an object-X turn leaves object X alone',
+   Math.hypot(...[0,1,2].map(k=>col1[k]-col0[k]))<1e-9,
+   Math.hypot(...[0,1,2].map(k=>col1[k]-col0[k])).toExponential(1));
+/* The switch has to be reachable from Objects mode as well, where bodies are
+ * placed and marked. It was not at first, S there went to Select instead, and
+ * the jump is quiet enough that the next X-locked turn simply came out in part
+ * space with nothing on screen explaining it. */
+setMode('objects');
+const spaceBefore = state.transformSpace;
+tapS();
+ok('F9 S switches the frame from Objects mode too',
+   state.transformSpace!==spaceBefore && state.mode==='objects',
+   state.mode+' / '+state.transformSpace);
+setMode('lines'); tapS();
+ok('F10 S still reaches Select from a mode with no body to turn',
+   state.mode==='select', state.mode);
+
+/* The 15/90 degree turn is the one gesture whose message could name an axis
+ * without naming the frame, and so report two different turns identically. */
+setMode('pose'); state.activeInstance = instId;
+state.transformSpace='object'; state.axisKey='x';
+key('ArrowRight');
+ok('F11 the exact turn names the frame it used',
+   /object X/.test(document.getElementById('status').textContent),
+   document.getElementById('status').textContent);
+Object.assign(INST(), {R:cp(Rf), t:cp(Tf)});
+state.transformSpace='part'; state.axisKey=null;
+
 const fails = R.filter(r=>!r.pass);
 return {total:R.length, failed:fails.length,
         results:R.map(r=>(r.pass?'PASS':'FAIL')+'  '+r.n+(r.d?'  ['+r.d+']':''))};

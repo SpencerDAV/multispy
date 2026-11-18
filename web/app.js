@@ -46,7 +46,9 @@ const state = {
   drag: null,
   spaceDown: false,
   depthDown: false,   // S held: the depth handle, see nudgeDepth
-  axisKey: null,   // 'x' | 'y' | 'z' while held, to turn about that world axis
+  depthUsed: false,   // ...and whether that hold actually dragged anything
+  axisKey: null,   // 'x' | 'y' | 'z' while held, to turn about that axis
+  transformSpace: 'part',   // which frame X/Y/Z name; see turnAxisWorld
   showVP: true,
   showResid: true,
   showExpected: true,
@@ -120,6 +122,21 @@ function anchorPoints(template) {
 function anchorMarkCount(key) {
   if (!state.project) return 0;
   return state.project.images.filter((im) => im.anchor_obs && key in im.anchor_obs).length;
+}
+
+/** Every anchor mark clicked on one object, across every photo.
+ *
+ *  Counted over the marks rather than over the template's anchors, because the
+ *  number this answers for is "how many clicks am I setting aside", and the
+ *  honest answer to that is clicks, not features. */
+function anchorMarkCountFor(instanceId) {
+  if (!state.project) return 0;
+  const prefix = `${instanceId}${ANCHOR_SEP}`;
+  let n = 0;
+  for (const im of state.project.images) {
+    for (const key of Object.keys(im.anchor_obs || {})) if (key.startsWith(prefix)) n += 1;
+  }
+  return n;
 }
 
 /** Anchors of this object that reach two or more photos.
@@ -526,6 +543,52 @@ function pivotWorld(inst) {
 
 const WORLD_AXIS = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
 
+/** Which frame X, Y and Z name while a turn is locked to one axis.
+ *
+ *  Part space is the scene's own frame. Once nominals have landed, those are
+ *  the drawing's axes, and they are the frame every number this app reports is
+ *  quoted in -- so it is the right default, and it was the wrong only option.
+ *  A body mounted at a compound angle has no edge parallel to any of them, and
+ *  the turn the eye actually wants on it -- roll it about its own length, bring
+ *  its own face round to meet the photograph -- is not on offer at all. Every
+ *  such correction then has to be reached by composing two or three turns about
+ *  axes that mean nothing to the body, each one disturbing what the last one
+ *  got right.
+ *
+ *  Object space reads the axes straight off the columns of the body's own pose,
+ *  so X, Y and Z mean what they meant in the CAD file the model came from. A
+ *  rotation about a local axis leaves that axis where it is, so recomputing it
+ *  from the current pose on every step of a drag is stable rather than drifting.
+ */
+function turnAxisWorld(inst, axisKey) {
+  const k = { x: 0, y: 1, z: 2 }[axisKey];
+  if (k === undefined) return null;
+  if (state.transformSpace !== 'object' || !inst || !inst.R) return WORLD_AXIS[axisKey];
+  // column k of an object-to-world R is that local axis, expressed in world
+  const v = [inst.R[0][k], inst.R[1][k], inst.R[2][k]];
+  const n = Math.hypot(v[0], v[1], v[2]);
+  return n > 1e-9 ? v.map((c) => c / n) : WORLD_AXIS[axisKey];
+}
+
+function spaceLabel() {
+  return state.transformSpace === 'object' ? 'object' : 'part';
+}
+
+/** Cycle the frame X/Y/Z are read in, and say so -- a mode with no visible
+ *  state is a mode that turns every later gesture into a guess. */
+function cycleTransformSpace() {
+  state.transformSpace = state.transformSpace === 'object' ? 'part' : 'object';
+  const inst = activeInstance();
+  setStatus(state.transformSpace === 'object'
+    ? `turning in OBJECT space — X/Y/Z are `
+      + `${inst ? (inst.label || inst.id) : 'the body'}'s own axes, as modelled`
+    : `turning in PART space — X/Y/Z are the scene's axes, the frame every `
+      + `reported number uses`, 'ok');
+  updateHint();
+  renderPanels();   // the 90-degree buttons carry the frame in their labels
+  render();
+}
+
 /** Turn by an exact angle about one world axis.
  *
  *  Dragging is for finding an angle; this is for the angles already known.
@@ -533,7 +596,7 @@ const WORLD_AXIS = { x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
  *  right angle to the scene's own axes, and nudging up to it by hand leaves a
  *  degree or two that no photograph will later remove. */
 function rotateSteps(inst, axisKey, deg) {
-  const axis = WORLD_AXIS[axisKey];
+  const axis = turnAxisWorld(inst, axisKey);
   if (!axis) return;
   rotateInPlace(inst, axis, (deg * Math.PI) / 180);
   inst.manual = true;
@@ -2165,8 +2228,11 @@ function drawPoseGizmo(inst, im, z) {
   if (state.axisKey) {
     const k = { x: 0, y: 1, z: 2 }[state.axisKey];
     const reach = Math.max(arm * 4, 0.3);
+    // drawn in whichever frame the turn will actually use, so switching space
+    // is something seen on the body rather than read off the hint
+    const dir = turnAxisWorld(inst, state.axisKey);
     const ends = [-1, 1].map((sgn) => projectWorld(
-      im, [0, 1, 2].map((j) => pivot[j] + WORLD_AXIS[state.axisKey][j] * reach * sgn)));
+      im, [0, 1, 2].map((j) => pivot[j] + dir[j] * reach * sgn)));
     if (ends[0] && ends[1]) {
       ctx.save();
       ctx.setLineDash([8 / z, 6 / z]);
@@ -2852,11 +2918,15 @@ canvas.addEventListener('mousedown', (ev) => {
     if (inst) {
       // the handle is decided by the button and the keys held at press time,
       // so a drag cannot change meaning half way through
+      const depth = ev.button === 0 && state.depthDown;
+      // pressing a button while S is held commits that hold to the drag, so
+      // even a press that never moves does not fall through to the space switch
+      if (depth) state.depthUsed = true;
       state.drag = {
         kind: 'pose',
         inst: inst.id,
         last: p,
-        depth: ev.button === 0 && state.depthDown,
+        depth,
         // Shift makes it a resize. Deliberately its own gesture rather than a
         // second meaning for the depth drag: in one photograph a body 1.25x
         // larger and 1.25x further away project identically, so the two have
@@ -2989,6 +3059,7 @@ window.addEventListener('mousemove', (ev) => {
         // this gesture did to the screen when it resized the model, so the hand
         // keeps the habit it already has while the number underneath it becomes
         // the one that belongs to this placement
+        state.depthUsed = true;   // this hold was a drag, so its keyup is not a tap
         nudgeDepth(inst, im, Math.exp(-sdx * 0.004));   // halves in ~170 px
         // the distance in metres, live, because that is the number being set --
         // the silhouette on screen cannot distinguish it from size
@@ -3018,7 +3089,7 @@ window.addEventListener('mousemove', (ev) => {
         // disturbs the one that was already right, and a part square to the
         // fixture never quite lands. Constraining it is what makes the last
         // few degrees reachable at all.
-        rotateInPlace(inst, WORLD_AXIS[d.axisKey], sdx * 0.006);
+        rotateInPlace(inst, turnAxisWorld(inst, d.axisKey), sdx * 0.006);
       } else if (d.roll) {
         // about the direction this photo is looking, so the body spins in the
         // picture plane -- the one turn that reads the same from every camera
@@ -3227,11 +3298,29 @@ window.addEventListener('keydown', (ev) => {
   if (k === 'p') { setMode('points'); return; }
   if (k === 'o') { setMode('objects'); return; }
   // S is the depth handle while posing, so it must not also leave pose mode.
-  // Held rather than tapped, to match the two drags it sits beside.
+  /* S does two jobs in pose mode, split by whether it was held or tapped.
+   *
+   * Held, it is the depth handle -- that is what it has always been, it sits
+   * beside the other two drag modifiers, and taking it away would cost the one
+   * gesture that places a body along the view ray.
+   *
+   * Tapped, it switches which frame X/Y/Z name. That was free to give: a tap
+   * on S did nothing at all before, since the keydown only armed a drag that
+   * then never happened. So the modifier keeps its key and the switch gets the
+   * key it was asked for, and neither has to be reached for with a chord.
+   */
   if (k === 's' && state.mode === 'pose') {
-    if (!state.depthDown) { state.depthDown = true; updateHint(); }
+    if (!state.depthDown) { state.depthDown = true; state.depthUsed = false; updateHint(); }
     return;
   }
+  /* Objects mode gets the switch too, without the depth handle it has no drag
+   * for. Scoping it to pose mode alone was wrong in the way that matters: a
+   * body is placed from Objects mode as often as from Pose, S there still meant
+   * "go to Select", and the jump is quiet enough to miss -- so the next X-locked
+   * turn came out in part space, the switch looked broken, and nothing on screen
+   * said why. The cost is the Select shortcut from this one mode, which is a
+   * button away; the frame a turn uses is not. */
+  if (k === 's' && state.mode === 'objects') { cycleTransformSpace(); return; }
   // H recalls a body that has drifted out of this photo's frame.
   if (k === 'h' && state.mode === 'pose') {
     const inst = activeInstance();
@@ -3263,7 +3352,9 @@ window.addEventListener('keydown', (ev) => {
     if (inst && isPlaced(inst)) {
       rotateSteps(inst, state.axisKey,
                   (ev.shiftKey ? 90 : 15) * (k === 'arrowright' ? 1 : -1));
-      setStatus(`turned ${ev.shiftKey ? 90 : 15}° about `
+      // names the frame, because "about X" is the one thing this message could
+      // say that does not distinguish the two turns it might have just made
+      setStatus(`turned ${ev.shiftKey ? 90 : 15}° about ${spaceLabel()} `
                 + `${state.axisKey.toUpperCase()}`, 'ok');
       renderPanels();
       render();
@@ -3348,7 +3439,12 @@ window.addEventListener('keydown', (ev) => {
 window.addEventListener('keyup', (ev) => {
   if (ev.key === ' ') { state.spaceDown = false; canvas.style.cursor = 'crosshair'; }
   const ku = ev.key.toLowerCase();
-  if (ku === 's' && state.depthDown) { state.depthDown = false; updateHint(); }
+  if (ku === 's' && state.depthDown) {
+    const tapped = !state.depthUsed;
+    state.depthDown = false;
+    state.depthUsed = false;
+    if (tapped) cycleTransformSpace(); else updateHint();
+  }
   if (state.axisKey === ku) { state.axisKey = null; updateHint(); render(); }
 });
 
@@ -3454,10 +3550,16 @@ function updateHint() {
   const poseHint = !inst
     ? `No object selected. Add a model and an object in the <b>Known objects</b> panel.`
     : state.axisKey
-      ? `<b>${state.axisKey.toUpperCase()} axis locked.</b> Right-drag turns about world `
-        + `<b>${state.axisKey.toUpperCase()}</b> and nothing else. `
-        + `<b>←</b>/<b>→</b> turn exactly 15°, with <b>Shift</b> exactly 90°. `
-        + `Release ${state.axisKey.toUpperCase()} for free rotation.`
+      ? `<b>${state.axisKey.toUpperCase()} axis locked`
+        + `${state.transformSpace === 'object' ? ', in OBJECT space' : ''}.</b> `
+        + `Right-drag turns about ${spaceLabel()} `
+        + `<b>${state.axisKey.toUpperCase()}</b> and nothing else — `
+        + (state.transformSpace === 'object'
+            ? `the body's own axis, as modelled.`
+            : `the scene's axis, the frame every reported number uses.`)
+        + ` <b>←</b>/<b>→</b> turn exactly 15°, with <b>Shift</b> exactly 90°. `
+        + `Tap <b>S</b> for ${state.transformSpace === 'object' ? 'part' : 'object'} space; `
+        + `release ${state.axisKey.toUpperCase()} for free rotation.`
       : state.depthDown
       ? `<b>Distance:</b> drag right to bring it closer, left to push it away. The `
         + `status line shows the distance in metres as you go. This moves <i>this body</i> `
@@ -3509,6 +3611,10 @@ function updateHint() {
   };
   $('hint').innerHTML = hints[state.mode]
     + ` &nbsp;·&nbsp; wheel zoom, space-drag pan, <b>F</b> fit`
+    // which frame a turn uses survives every other gesture, so it is shown
+    // wherever pose mode is, not only while an axis happens to be held
+    + (state.mode === 'pose' || state.mode === 'objects'
+        ? ` &nbsp;·&nbsp; turning in <b>${spaceLabel()}</b> space (tap <b>S</b>)` : '')
     + (state.showResid ? ` &nbsp;·&nbsp; residuals ×${RESIDUAL_GAIN}` : '');
 }
 
@@ -4267,6 +4373,51 @@ const CAD_COLOR = {
   improves: 'good', harmless: 'good', worsens: 'bad', untestable: 'unknown',
 };
 
+/* The switch, above the verdict rather than below it.
+ *
+ * Above, because this is the control the user comes to this panel for most
+ * often and it needs no verdict to justify it: "the fit was good before the
+ * models went in" is a thing you notice, not a thing you measure, and on a cell
+ * with twenty-eight bodies and five hundred marks, working out which three are
+ * lying is a separate afternoon. The check is still here and still worth
+ * running; it is no longer the only way through this panel.
+ *
+ * It re-solves on its own rather than leaving the project dirty, because the
+ * state it names and the solution on screen have to agree -- the whole failure
+ * this feature exists for is a camera solution that the bodies dictated sitting
+ * under a report that does not mention them. */
+function cadMuteSwitchHtml() {
+  const s = state.project.settings || {};
+  const off = s.anchors_in_solve === false;
+  const bodies = instanceList().filter((o) => !o.is_part);
+  const perBody = bodies.filter((o) => o.anchors_off).length;
+  const marks = bodies.reduce((n, o) => n + anchorMarkCountFor(o.id), 0);
+  const rep = state.report || {};
+
+  let html = `<label class="toggle" title="Solve the cameras from tie points, control lines and `
+           + `nominals alone. Every anchor stays marked; the bodies are placed against the `
+           + `result instead of moving it."><input type="checkbox" id="cadmuteall"`
+           + `${off ? ' checked' : ''}> keep every body's anchors out of the solve</label>`;
+  if (off) {
+    html += `<div class="note">The cameras, the points and the focal are what the tie points, `
+          + `control lines and nominals make them. ${marks} anchor mark(s) are still on the `
+          + `record and still drawn &mdash; they are simply not evidence about where the `
+          + `cameras are, and this holds across every Solve until you untick it.`
+          + `${rep.n_muted_instances ? ` Last solve placed `
+            + `${Object.values(rep.instances || {}).filter((v) => v.placed).length} of `
+            + `${rep.n_muted_instances} of them against the finished cameras.` : ''}</div>`
+          + `<div class="note">What this buys and what it does not: on the rear-module cell it `
+          + `took the fit from 9.37 px to 2.99 px and the culled marks from 15 to 2. It did `
+          + `<b>not</b> improve the bodies' agreement with CAD &mdash; shape error 3.49 mm to `
+          + `3.74 mm on one yardstick for both. It buys back the camera solution, not accuracy.`
+          + `</div>`;
+  } else if (perBody) {
+    html += `<div class="note">${perBody} body/bodies have their anchors out of the solve `
+          + `individually &mdash; see the objects panel. The rest are voting.</div>`;
+  }
+  return html;
+}
+
 function cadPanelHtml() {
   const r = state.cadCheck;
   if (!r) {
@@ -4324,14 +4475,21 @@ function cadPanelHtml() {
     html += `<div class="note${r.verdict === 'worsens' ? ' bad' : ''}">${escapeHtml(n)}</div>`;
   }
   if (r.verdict === 'worsens') {
-    html += `<div style="display:flex;gap:5px;margin-top:6px">`
-          + `<button class="smallbtn" id="cadrevert">put the body-free cameras back</button>`
+    html += `<div style="display:flex;gap:5px;margin-top:6px;flex-wrap:wrap">`
+          + `<button class="smallbtn" id="cadmute">take their anchors out of the solve</button>`
+          + `<button class="smallbtn" id="cadrevert">just put the cameras back</button>`
           + `</div>`
-          + `<div class="note">That restores the camera poses and points from the solve `
-          + `without the bodies, and leaves every anchor you clicked exactly where it is, so `
-          + `you can re-click one corner and check again. It does not re-place the bodies `
-          + `against the restored cameras &mdash; a rejected body is left rejected rather than `
-          + `quietly re-fitted.</div>`;
+          // The two buttons do different things and the difference is the whole
+          // point of this feature, so it is spelled out rather than left to the
+          // labels. The first is a decision that survives a reload; the second
+          // is a look at the old answer that the next Solve undoes.
+          + `<div class="note"><b>Out of the solve</b> is the lasting one: it keeps every click `
+          + `and every body, re-solves from tie points, control lines and nominals, and places `
+          + `the bodies against that result. Press Solve as often as you like &mdash; it stays. `
+          + `<b>Put the cameras back</b> only restores the poses and points from the body-free `
+          + `solve and leaves the marks voting, so the next Solve re-makes exactly the damage `
+          + `above. Use it to look, not to keep. To mute one body rather than all of them, use `
+          + `the tickbox in the objects panel.</div>`;
   }
   return html;
 }
@@ -4344,8 +4502,39 @@ function renderCadPanel() {
   if (badge) badge.textContent = r && r.ok ? r.verdict : '';
   el.innerHTML = `<div class="row"><span class="k">bodies against the marks</span>`
                +   `<button class="smallbtn" id="checkcad">check CAD</button></div>`
+               + cadMuteSwitchHtml()
                + cadPanelHtml();
   wireCadPanel();
+}
+
+/* Set the switch and re-solve, in one act.
+ *
+ * One act because the two halves are not separable in any useful way: the
+ * switch describes which marks are evidence, and leaving the old solution on
+ * screen under it would show a camera solution those very marks produced. That
+ * mismatch -- a good-looking report over a calibration the bodies bent -- is the
+ * failure this whole feature exists to end, so it is not reproduced by the fix.
+ *
+ * Goes through its own route rather than the solve route because it writes the
+ * project: /api/check_cad must stay read-only, and a switch that is set
+ * client-side and only saved on the next autosave would be a decision that can
+ * be lost. */
+async function muteEverything() {
+  pushUndoBefore('take the bodies’ anchors out of the solve');
+  state.project.settings.anchors_in_solve = false;
+  markDirty();
+  setStatus('taking the bodies’ anchors out of the solve and re-solving…');
+  try {
+    const data = await api('/api/mute_bodies', { project: projectPayload() });
+    if (data.project) adopt(data);
+    setStatus(data.applied || 'done', 'ok');
+  } catch (err) {
+    setStatus(`could not do it: ${err.message || err}`, 'warn');
+  } finally {
+    renderPanels();
+    render();
+    if (Viewer3D.isOn()) Viewer3D.render();
+  }
 }
 
 function wireCadPanel() {
@@ -4373,6 +4562,22 @@ function wireCadPanel() {
       }
     };
   }
+  const muteAll = $('cadmuteall');
+  if (muteAll) {
+    muteAll.onchange = (e) => {
+      if (e.target.checked) { muteEverything(); return; }
+      // Unmuting is the plain edit: the next Solve lets them back in, and
+      // nothing needs re-solving behind the user's back to make that true.
+      pushUndoBefore('let the bodies’ anchors back into the solve');
+      state.project.settings.anchors_in_solve = true;
+      state.cadCheck = null;
+      markDirty();
+      setStatus('the bodies’ anchors are back in the solve — press Enter to re-solve', 'ok');
+      renderPanels();
+    };
+  }
+  const mute = $('cadmute');
+  if (mute) mute.onclick = () => muteEverything();
   const revert = $('cadrevert');
   if (revert) {
     revert.onclick = async () => {
@@ -5180,7 +5385,11 @@ function renderObjectsPanel() {
             + `${placed ? ' placed' : ''}${inst.locked ? ' locked' : ''}" data-obj="${escapeHtml(inst.id)}">`
             + `<span class="swatch"></span>`
             + `<span class="name">${escapeHtml(inst.label || inst.id)}`
-            + `<span style="color:var(--text-dim)"> ${rep ? `${rep.n_anchors_used}/${rep.n_anchors_marked}` : ''}</span></span>`
+            + `<span style="color:var(--text-dim)"> ${rep ? `${rep.n_anchors_used}/${rep.n_anchors_marked}` : ''}`
+            // Said on the row, not only in the detail below it, because "why is
+            // this body not holding the cameras" is a question asked while
+            // scanning the list rather than after selecting one.
+            + `${inst.anchors_off ? ' · not voting' : ''}</span></span>`
             + `<span class="err${bad ? ' hi' : ''}">${shape || (placed ? 'placed' : 'not placed')}</span></div>`;
     }
     html += `</div>`;
@@ -5192,6 +5401,23 @@ function renderObjectsPanel() {
             + `<input type="text" id="objlabel" value="${escapeHtml(inst.label)}" style="width:140px"></div>`;
       html += `<label class="toggle"><input type="checkbox" id="objlocked"${inst.locked ? ' checked' : ''}>`
             + ` lock — this object is the world frame</label>`;
+      /* The per-body half of "take the CAD out of the solve". The project-wide
+       * switch lives in the CAD panel beside the verdict that justifies it;
+       * this one is for the single body you have just caught, which is the
+       * granularity the failure actually comes in -- one anchor clicked onto
+       * the wrong one of two similar corners, while the same model placed nine
+       * other times is marked perfectly. */
+      html += `<label class="toggle" title="Keeps every click and keeps the body in the scene, `
+            + `but its anchors stop saying where the cameras are. It is still placed — against `
+            + `the cameras the tie points give, rather than by moving them."`
+            + `><input type="checkbox" id="objanchorsoff"${inst.anchors_off ? ' checked' : ''}>`
+            + ` anchors out of the solve</label>`;
+      if (inst.anchors_off) {
+        html += `<div class="note">This body's marks are on the record but not in the solve: `
+              + `they cannot move a camera, a point or the focal. It is placed afterwards by `
+              + `triangulating them against the finished cameras, so its shape error below is a `
+              + `measurement with nothing bent to meet it. Untick to let it vote again.</div>`;
+      }
       if (!(rep && rep.placed)) {
         // a bare "not placed" reads as a failure when it usually means the
         // solve has not been run since the marks went in
@@ -5203,12 +5429,20 @@ function renderObjectsPanel() {
               + `measure it.</div>`;
       }
       if (isPlaced(inst)) {
+        /* The buttons carry the frame in their own labels. Putting it only in
+         * the hint strip was not enough: this panel is where a body is turned,
+         * and a button reading "90° X" beside a body sitting at a compound
+         * angle is the same label for two different turns. "obj X" says which
+         * one is about to happen without having to look anywhere else. */
+        const sp = state.transformSpace === 'object' ? 'obj ' : '';
         html += `<div style="display:flex;gap:4px;margin-top:5px;flex-wrap:wrap">`
               + `<button class="smallbtn" id="posesnap">snap anchors here</button>`
-              + `<button class="smallbtn" id="poseturn" data-ax="0">90° X</button>`
-              + `<button class="smallbtn" id="poseturny" data-ax="1">90° Y</button>`
-              + `<button class="smallbtn" id="poseturnz" data-ax="2">90° Z</button>`
-              + `<button class="smallbtn" id="poseclear">clear pose</button></div>`;
+              + `<button class="smallbtn" id="poseturn" data-ax="0">90° ${sp}X</button>`
+              + `<button class="smallbtn" id="poseturny" data-ax="1">90° ${sp}Y</button>`
+              + `<button class="smallbtn" id="poseturnz" data-ax="2">90° ${sp}Z</button>`
+              + `<button class="smallbtn" id="poseclear">clear pose</button></div>`
+              + `<div class="hintline" style="opacity:.75;margin-top:3px">turning in `
+              + `<b>${spaceLabel()}</b> space — tap <b>S</b> to switch</div>`;
       }
       if (rep && rep.placed) {
         html += `<div class="row"><span class="k">anchor RMS</span><span class="v">${rep.rms_px.toFixed(2)} px</span></div>`;
@@ -5440,31 +5674,53 @@ function wireObjectsPanel(el) {
     markDirty();
     renderObjectsPanel();
   };
+  const anchorsOff = $('objanchorsoff');
+  if (anchorsOff) anchorsOff.onchange = (e) => {
+    const inst = activeInstance();
+    if (!inst) return;
+    pushUndoBefore(e.target.checked
+      ? 'take this body’s anchors out of the solve'
+      : 'let this body’s anchors back into the solve');
+    inst.anchors_off = e.target.checked;
+    // The CAD verdict was measured against a different set of voters, so it is
+    // void -- same rule as any other edit. Saying nothing here would leave a
+    // stale "worsens" sitting above the very switch that answered it.
+    state.cadCheck = null;
+    markDirty();
+    setStatus(e.target.checked
+      ? `${inst.label || inst.id}: anchors out of the solve — press Enter to re-solve without `
+        + `them. Nothing was deleted.`
+      : `${inst.label || inst.id}: anchors back in the solve — press Enter to re-solve.`, 'ok');
+    renderPanels();
+  };
   const snap = $('posesnap');
   if (snap) snap.onclick = () => {
     const im = currentImage();
     if (im) snapAnchorsHere(im);
   };
-  // quarter turns about the world axes, because a CAD model almost never comes
-  // in facing the way the real object does and nudging 90 degrees by hand is
-  // both slow and never exactly 90
+  // quarter turns, because a CAD model almost never comes in facing the way the
+  // real object does and nudging 90 degrees by hand is both slow and never
+  // exactly 90. These follow the same frame the keyboard does -- a button that
+  // kept turning about part X while X/Y/Z had been switched to the body's own
+  // axes would be the one gesture in the panel that lied about its label.
   for (const [id, axis] of [['poseturn', 0], ['poseturny', 1], ['poseturnz', 2]]) {
     const btn = $(id);
     if (!btn) continue;
     btn.onclick = (e) => {
       const inst = activeInstance();
       if (!inst || !isPlaced(inst)) return;
-      const dir = [0, 0, 0];
-      dir[axis] = 1;
+      const dir = turnAxisWorld(inst, 'xyz'[axis]);
       rotateInPlace(inst, dir, (e.shiftKey ? -1 : 1) * Math.PI / 2);
       inst.manual = true;
       inst.pose_in_part_space = partSpaceState().ok;
       markDirty();
       renderPanels();
       render();
-      setStatus(`turned ${e.shiftKey ? '-' : '+'}90\u00b0 about world ${AXIS_NAME[axis]}`, 'ok');
+      setStatus(`turned ${e.shiftKey ? '-' : '+'}90\u00b0 about ${spaceLabel()} `
+                + `${AXIS_NAME[axis]}`, 'ok');
     };
-    btn.title = 'Quarter turn about world ' + AXIS_NAME[axis] + ' (shift for the other way)';
+    btn.title = `Quarter turn about ${AXIS_NAME[axis]} in the current frame `
+              + `(S switches part/object; shift for the other way)`;
   }
   const posedrop = $('poseclear');
   if (posedrop) posedrop.onclick = () => {
