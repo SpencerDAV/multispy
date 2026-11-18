@@ -79,12 +79,42 @@ carried a nominal the part space is a link short.
 
 What this does and does not do
 ------------------------------
-It measures, and it can put the body-free cameras back. It does not place the
-bodies against locked cameras -- that would need a solve mode that does not exist
-yet, since ``fit_instances`` is part of the linear initialisation and works from
-triangulated anchor positions rather than from a finished camera solution. So a
-rejected body is reported as rejected, and what to do about it is the user's call:
-re-click its anchors, check its units, or leave it out.
+It measures, and it can act on the measurement in two ways: put the body-free
+cameras back, or take the anchors out of the solve for good.
+
+The second is the one that was missing, and its absence was the whole complaint.
+Restoring the cameras is a *snapshot* -- the marks stay live, so the next press
+of Solve re-makes the mess it just undid, and the user who has got a good fit
+from tie points is back where they started. The persistent answer is
+:data:`~multispy.project.Settings.anchors_in_solve` and
+:attr:`~multispy.project.ObjectInstance.anchors_off`, which say "these marks are
+not evidence about where the cameras are" and keep saying it after a reload.
+:func:`mute_bodies` sets that and re-solves.
+
+An earlier version of this docstring said a rejected body could not be placed
+against locked cameras, because ``fit_instances`` runs inside the linear
+initialisation and works from triangulated anchor positions rather than from a
+finished camera solution. That is now :func:`~multispy.solve.place_muted_instances`,
+which triangulates each anchor against the final cameras and fits the model to
+the result. So a muted body is still placed, still drawn, and still reports its
+shape error -- a better shape error than before, in fact, since nothing had the
+chance to bend towards it.
+
+What muting is and is not worth, measured
+-----------------------------------------
+On the rear-module cell (8 photographs, 33 tie points, 28 bodies, 582 anchor
+marks) muting every body took the solve from 9.37 px to 2.99 px and from 15
+culled marks to 2. That is the damage this module exists to detect, undone.
+
+It did **not** improve the geometry: measured on one yardstick for both arms --
+every body's anchors triangulated against that arm's own final cameras and the
+model rigid-fitted -- the shape error median moved 3.49 mm to 3.74 mm, and muting
+was better on 9 bodies of 23. The remaining error on that dataset is in the
+marks, and no weighting or exclusion policy reaches it; see ``TODO.md``.
+
+Both halves of that matter. Muting is the right answer to "the bodies are
+wrecking a calibration I had" and the wrong answer to "the bodies disagree with
+my CAD by 3 mm". It buys back the camera solution, not accuracy.
 """
 
 from __future__ import annotations
@@ -169,6 +199,17 @@ class CadReport:
     """``"improves"``, ``"harmless"``, ``"worsens"`` or ``"untestable"``."""
     n_instances: int = 0
     n_anchor_marks: int = 0
+    n_voting_anchor_marks: int = 0
+    """Of those, the ones actually allowed to say where the cameras are.
+
+    Lower than ``n_anchor_marks`` once anything is muted, and the two being
+    different is the first thing a reader of this report needs to know: the
+    verdict is about the voting ones only."""
+    n_muted_anchor_marks: int = 0
+    already_muted: bool = False
+    """Nothing was voting, so there was no second state to compare against.
+
+    Not a pass. See the ``untestable`` reason this sets."""
     before_rms_px: float = 0.0
     """Overall tie-point-only RMS without bodies. Read the per-image table
     rather than this: the whole point is that an average hides the damage."""
@@ -255,17 +296,23 @@ def _shared_focal(report: Any) -> float | None:
 
 
 def body_free_copy(project: Project) -> Project:
-    """The project as it was before any body anchor was clicked.
+    """The project with the bodies' anchors muted rather than deleted.
 
-    The anchor *marks* are what is removed, not the instances or their models.
-    The bodies are still in the scene and still drawn; they simply stop being
-    evidence about where the cameras are, which is exactly the state the user
-    describes as "the good solution" before the models went in.
+    The state the user describes as "the good solution" before the models went
+    in: the bodies are still in the scene, still drawn, every click still there,
+    and they simply stop being evidence about where the cameras are.
+
+    This used to clear ``anchor_obs`` outright, which gave the same tie-point
+    residuals -- that is what the comparison reads -- but was not a state the
+    user could ever be left in except by deleting their work. Now it sets the
+    switch that :func:`mute_bodies` makes permanent, so the "without" column of
+    the report is exactly, parameter for parameter, what pressing that button
+    produces. A measurement of a state nobody can reach is a worse measurement,
+    however equal its arithmetic.
     """
     trial = copy.deepcopy(project)
     trial.path = None          # a trial must never be saved over the project
-    for im in trial.images:
-        im.anchor_obs = {}
+    trial.settings.anchors_in_solve = False
     return trial
 
 
@@ -285,6 +332,11 @@ def check_cad_bodies(
     instances = list(getattr(project, "instances", []) or [])
     rep.n_instances = len(instances)
     rep.n_anchor_marks = sum(len(im.anchor_obs or {}) for im in project.active_images())
+    muted = project.muted_anchor_keys()
+    rep.n_muted_anchor_marks = sum(
+        sum(1 for key in im.anchor_obs if key in muted) for im in project.active_images()
+    )
+    rep.n_voting_anchor_marks = rep.n_anchor_marks - rep.n_muted_anchor_marks
 
     if not rep.n_anchor_marks:
         rep.verdict = "untestable"
@@ -293,6 +345,21 @@ def check_cad_bodies(
             "there is nothing to compare. This check answers 'did the CAD make the "
             "photographs fit worse', and without anchor marks the answer is no by "
             "construction."
+        )
+        return rep
+
+    # Already in the body-free state, by the switch rather than by deletion.
+    # "harmless" would be the arithmetic's answer here and it would be a lie by
+    # omission: both arms would be the same solve, and the user would read a
+    # clean bill of health for bodies that are not in the solve to be judged.
+    if not rep.n_voting_anchor_marks:
+        rep.verdict = "untestable"
+        rep.already_muted = True
+        rep.reason = (
+            f"all {rep.n_anchor_marks} anchor mark(s) are already out of the solve, so this "
+            f"*is* the body-free state and there are not two solutions to compare. The marks "
+            f"are not lost -- let the bodies vote again and run this to find out what they "
+            f"would cost."
         )
         return rep
 
@@ -436,18 +503,112 @@ def check_cad_bodies(
                 f"a few percent, and a few percent is still the cameras being bent to suit "
                 f"the model."
             )
+
+    if rep.verdict == "worsens":
+        rep.notes.append(
+            "Two things to do about it, and they are not the same thing. Re-clicking the "
+            "anchors above fixes the cause. Taking the anchors out of the solve stops the "
+            "damage now and keeps every click: the bodies stay in the scene, stay drawn and "
+            "are still placed -- against the cameras the tie points give, rather than by "
+            "moving them -- and it holds across the next Solve, which putting the cameras "
+            "back does not. What it does not buy is accuracy: measured on the rear-module "
+            "cell, muting took the fit from 9.37 px to 2.99 px and left the bodies' shape "
+            "error where it was, 3.49 mm to 3.74 mm. It buys back the camera solution."
+        )
+    if rep.n_muted_anchor_marks:
+        rep.notes.append(
+            f"{rep.n_muted_anchor_marks} of {rep.n_anchor_marks} anchor mark(s) were already "
+            f"out of the solve and are in neither column: this verdict is about the "
+            f"{rep.n_voting_anchor_marks} that are voting."
+        )
     return rep
+
+
+def mute_bodies(
+    project: Project, *, instances: list[str] | None = None
+) -> tuple[str, Any | None]:
+    """Take the bodies' anchors out of the solve for good, and re-solve.
+
+    The decision the verdict leads to, and the thing
+    :func:`restore_without_bodies` could not do. That one puts a camera solution
+    back and leaves the marks live, so Solve undoes it; this changes what the
+    marks *are* -- clicks on the record rather than evidence about the cameras --
+    and the change is in the project file.
+
+    ``instances`` mutes those placements only, which is the right granularity
+    when one body is at fault and the others are earning their keep. Omitted, it
+    sets the project-wide switch, which is the right one when the answer to "was
+    the fit better before the models went in" is yes and sorting out which of
+    twenty-eight is lying is tomorrow's job.
+
+    Nothing is deleted. Every anchor stays marked, every body stays in the
+    scene, every body is still placed -- against the cameras this re-solve
+    produces rather than by moving them. Unmuting is the same switch back.
+
+    Returns ``(what it did, the new solve report or None)``. The report comes
+    back rather than being thrown away because the project on disk now carries
+    the solution it describes, and a caller that showed the old report beside
+    the new project would be showing the damage this call just removed.
+    """
+    from .solve import solve
+
+    if instances:
+        wanted = set(instances)
+        hit = [inst for inst in project.placed_object_instances() if inst.id in wanted]
+        if not hit:
+            return "none of those bodies are in this project, so nothing changed", None
+        already = [inst for inst in hit if inst.anchors_off]
+        for inst in hit:
+            inst.anchors_off = True
+        which = ", ".join(inst.label or inst.id for inst in hit)
+        what = (
+            f"took {len(hit)} body's anchors out of the solve ({which})"
+            if len(already) < len(hit)
+            else f"{which} already had their anchors out of the solve"
+        )
+    else:
+        if not project.settings.anchors_in_solve:
+            return (
+                "the bodies' anchors are already out of the solve; nothing changed",
+                None,
+            )
+        project.settings.anchors_in_solve = False
+        what = (
+            f"took every body's anchors out of the solve "
+            f"({len(project.placed_object_instances())} bodies, "
+            f"{project.n_muted_anchor_marks()} marks)"
+        )
+
+    fresh = solve(project)
+    if not getattr(fresh, "ok", False):
+        return (
+            f"{what}, but the solve without them did not succeed, so the project is left with "
+            f"the switch set and no new solution. Fix the tie-point solve first -- muting the "
+            f"bodies cannot rescue a project that will not solve without them.",
+            fresh,
+        )
+    placed = sum(1 for rep in fresh.instances.values() if rep.placed)
+    return (
+        f"{what} and re-solved: {fresh.rms_reprojection_px:.2f} px, {placed} body/bodies still "
+        f"placed, every mark still where you clicked it. The cameras are now what the tie "
+        f"points, control lines and nominals make them, and this survives the next Solve -- "
+        f"which is what putting the cameras back did not.",
+        fresh,
+    )
 
 
 def restore_without_bodies(project: Project, report: CadReport) -> str:
     """Put the body-free camera solution back, when the bodies made things worse.
 
-    The honest half of the enforcement. It does not place the bodies against the
-    restored cameras -- see the module docstring for why that needs a solve mode
-    that does not exist -- so this leaves the project in the state the user calls
-    "the good solution", with the bodies present but no longer dictating where the
-    cameras are. Their anchors stay marked, so nothing the user clicked is lost
-    and the check can be run again after re-clicking.
+    A snapshot, and that is now its whole job: it recovers the camera poses and
+    point positions from a solve the bodies were not in, and leaves the marks
+    voting. So the very next press of Solve re-makes the damage. That is not a
+    flaw to be fixed here -- it is what "restore" means -- but it is why the
+    decision belongs to :func:`mute_bodies` and this is for looking at the old
+    answer, not for keeping it.
+
+    Use it when you want to see the good solution again before deciding; use
+    :func:`mute_bodies` when you have decided.
 
     Returns what it did, for the caller to show. Does nothing unless the verdict
     is ``"worsens"``, so calling it unconditionally is safe.
@@ -478,6 +639,7 @@ def restore_without_bodies(project: Project, report: CadReport) -> str:
             pt.xyz = positions[pt.id]
     return (
         f"restored the body-free solution: {moved} camera pose(s) and "
-        f"{len(positions)} point(s) put back, anchors left marked. The bodies are still in "
-        f"the scene but are no longer bending the cameras."
+        f"{len(positions)} point(s) put back, anchors left marked and still voting. The next "
+        f"Solve will put the bodies back in charge of the cameras -- to keep this state, take "
+        f"their anchors out of the solve instead."
     )

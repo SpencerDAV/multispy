@@ -71,6 +71,7 @@ SHARED_ROUTES = frozenset(
         "/api/check_nominal_shape",
         "/api/viewpoints",
         "/api/check_cad",
+        "/api/mute_bodies",
         "/api/use_calibration_nominals",
     }
 )
@@ -742,6 +743,29 @@ class Workspace:
                 self.save()
                 out["project"] = project_payload(self.project)
             return out
+
+        # The lasting half of the CAD guard, and its own route because it is a
+        # different kind of act from /api/check_cad: that one looks and must not
+        # be able to write, this one decides and must. It does not re-run the
+        # check -- muting is a choice the user is entitled to make without a
+        # verdict, and most often it is made because the fit was good before the
+        # models went in, which needs no measurement to notice.
+        #
+        # Re-solves, so the project on disk is in the state the switch describes
+        # rather than carrying a camera solution the bodies still dictated.
+        if route == "/api/mute_bodies":
+            project = self.adopt(body["project"])
+            raw = body.get("instances")
+            instances = [str(i) for i in raw] if isinstance(raw, list) else None
+            applied, fresh = cadguard.mute_bodies(project, instances=instances)
+            if fresh is not None:
+                self.last_report = fresh.to_dict()
+            self.save()
+            return {
+                "applied": applied,
+                "project": project_payload(self.project),
+                "report": self.last_report,
+            }
 
         # Adopting the file's feature coordinates as nominals you can pick from.
         # A separate route from /api/check_calibration, which stays read-only:
