@@ -65,6 +65,13 @@ const state = {
   partPlacement: null,
   refine: null,        // the latest edge-alignment outcomes, per image
   planeDraw: null,     // {id, idx} while a surface's corners are being clicked
+  /* The mark a right-click has just removed, as {point, image}. The click that
+   * follows one of those is a correction -- "put it back, properly" -- so it
+   * re-marks that same point and stays on that same photograph, rather than
+   * marking whatever point happened to be active and auto-advancing away from
+   * the thing being looked at. Cleared by that click, and by leaving the
+   * photo. */
+  repair: null,
 };
 
 /* Anchors are keyed "<instance>/<anchor>" to match the project format, where
@@ -1691,6 +1698,10 @@ const tol = () => 9 / state.view.zoom;
 async function selectImage(id, fit) {
   if (!id) return;
   state.current = id;
+  // a removed mark is replaced in the photo it was removed from, and nowhere
+  // else; and the corner cursor belongs to whichever photo is on screen
+  state.repair = null;
+  syncPlaneDraw();
   try {
     await bitmapFor(id);
   } catch (err) {
@@ -3024,9 +3035,31 @@ canvas.addEventListener('contextmenu', (ev) => {
   if (state.mode === 'pose') return;
   const hit = hitTest(toImage(ev));
   if (!hit) return;
-  if (hit.kind === 'obs') delete im.observations[hit.point];
-  else if (hit.kind === 'anchor') delete im.anchor_obs[hit.key];
-  else im.axis_lines.splice(hit.index, 1);
+  if (hit.kind === 'obs') {
+    delete im.observations[hit.point];
+    /* Removing a mark is almost always the first half of moving it, so the
+     * cursor follows the removal: the next click re-marks THIS point, here.
+     * Left to itself the cursor stayed wherever the marking pass had got to,
+     * so that click marked some other point -- and, that other point being
+     * marked here already, the auto-advance carried the user off to another
+     * photograph. Correcting a mark was impossible without noticing why. */
+    state.activePoint = hit.point;
+    state.repair = { point: hit.point, image: im.id };
+    aimPlaneDrawAt(hit.point);
+    const pt = state.project.points.find((q) => q.id === hit.point);
+    setStatus(`${pt?.label || hit.point} removed from this photo — click where it `
+            + `should be, and the photo stays put`, 'ok');
+  } else if (hit.kind === 'anchor') {
+    delete im.anchor_obs[hit.key];
+    // same reasoning as a tie point: the next click is the replacement, so
+    // point the anchor cursor at the anchor that was just removed
+    const [instId, name] = splitAnchorKey(hit.key);
+    state.activeInstance = instId;
+    state.activeAnchor = name;
+    setStatus(`${name} removed from this photo — click where it should be`, 'ok');
+  } else {
+    im.axis_lines.splice(hit.index, 1);
+  }
   markDirty();
   renderPanels();
   render();
@@ -3144,21 +3177,42 @@ canvas.addEventListener('mousedown', (ev) => {
   if (state.mode === 'lines') {
     state.drag = { kind: 'newline', from: p, to: p };
   } else if (state.mode === 'points') {
-    if (!state.activePoint) newPoint();
-    im.observations[state.activePoint] = [p.x, p.y];
-    markDirty();
-    const pid = state.activePoint;
     if (state.planeDraw) {
+      const plane = planeBeingDrawn();
+      const slot = plane ? state.planeDraw.idx : -1;
+      if (slot < 0) {
+        // nothing here is being asked for, and placing the active point would
+        // silently drag a corner that is already right
+        setStatus(`${plane ? (plane.label || plane.id) + ': every' : 'Every'} corner of `
+                + `this surface is already marked in this photo — drag one to move it, `
+                + `or right-click it to remove it`, 'warn');
+        return;
+      }
+      /* The corner being asked for, not the active point. The two part company
+       * as soon as anything else on the photo is touched -- picking up a
+       * neighbouring mark makes that the active point -- and the click after
+       * that then marked it again somewhere new instead of the corner the
+       * status line was asking for. */
+      const pid = plane.corners[slot];
+      const repair = isRepair(pid, im);
+      im.observations[pid] = [p.x, p.y];
+      state.activePoint = pid;
+      markDirty();
       // round the quad in this photo first; the plane's own advance decides
       // when to move on, and it is not "next photo missing this one point"
-      advancePlaneCorner();
+      advancePlaneCorner(repair);
       renderPanels();
       render();
       return;
     }
+    if (!state.activePoint) newPoint();
+    const pid = state.activePoint;
+    const repair = isRepair(pid, im);
+    im.observations[pid] = [p.x, p.y];
+    markDirty();
     renderPanels();
     render();
-    if (state.autoAdvance) advanceToMissing(pid);
+    if (state.autoAdvance && !repair) advanceToMissing(pid);
   } else if (state.mode === 'objects') {
     placeAnchor(im, p);
   }
@@ -6681,20 +6735,67 @@ function dropPoints(ids) {
 /** Begin clicking a plane's corners, in this photo, starting at corner one. */
 function startPlaneDraw(plane) {
   if (!plane || !(plane.corners || []).length) return;
-  const im = currentImage();
+  state.planeDraw = { id: plane.id, idx: 0 };
+  setMode('points');
   // picking up where this photograph left off, which for a surface sharing an
   // edge with one already drawn is corner three
-  const first = Math.max(0, im
-    ? plane.corners.findIndex((c) => !(c in im.observations))
-    : 0);
-  state.planeDraw = { id: plane.id, idx: first };
-  state.activePoint = plane.corners[first];
-  setMode('points');
+  syncPlaneDraw();
   renderPanels();
   render();
-  setStatus(
-    `${plane.label || plane.id}: click corner ${first + 1} of ${plane.corners.length}, `
-    + `in order round the surface — click a point that is already there to share it`);
+  const first = state.planeDraw.idx;
+  const n = plane.corners.length;
+  setStatus(first < 0
+    ? `${plane.label || plane.id}: this photo already has all ${n} corners — drag one to `
+      + `move it, right-click one to remove it, or open a photo that is missing some`
+    : `${plane.label || plane.id}: click corner ${first + 1} of ${n}, `
+      + `in order round the surface — click a point that is already there to share it`,
+    first < 0 ? 'warn' : null);
+}
+
+/** The surface whose corners are being clicked, or null. */
+function planeBeingDrawn() {
+  if (!state.planeDraw) return null;
+  return (state.project?.reference_planes || [])
+    .find((pl) => pl.id === state.planeDraw.id) || null;
+}
+
+/** Aim the corner cursor at this photograph: the first corner it is missing,
+ *  or -1 when it is missing none.
+ *
+ *  The cursor is a corner INDEX into the surface, and it used to move only
+ *  when a corner was clicked. Step back to an earlier photo to fix something
+ *  and it still pointed at wherever the marking pass had got to, so the next
+ *  click marked the wrong corner -- and, with that corner the last one this
+ *  photo was missing, the advance then carried the user straight back out of
+ *  the photograph they had come to look at. */
+function syncPlaneDraw() {
+  const plane = planeBeingDrawn();
+  if (!plane) { state.planeDraw = null; return; }
+  const im = currentImage();
+  if (!im) return;
+  const corners = plane.corners || [];
+  const k = corners.findIndex((c) => !(c in im.observations));
+  state.planeDraw.idx = k;
+  if (k >= 0) state.activePoint = corners[k];
+}
+
+/** Point the corner cursor at one particular corner, if it is one of this
+ *  surface's -- used when that corner's mark has just been removed, so that
+ *  the click which replaces it marks the corner the user is looking at. */
+function aimPlaneDrawAt(pid) {
+  const plane = planeBeingDrawn();
+  if (!plane) return;
+  const k = (plane.corners || []).indexOf(pid);
+  if (k < 0) return;
+  state.planeDraw.idx = k;
+  state.activePoint = pid;
+}
+
+/** Is this click putting back a mark that was just removed from this photo? */
+function isRepair(pid, im) {
+  const r = state.repair;
+  state.repair = null;
+  return !!(r && r.point === pid && im && r.image === im.id);
 }
 
 /** Two significant figures, without `toPrecision` reaching for an exponent.
@@ -6756,27 +6857,25 @@ function pointIsUnmarked(pid) {
  *  carries a mark it is a real feature with a position, and a press on some
  *  other marker means what it means everywhere else -- pick it up and drag it.
  *
+ *  A mark this surface already owns is likewise a drag and never an adoption:
+ *  there is nothing to adopt, the corner IS that point. Pressing the corner
+ *  the status line happened to be asking for used to count as "done, move on"
+ *  instead, which fired the advance to the next photograph on the way to the
+ *  drag -- so a corner, once placed, could not be nudged.
+ *
  *  Returns true when the press was consumed.
  */
 function adoptCornerPoint(pid) {
-  const plane = (state.project.reference_planes || [])
-    .find((p) => p.id === state.planeDraw.id);
+  const plane = planeBeingDrawn();
   if (!plane) return false;
 
   const slot = state.planeDraw.idx;
+  if (slot < 0) return false;
   const own = plane.corners[slot];
-  if (own === pid) {
-    // they clicked the very corner they were asked for, which is already
-    // marked here: take it as done rather than as a drag
-    advancePlaneCorner();
-    return true;
-  }
   if (plane.corners.includes(pid)) {
-    setStatus(
-      `${plane.label || plane.id}: that point is already corner `
-      + `${plane.corners.indexOf(pid) + 1} of this surface — a quad needs four `
-      + `different ones`, 'warn');
-    return true;
+    setStatus(`${plane.label || plane.id}: moving corner `
+            + `${plane.corners.indexOf(pid) + 1} of ${plane.corners.length}`);
+    return false;
   }
   if (!pointIsUnmarked(own)) return false;
 
@@ -6805,10 +6904,14 @@ function adoptCornerPoint(pid) {
  *  which is the opposite of how a lone tie point is marked. Four corners of
  *  one surface are visible together and are recognised together -- going round
  *  the quad once per photo is how a person actually sees it, and it keeps the
- *  winding order right, which a corner-at-a-time pass does not. */
-function advancePlaneCorner() {
-  const plane = (state.project.reference_planes || [])
-    .find((p) => p.id === state.planeDraw.id);
+ *  winding order right, which a corner-at-a-time pass does not.
+ *
+ *  `stay` holds the photograph still: the click was putting back a mark that
+ *  had just been removed from it, and being thrown into the next photo before
+ *  the correction can even be looked at is what made correcting one
+ *  impossible. Corners still missing HERE are stepped through as usual. */
+function advancePlaneCorner(stay) {
+  const plane = planeBeingDrawn();
   if (!plane) { state.planeDraw = null; return; }
   const corners = plane.corners;
 
@@ -6841,6 +6944,17 @@ function advancePlaneCorner() {
     setStatus(
       `${plane.label || plane.id}: all ${prog.total} corners are in two or more photos — `
       + `press Solve and the surface is fitted through them`, 'ok');
+    return;
+  }
+
+  if (stay) {
+    // nothing left to ask for in this photo, and this click was a correction:
+    // the cursor goes idle here rather than jumping on
+    syncPlaneDraw();
+    setStatus(
+      `${plane.label || plane.id}: corner put back. ${prog.ready} of ${prog.total} `
+      + `corner(s) are in two or more photos — the filmstrip still has photos to `
+      + `mark them in`, 'ok');
     return;
   }
 
