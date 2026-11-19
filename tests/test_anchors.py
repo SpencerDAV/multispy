@@ -231,6 +231,74 @@ def test_payload_carries_the_breakdown():
     assert scores == sorted(scores, reverse=True), "candidates must be best-first"
 
 
+def test_the_payload_carries_the_whole_model():
+    """Every triangle and every feature edge, not a thinned sample of them.
+
+    This is the regression that matters most here, because its symptom was not
+    an error. The payload used to cap itself at 6000 edges and 9000 triangles
+    before it went out, so a 222,000-triangle bracket arrived in the 3D view as
+    a few thousand disconnected lines and no surface at all -- which looks like
+    a renderer that cannot draw CAD, not like a server that sent a twentieth of
+    the part. Nothing failed, nothing logged, and the number on screen was the
+    number that had been kept.
+    """
+    mesh = _load_plate()
+    payload = mesh.display_payload()
+    assert payload["n_faces_sent"] == mesh.n_faces, (
+        payload["n_faces_sent"], mesh.n_faces)
+    assert len(payload["faces"]) == mesh.n_faces, len(payload["faces"])
+    assert payload["n_edges_sent"] == payload["n_feature_edges"], payload
+    assert len(payload["normals"]) == mesh.n_vertices, len(payload["normals"])
+
+
+def test_the_payload_is_ordered_so_a_prefix_is_the_shape():
+    """Edges longest-first and triangles largest-first.
+
+    Everything downstream that cannot afford the whole model -- the wireframe
+    over a photograph, the filmstrip thumbnails -- now takes the first N rather
+    than sorting or striding. That is only correct while the server sorts, so
+    the sort is the contract and this is where it is held.
+    """
+    import numpy as np
+
+    mesh = _load_plate()
+    payload = mesh.display_payload()
+    v = np.asarray(payload["vertices"], dtype=float)
+
+    e = np.asarray(payload["edges"], dtype=int)
+    lengths = np.linalg.norm(v[e[:, 0]] - v[e[:, 1]], axis=1)
+    assert np.all(np.diff(lengths) <= 1e-12), "edges are not longest-first"
+
+    f = np.asarray(payload["faces"], dtype=int)
+    tri = v[f]
+    area = np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    assert np.all(np.diff(area) <= 1e-12), "faces are not largest-area-first"
+
+
+def test_the_transport_ceiling_still_bites_and_says_so():
+    """The caps are a transport ceiling, not a drawing budget -- but they are
+    still there, and when one bites the payload admits it rather than
+    reporting the model's own size."""
+    mesh = _load_plate()
+    payload = mesh.display_payload(max_faces=4, max_edges=3)
+    assert payload["n_faces_sent"] == 4, payload["n_faces_sent"]
+    assert payload["n_edges_sent"] == 3, payload["n_edges_sent"]
+    assert payload["n_faces"] == mesh.n_faces, "the true size was overwritten"
+    assert payload["n_feature_edges"] > 3, "the true edge count was overwritten"
+
+
+def test_vertex_normals_point_outwards():
+    """One unit normal per vertex, which is what lets the viewer shade a
+    curve as a curve instead of as a drum of flat strips."""
+    import numpy as np
+
+    mesh = _load_plate()
+    n = np.asarray(mesh.display_payload()["normals"], dtype=float)
+    assert n.shape == (mesh.n_vertices, 3), n.shape
+    assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-3)
+
+
 # --------------------------------------------------------------------------
 
 
@@ -243,6 +311,10 @@ def main() -> int:
         test_a_long_thin_outline_has_no_usable_centre,
         test_a_plain_box_is_unchanged,
         test_payload_carries_the_breakdown,
+        test_the_payload_carries_the_whole_model,
+        test_the_payload_is_ordered_so_a_prefix_is_the_shape,
+        test_the_transport_ceiling_still_bites_and_says_so,
+        test_vertex_normals_point_outwards,
     ]
     failures = 0
     for fn in tests:

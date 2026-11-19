@@ -303,6 +303,17 @@ class ReferencePlane:
     ``normal`` and ``offset`` rather than three points on the surface, because
     a datum on a drawing is a direction and a distance, and three points would
     invite a plane that is nearly but not exactly the one that was meant.
+
+    That is the right argument for a datum off a print, and the wrong one for
+    every surface in the cell that no drawing describes: a fence, a floor, the
+    face of a tooling plate. Those have no stated direction and no stated
+    distance -- they are simply there, in the photographs, and what is wanted
+    is the plane they lie in. So a plane may instead name four ``corners``,
+    which are ordinary tie points marked across the photographs like any
+    other, and the solve fits the surface to where they land. ``normal`` and
+    ``offset`` are then outputs rather than inputs: recomputed after every
+    bundle, stored so that everything downstream -- ``describe``, ``basis``,
+    the exporter -- keeps working without knowing which kind of plane it has.
     """
 
     id: str
@@ -317,7 +328,42 @@ class ReferencePlane:
     A plane is infinite and a CAD file cannot hold an infinite face, so one gets
     drawn at some size. ``None`` sizes it to the scene, which is right until
     somebody wants a datum that visibly overhangs the part.
+
+    Ignored for a drawn plane, which has four real corners and therefore a real
+    extent -- the one case where the size is measured rather than chosen.
     """
+
+    corners: list[str] = field(default_factory=list)
+    """Tie-point ids, in order around the quad, for a plane drawn on the photos.
+
+    Four of them, and empty for a typed plane. They are ordinary tie points:
+    marked in two or more photographs each, triangulated by the same solve as
+    everything else, and carrying their own residuals. Nothing about this plane
+    is a separate kind of evidence -- it is four points and the surface through
+    them.
+    """
+
+    quad: list[list[float]] | None = None
+    """The four corners projected onto the fitted plane, in nominal units.
+
+    Projected rather than raw, because four measured points are never exactly
+    coplanar and a CAD face must be. The gap between the two is what
+    :attr:`flatness` reports, so the face is exact and the error is stated
+    instead of being quietly absorbed into the geometry.
+    """
+
+    flatness: float | None = None
+    """How far the worst corner sat off the fitted plane, in nominal units.
+
+    The honest version of "these four points define a plane": they do not,
+    quite, and this says by how much. Nothing uses it but the panel, which is
+    the point -- it is for the person deciding whether to trust the surface.
+    """
+
+    @property
+    def is_drawn(self) -> bool:
+        """Was this fitted to marked corners rather than typed off a drawing?"""
+        return len(self.corners) >= 3
 
     def unit_normal(self) -> np.ndarray:
         n = np.array(self.normal, dtype=float)
@@ -1127,6 +1173,22 @@ class Project:
             if split_anchor_key(key)[0] in muted
         }
 
+    def plane_corner_points(self) -> set[str]:
+        """Tie-point ids that exist to be the corners of a drawn surface.
+
+        The solve keeps these out of the bundle and triangulates them against
+        the finished cameras instead, so a surface someone sketched along a
+        fence cannot move the cameras that measured the part. They are still
+        ordinary points in every other respect -- marked the same way, drawn
+        the same way, reported the same way -- and a point that is a corner of
+        two surfaces is named once here, like any other set member.
+        """
+        return {
+            cid
+            for plane in self.reference_planes
+            for cid in plane.corners
+        }
+
     def solving_anchor_points(self) -> dict[str, np.ndarray]:
         """:meth:`anchor_world_points`, less the bodies that are not voting.
 
@@ -1536,6 +1598,14 @@ class Project:
                 normal=[float(v) for v in raw.get("normal", [0.0, 0.0, 1.0])],
                 offset=float(raw.get("offset", 0.0)),
                 size=None if raw.get("size") is None else float(raw["size"]),
+                corners=[str(c) for c in (raw.get("corners") or [])],
+                quad=(
+                    None if raw.get("quad") is None
+                    else [[float(v) for v in c] for c in raw["quad"]]
+                ),
+                flatness=(
+                    None if raw.get("flatness") is None else float(raw["flatness"])
+                ),
             )
             for i, raw in enumerate(d.get("reference_planes", []))
         ]

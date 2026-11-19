@@ -129,11 +129,13 @@ def main(argv: list[str] | None = None) -> int:
     p_export.add_argument(
         "--step-shape",
         choices=exporters.STEP_SHAPES,
-        default="tessellated",
+        default="none",
         help=(
-            "how the STEP export carries CAD bodies: tessellated (AP242, every "
-            "triangle, compact), wireframe (feature edges, opens anywhere), brep "
-            "(faceted solid, small parts only), none (placements only)"
+            "how the STEP export carries CAD bodies: none (the default -- the "
+            "tree and the poses, no geometry, read by every seat), wireframe "
+            "(feature edges, AP214), brep (faceted solid, AP214, small parts "
+            "only), tessellated (AP242, every triangle, compact, but CATIA V5 "
+            "cannot read it)"
         ),
     )
     p_export.add_argument(

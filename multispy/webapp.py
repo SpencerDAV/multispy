@@ -249,6 +249,25 @@ def project_payload(project: Project) -> dict:
             "absolute": str(path),
             "name": path.name,
         }
+    # The same question for the CAD models, and it had been going unasked.
+    #
+    # A template keeps a path, not the geometry, so a project whose models are
+    # not beside it is a project whose bodies cannot be drawn and cannot be
+    # exported -- and until this was here, nothing said so. The photos had this
+    # flag from the start and a missing photo is obvious anyway; a missing
+    # model was invisible, and the way it showed up was a STEP file with every
+    # camera and every anchor cross in it and not one solid, which reads as an
+    # exporter that cannot carry meshes rather than as a file it could not
+    # find.
+    data["_models_meta"] = {}
+    for tid, template in project.templates.items():
+        path = project.resolve_mesh_path(template)
+        data["_models_meta"][tid] = {
+            "attached": path is not None,
+            "exists": path is not None and path.exists(),
+            "absolute": str(path) if path is not None else None,
+            "name": path.name if path is not None else None,
+        }
     return data
 
 
@@ -350,7 +369,7 @@ def write_exports(
     project: Project,
     out_dir: str | Path,
     formats=None,
-    step_shape: str = "tessellated",
+    step_shape: str = "none",
 ) -> dict[str, str]:
     """Every requested export, into ``out_dir``. Returns what was written."""
     out_dir = Path(out_dir)
@@ -402,7 +421,7 @@ def export_zip(project: Project, formats=None, work_dir: str | Path = "/tmp/ms_e
 
 def step_bytes(
     project: Project,
-    shape: str = "tessellated",
+    shape: str = "none",
     work_dir: str | Path = "/tmp/ms_step",
 ) -> bytes:
     """The STEP scene on its own, for a front end with nowhere to put a folder.
@@ -412,11 +431,11 @@ def step_bytes(
     is an extra step between the user and the thing they asked for, and a
     browser can download a ``.step`` as readily as a ``.zip``.
 
-    ``shape`` is exposed here, unlike in :func:`write_exports`, because the
-    browser build has no command line to fall back to. Somebody whose CAD seat
-    will not read AP242 tessellated geometry has to be able to ask for the
-    wireframe from the page itself, or the export is simply broken for them with
-    no way out.
+    ``shape`` is exposed here because the browser build has no command line to
+    fall back to. The default leaves the bodies out, which is the form every
+    CAD seat reads; somebody who needs the geometry to travel in the file has
+    to be able to pick a shape from the page itself, or there is no route to
+    any of them at all.
     """
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)

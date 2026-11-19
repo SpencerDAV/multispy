@@ -293,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
                 project,
                 out_dir,
                 body.get("formats"),
-                step_shape=body.get("step_shape") or "tessellated",
+                step_shape=body.get("step_shape") or "none",
             )
         self._send_json({"written": written, "out_dir": str(out_dir)})
 

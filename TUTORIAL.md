@@ -228,11 +228,16 @@ millimetres, with every camera, tie point and body a named node you can measure
 between. Each body hangs under the transform that located it, so a better CAD
 model of the same part drops into the `_body` node without disturbing the
 measurement. Add your drawing's datums under **Reference planes** first and
-they come through as real surfaces to dimension against. The **STEP** button beside Export writes just that file, which is
-quicker when it is all you want. If it opens with the cameras there and the
-bodies missing, that CAD system does not read AP242 tessellated geometry —
-**shift-click STEP** for the wireframe instead (or `--step-shape wireframe`
-from the command line).
+they come through as real surfaces to dimension against — and for the surfaces
+no drawing describes, a fence or a floor or the face of a tooling plate, press
+**draw on photos** there instead and click the four corners in order round it,
+then the same four in a second photo. The **STEP** button beside Export writes just that file, which is
+quicker when it is all you want. It leaves the bodies out, on purpose: each
+one still comes through as a named node at its solved pose, so your own CAD
+model of it drops in on the other side, and the file opens on any seat.
+**Shift-click STEP** to choose how the geometry travels along with them
+instead — feature edges, a faceted solid, or every triangle — which is the
+same choice as `--step-shape` from the command line.
 
 **You have now done the whole job.** Everything below is either a stronger way to
 do it, or how to recover when it goes wrong.
@@ -541,7 +546,7 @@ Two failure modes worth recognising before you shoot:
 .venv\Scripts\python.exe -m multispy                       open the UI
 .venv\Scripts\python.exe -m multispy solve   <project>     solve, print the report
 .venv\Scripts\python.exe -m multispy export  <project>     write the exports
-  --step-shape tessellated|wireframe|brep|none             how scene.step carries CAD bodies
+  --step-shape none|wireframe|brep|tessellated             how scene.step carries CAD bodies
   --step-units mm|cm|m|in|ft                               units scene.step is written in
 .venv\Scripts\python.exe -m multispy rig     <project>     print the object layout
 .venv\Scripts\python.exe -m multispy exif    <project>     what the photos claim

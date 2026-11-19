@@ -2,8 +2,11 @@
  *
  * MultiSpy runs two ways from one codebase. Locally, a Python process serves
  * the UI and answers over HTTP. On a static host there is no process, so the
- * page loads CPython itself -- numpy, scipy and Pillow included -- through
- * Pyodide and calls the very same `multispy` package in-process.
+ * tab loads CPython itself -- numpy, scipy and Pillow included -- through
+ * Pyodide and calls the very same `multispy` package, in a Web Worker beside
+ * the page. See worker.js for why beside and not inside: a solve on the main
+ * thread cannot paint while it runs, so the window freezes for its duration
+ * with nothing on screen to say that it is working rather than hung.
  *
  * This is not a reimplementation of the solver. It is the same Python, running
  * a few milliseconds away instead of a few milliseconds away over a socket, and
@@ -56,135 +59,115 @@ const Backend = (() => {
       + 'this build twice before, so it is not attempted.');
   }
 
-  let pyodide = null;
-  let dispatch = null;
-  let addFile = null;
-  let photoFn = null;
-  let exportFn = null;
+  const WORKER_URL = window.MULTISPY_WORKER_URL || 'worker.js';
+
+  let worker = null;
   let booted = false;
+  let nextId = 1;
+  const pending = new Map(); // id -> {resolve, reject}
   const urlCache = new Map(); // `${id}|${thumb}` -> object URL
 
   const isStatic = () => MODE === 'pyodide';
   const isReady = () => MODE === 'server' || booted;
 
+  /* ----------------------------------------------------------- busy state
+   *
+   * Which operations are in flight, so the page can say that it is working.
+   *
+   * This exists because the thing it reports used to be unreportable. While
+   * Python ran on the main thread nothing could be drawn during a call, so the
+   * only honest indicator -- "still going, 12s so far" -- was the one piece of
+   * information the architecture made impossible to show. Now that the work is
+   * in a worker, the count is maintained here, once, around every request,
+   * rather than remembered at each of the twenty-odd call sites.
+   */
+
+  let inflight = 0;
+  let busyLabel = null;
+  let busySince = 0;
+  const busyWatchers = [];
+
+  function announceBusy() {
+    const state = {
+      busy: inflight > 0,
+      label: inflight > 0 ? busyLabel : null,
+      since: inflight > 0 ? busySince : 0,
+    };
+    for (const fn of busyWatchers) {
+      try { fn(state); } catch (err) { /* a watcher must not break a request */ }
+    }
+  }
+
+  /** Be told when Python starts and stops working. */
+  function onBusy(fn) {
+    busyWatchers.push(fn);
+    fn({ busy: inflight > 0, label: busyLabel, since: busySince });
+  }
+
+  function enter(label) {
+    if (inflight === 0) { busyLabel = label; busySince = Date.now(); }
+    inflight += 1;
+    announceBusy();
+  }
+
+  function leave() {
+    inflight = Math.max(0, inflight - 1);
+    if (inflight === 0) { busyLabel = null; busySince = 0; }
+    announceBusy();
+  }
+
   /* --------------------------------------------------------------- boot */
+
+  /** Ask the worker to do one thing, and wait for its answer.
+   *
+   *  `label` is what the page says it is doing while this is outstanding. */
+  function send(kind, payload, transfer, label) {
+    if (!worker) return Promise.reject(new Error('MultiSpy is not started'));
+    const id = nextId++;
+    enter(label || kind);
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      worker.postMessage({ id, kind, ...payload }, transfer || []);
+    }).finally(leave);
+  }
 
   async function boot(onProgress) {
     if (booted) return;
     const step = (msg, frac) => onProgress && onProgress(msg, frac);
 
-    step('loading the Python runtime…', 0.05);
-    if (!window.loadPyodide) {
-      await new Promise((resolve, reject) => {
-        const tag = document.createElement('script');
-        tag.src = `${PYODIDE_URL}pyodide.js`;
-        tag.onload = resolve;
-        tag.onerror = () => reject(new Error('could not load Pyodide from the CDN'));
-        document.head.appendChild(tag);
-      });
-    }
-    pyodide = await window.loadPyodide({ indexURL: PYODIDE_URL });
-
-    step('loading numpy, scipy and pillow…', 0.35);
-    await pyodide.loadPackage(['numpy', 'scipy', 'pillow']);
-
-    step('loading MultiSpy…', 0.85);
-    pyodide.FS.mkdirTree('/app/multispy');
-    const sources = await Promise.all(
-      MODULES.map(async (name) => {
-        const res = await fetch(`${PY_BASE}multispy/${name}.py`);
-        if (!res.ok) throw new Error(`missing ${name}.py (HTTP ${res.status})`);
-        return [name, await res.text()];
-      })
-    );
-    for (const [name, src] of sources) {
-      pyodide.FS.writeFile(`/app/multispy/${name}.py`, src);
+    if (!worker) {
+      worker = new Worker(WORKER_URL);
+      worker.onmessage = (ev) => {
+        const { id, ok, result, error, kind, msg, frac } = ev.data || {};
+        if (kind === 'progress') { step(msg, frac); return; }
+        const slot = pending.get(id);
+        if (!slot) return;
+        pending.delete(id);
+        if (ok) slot.resolve(result);
+        else slot.reject(new Error(error));
+      };
+      /* A worker that dies takes every outstanding request with it, and a
+       * promise that never settles is a spinner that never stops. Settle them
+       * all with the reason, so the page can say what happened. */
+      worker.onerror = (ev) => {
+        const err = new Error(ev.message || 'the MultiSpy worker stopped');
+        for (const [, slot] of pending) slot.reject(err);
+        pending.clear();
+      };
     }
 
-    step('starting…', 0.95);
-    pyodide.runPython(BRIDGE);
-    dispatch = pyodide.globals.get('_ms_dispatch');
-    addFile = pyodide.globals.get('_ms_add_file');
-    photoFn = pyodide.globals.get('_ms_photo');
-    exportFn = pyodide.globals.get('_ms_export_zip');
+    await send('boot', {
+      pyodideUrl: PYODIDE_URL,
+      // the worker resolves its own fetches against its own URL, so hand it
+      // something absolute rather than a path that means two different things
+      // depending on which thread reads it
+      pyBase: new URL(PY_BASE, window.location.href).href,
+      modules: MODULES,
+    }, [], 'starting Python');
     booted = true;
     step('ready', 1);
   }
 
-  /* The Python side of the bridge. Everything crosses as a JSON string, which
-   * keeps the boundary identical in shape to the HTTP one -- the client cannot
-   * tell which it is talking to, and neither can the Python. */
-  const BRIDGE = `
-import json, sys, traceback
-sys.path.insert(0, "/app")
-
-from multispy import webapp
-
-_ws = webapp.blank_workspace("/workspace")
-
-def _reply(fn):
-    try:
-        return json.dumps(fn())
-    except (ValueError, KeyError, FileNotFoundError) as exc:
-        return json.dumps({"__error__": str(exc).strip("'")})
-    except Exception as exc:
-        traceback.print_exc()
-        return json.dumps({"__error__": f"{type(exc).__name__}: {exc}"})
-
-def _ms_dispatch(route, body_json):
-    body = json.loads(body_json) if body_json else {}
-    return _reply(lambda: _ws.handle(route, body))
-
-def _ms_add_file(kind, name, tmp_path):
-    data = open(tmp_path, "rb").read()
-    import os
-    os.unlink(tmp_path)
-    if kind == "photo":
-        return _reply(lambda: _ws.add_photo(name, data))
-    return _reply(lambda: _ws.add_model(name, data))
-
-def _ms_photo(image_id, thumb):
-    # bytes, not JSON: this one is a JPEG
-    return _ws.photo_bytes(image_id, thumb=bool(thumb))
-
-def _ms_export_zip(formats_json):
-    formats = json.loads(formats_json) if formats_json else None
-    return webapp.export_zip(_ws.project, formats, work_dir="/export")
-
-def _ms_export_step(shape):
-    # bytes, not JSON: one STEP file, and a zip holding one file is an extra
-    # step between the user and what they asked for
-    return webapp.step_bytes(_ws.project, shape or "tessellated", work_dir="/export")
-
-def _ms_reset(name):
-    global _ws
-    _ws = webapp.blank_workspace("/workspace", name or "untitled")
-    return "{}"
-
-def _ms_bundle():
-    # bytes, not JSON: the whole workspace zipped, photos included
-    return webapp.bundle_zip(_ws)
-
-def _ms_open_bundle(tmp_path, is_zip):
-    import os
-    data = open(tmp_path, "rb").read()
-    os.unlink(tmp_path)
-
-    def go():
-        if is_zip:
-            webapp.open_bundle(_ws, data)
-        else:
-            # a bare .multispy restores the marks; its photos are not in it, and
-            # the payload's per-image "exists" flags will say so
-            from multispy.project import Project
-            incoming = Project.from_dict(json.loads(data.decode("utf-8")))
-            incoming.path = _ws.project.path
-            _ws.project = incoming
-            _ws.last_report = None
-        return {"project": webapp.project_payload(_ws.project)}
-
-    return _reply(go)
-`;
 
   /* ------------------------------------------------------------- calling */
 
@@ -209,7 +192,35 @@ def _ms_open_bundle(tmp_path, is_zip):
     if (!booted) throw new Error('MultiSpy is still starting up');
     // a GET in the server build; named apart so one dispatcher can serve both
     const route = body === undefined ? `GET ${path}` : path;
-    return unwrap(dispatch(route, body === undefined ? '' : JSON.stringify(body)));
+    return unwrap(await send('dispatch', {
+      route,
+      body: body === undefined ? '' : JSON.stringify(body),
+    }, [], labelFor(path)));
+  }
+
+  /* What the page says it is doing, per route.
+   *
+   * Only the ones worth naming are named: a route that answers in a few
+   * milliseconds is better left unmentioned than flashed on screen, and the
+   * caller already sets its own status line. What this covers is the handful
+   * that take long enough for the user to wonder, which is exactly the set
+   * that used to freeze the tab. */
+  const LABELS = {
+    '/api/solve': 'solving',
+    '/api/check_cad': 'comparing the CAD against the photographs',
+    '/api/mute_bodies': 'muting bodies and re-solving',
+    '/api/origin_uncertainty': 'sampling the origin (many re-solves)',
+    '/api/edge_refine': 'aligning poses to the image edges',
+    '/api/place_part': 'placing the part',
+    '/api/set_part': 'fitting the part',
+    '/api/check_nominal_shape': 'checking the nominal shape',
+    '/api/viewpoints': 'working out where to shoot next',
+    '/api/mesh': 'reading the model',
+    '/api/rig': 'measuring the rig',
+  };
+
+  function labelFor(path) {
+    return LABELS[path] || 'working';
   }
 
   /* --------------------------------------------------------- photo bytes */
@@ -225,10 +236,12 @@ def _ms_open_bundle(tmp_path, is_zip):
     }
     const key = `${imageId}|${thumb}`;
     if (urlCache.has(key)) return urlCache.get(key);
-    const bytes = photoFn(imageId, thumb);
-    const blob = new Blob([bytes.toJs ? bytes.toJs() : bytes], { type: 'image/jpeg' });
-    if (bytes.destroy) bytes.destroy();
-    const url = URL.createObjectURL(blob);
+    const bytes = await send('photo', { imageId, thumb }, [], 'reading a photo');
+    // the cache may have been filled while this was in the worker: two
+    // filmstrip tiles asking for the same thumbnail used to be impossible,
+    // since nothing else could run during the call
+    if (urlCache.has(key)) return urlCache.get(key);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
     urlCache.set(key, url);
     return url;
   }
@@ -266,11 +279,15 @@ def _ms_open_bundle(tmp_path, is_zip):
     }
 
     if (!booted) throw new Error('MultiSpy is still starting up');
-    // hand the bytes over through the virtual filesystem rather than as a proxy
-    // object: unambiguous, and it keeps the Python side reading a plain file
-    const tmp = `/tmp/upload_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    pyodide.FS.writeFile(tmp, new Uint8Array(await file.arrayBuffer()));
-    return unwrap(addFile(kind, file.name, tmp));
+    // the worker writes these into its own filesystem; the buffer is handed
+    // over rather than copied, so a 40 MB model costs one allocation
+    const buf = await file.arrayBuffer();
+    return unwrap(await send(
+      'addFile',
+      { fileKind: kind, name: file.name, bytes: buf },
+      [buf],
+      kind === 'photo' ? 'reading the photo' : 'reading the model',
+    ));
   }
 
   /* ------------------------------------------------- projects and exports */
@@ -297,10 +314,10 @@ def _ms_open_bundle(tmp_path, is_zip):
   async function exportAll(formats, project) {
     if (!isStatic()) return call('/api/export', { formats, project });
     if (!booted) throw new Error('MultiSpy is still starting up');
-    const bytes = exportFn(formats ? JSON.stringify(formats) : '');
-    const blob = new Blob([bytes.toJs ? bytes.toJs() : bytes], { type: 'application/zip' });
-    if (bytes.destroy) bytes.destroy();
-    download('multispy-export.zip', blob);
+    const bytes = await send(
+      'exportZip', { formats: formats ? JSON.stringify(formats) : '' }, [], 'writing the export',
+    );
+    download('multispy-export.zip', new Blob([bytes], { type: 'application/zip' }));
     return { written: { zip: 'multispy-export.zip' }, out_dir: 'your downloads folder' };
   }
 
@@ -315,14 +332,10 @@ def _ms_open_bundle(tmp_path, is_zip):
       return { ...data, file: 'scene.step' };
     }
     if (!booted) throw new Error('MultiSpy is still starting up');
-    const fn = pyodide.globals.get('_ms_export_step');
-    const bytes = fn(shape || 'tessellated');
-    fn.destroy();
-    const blob = new Blob([bytes.toJs ? bytes.toJs() : bytes], {
-      type: 'application/octet-stream',
-    });
-    if (bytes.destroy) bytes.destroy();
-    download('scene.step', blob);
+    const bytes = await send(
+      'exportStep', { shape: shape || 'none' }, [], 'writing the STEP scene',
+    );
+    download('scene.step', new Blob([bytes], { type: 'application/octet-stream' }));
     return { written: { step: 'scene.step' }, out_dir: 'your downloads folder' };
   }
 
@@ -332,13 +345,9 @@ def _ms_open_bundle(tmp_path, is_zip):
    *  reopen into a project whose photos are all missing. */
   async function saveBundle(projectName) {
     if (!isStatic()) throw new Error('not available in server mode');
-    const fn = pyodide.globals.get('_ms_bundle');
-    const bytes = fn();
-    fn.destroy();
-    const blob = new Blob([bytes.toJs ? bytes.toJs() : bytes], { type: 'application/zip' });
-    if (bytes.destroy) bytes.destroy();
+    const bytes = await send('bundle', {}, [], 'packing the project');
     const safe = String(projectName || 'project').replace(/[^\w.-]+/g, '-');
-    download(`${safe}.multispy.zip`, blob);
+    download(`${safe}.multispy.zip`, new Blob([bytes], { type: 'application/zip' }));
   }
 
   /** Replace the open project from a file the user picked: a zip with its
@@ -346,20 +355,17 @@ def _ms_open_bundle(tmp_path, is_zip):
   async function openFile(file) {
     if (!isStatic()) throw new Error('not available in server mode');
     const isZip = /\.zip$/i.test(file.name);
-    const tmp = `/tmp/open_${Date.now()}`;
-    pyodide.FS.writeFile(tmp, new Uint8Array(await file.arrayBuffer()));
-    const fn = pyodide.globals.get('_ms_open_bundle');
-    const data = unwrap(fn(tmp, isZip));
-    fn.destroy();
+    const buf = await file.arrayBuffer();
+    const data = unwrap(await send(
+      'openBundle', { bytes: buf, isZip }, [buf], 'opening the project',
+    ));
     forgetAllPhotos();
     return data;
   }
 
   async function resetProject(name) {
     if (!isStatic()) throw new Error('not available in server mode');
-    const reset = pyodide.globals.get('_ms_reset');
-    reset(name || 'untitled');
-    reset.destroy();
+    await send('reset', { name: name || 'untitled' }, [], 'starting a new project');
     forgetAllPhotos();
   }
 
@@ -369,6 +375,7 @@ def _ms_open_bundle(tmp_path, is_zip):
     isReady,
     boot,
     call,
+    onBusy,
     photoSrc,
     forgetPhoto,
     forgetAllPhotos,

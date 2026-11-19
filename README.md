@@ -1008,20 +1008,59 @@ transforms rather than ten copies of the mesh.
 
 #### Reference planes
 
-Datum surfaces you type in, under **Reference planes** in the panel: a name, an
-axis and an offset, in the project's nominal units and in part space — the same
-numbers you type for a point nominal, so a plane at `Z = 995` lands where a
-nominal of 995 does. They save with the project and go into every export.
+Datum surfaces, under **Reference planes** in the panel. They come two ways.
 
-They are the one thing in the file that is not evidence. Nothing here enters
-the solve, and a plane has no residual to report, because it states where a
-datum *is* rather than claiming to have found one. It exists to be dimensioned
-against once the scene is open in CAD.
+**Typed**, off a drawing: a name, an axis and an offset, in the project's
+nominal units and in part space — the same numbers you type for a point
+nominal, so a plane at `Z = 995` lands where a nominal of 995 does.
+
+**Drawn**, on the photographs, for the surfaces no drawing describes — a fence,
+a floor, the face of a tooling plate. Press **draw on photos**, click the four
+corners of the surface in order round it, then the same four in a second photo.
+The corners are ordinary tie points: the solve triangulates them, fits the
+plane they lie in, and the surface comes out at any orientation at all —
+nothing about it is axis-aligned. The panel then reports how far the worst
+corner sat off its own surface, which is the plane's error bar; the exported
+face is exactly flat, so everything the four corners disagreed about is in that
+one number and nowhere else.
+
+Four corners in *one* photograph would be enough only if the quad were a
+parallelogram in space, and a fence gives you no such promise. Marking them
+twice costs four more clicks and assumes nothing.
+
+**Surfaces that meet share their corners.** While drawing, click a point that
+is already on the photograph and that corner *becomes* that point, rather than
+a second mark on the same feature a few pixels away — which is how two panels
+of a tooling plate come out meeting along one edge instead of along a seam as
+wide as two clicks disagree. The row says how many corners a surface shares and
+how far the two faces are actually apart along them. That gap is not zero: each
+surface still projects the shared corner onto its own plane to keep its own
+face flat, so two surfaces that are not quite coplanar put it in two places.
+Sharing removes the marking error, not the geometry.
+
+A drawn surface is refused rather than guessed at in two cases, both of which
+would otherwise look perfect. A corner that never triangulated leaves three,
+and three points are exactly coplanar by definition — so the surface would come
+out as a triangle reporting a flatness of zero. Corners strung out along a line
+are the same trap: every plane through that line fits them exactly. Neither can
+be caught by looking at the residual, because the residual is the thing they
+fake, so both are checked directly and named in the solve report.
+
+Both kinds save with the project and go into every export.
+
+Neither kind is evidence. Nothing here enters the solve: a typed plane states
+where a datum *is* rather than claiming to have found one, and a drawn plane's
+corners are deliberately kept out of the bundle and triangulated against the
+finished cameras afterwards — so a surface you sketched along a fence cannot
+move the cameras that measured the part. Without that, four roughly-clicked
+corners took a seven-photo project from 1.41 px to 82 px.
 
 Each one comes through as a genuine bounded planar surface — a `FACE_SURFACE`
 on a `PLANE` — so CAD can select it, offset from it, project onto it and
 measure to it. Not four lines in the shape of a rectangle, which can do none of
-those things. They are sized to the scene unless you give one a size.
+those things. A typed plane is sized to the scene unless you give one a size; a
+drawn one is bounded by its own four corners, because a fence is where its
+posts are and a tidy square centred on it would reach past both ends.
 
 Written in **millimetres** by default, because that is what a drawing is
 dimensioned in, while the scene is solved in metres; the file's unit context
@@ -1033,14 +1072,17 @@ everything:
 
 | `--step-shape` | Geometry | Schema | Read by |
 |---|---|---|---|
-| `tessellated` *(default)* | Every triangle, as one AP242 tessellated shell — two entities for a whole body, so a 84,000-triangle casting is a few megabytes | AP242 | OpenCASCADE 7.5+ (FreeCAD, most viewers), NX, CATIA, Creo |
+| `none` *(default)* | Placements only: the tree, the poses, the cameras and the points — every body still a named node at its pose, with nothing in it | AP214 | everything |
 | `wireframe` | The body's feature edges as polylines — the same edges MultiSpy draws over a photo | AP214 | everything, back to AP203 |
 | `brep` | A real faceted solid, one planar face per triangle — about nine entities per triangle, so it is capped at 40,000 | AP214 | everything, and properly solid |
-| `none` | Placements only: the tree, the poses, the cameras and the points | AP214 | everything |
+| `tessellated` | Every triangle, as one AP242 tessellated shell — two entities for a whole body, so a 84,000-triangle casting is a few megabytes | AP242 | OpenCASCADE 7.5+ (FreeCAD, most viewers), NX, Creo, 3DEXPERIENCE — **not CATIA V5** |
 
-If a CAD seat opens the default with the cameras present and the bodies
-missing, it does not do AP242 tessellated geometry — shift-click **STEP**, or
-re-export with `--step-shape wireframe`:
+The default carries no body geometry, which is the usual answer rather than
+a limitation: those bodies are the seat's own CAD models, already better than
+anything this file could restate, and each still arrives as a named node at
+its solved pose for the real part to drop into. When the geometry has to
+travel with the poses, shift-click **STEP** and pick a shape, or re-export
+with `--step-shape`:
 
 ```
 .venv\Scripts\python.exe -m multispy export projects\mypart\project.multispy --step-shape wireframe

@@ -52,6 +52,25 @@ turns a lens barrel into a solid blob. Keeping only edges where the surface
 actually creases gives the clean CAD-looking wireframe you can pick corners off.
 """
 
+MAX_PAYLOAD_FACES = 400_000
+"""Triangles past which :meth:`Mesh.display_payload` starts dropping some.
+
+A ceiling, not a budget. The whole mesh goes to the client -- the 3D view draws
+it on the GPU, where a quarter of a million triangles is nothing, and anything
+that needs fewer takes a prefix of the area-sorted list. What this number is
+protecting is the *transport*: the payload crosses as JSON, and under Pyodide
+that JSON is built, stringified and parsed inside the tab. 400k triangles is
+about 18 MB of it, which is already a visible pause; a ten-million-triangle
+scan would be a dead window.
+"""
+
+MAX_PAYLOAD_EDGES = 250_000
+"""Feature edges past which :meth:`Mesh.display_payload` starts dropping some.
+
+Same bargain as :data:`MAX_PAYLOAD_FACES`, and the same kind of number: a
+quarter of a million lines is one GL draw call and about 6 MB of JSON.
+"""
+
 
 @dataclass
 class AnchorCandidate:
@@ -429,57 +448,90 @@ class Mesh:
                 seen.add((int(u), int(v)) if u < v else (int(v), int(u)))
         return len(seen)
 
-    def display_payload(self, max_edges: int = 6000, max_corners: int = 400,
+    def display_payload(self, max_edges: int = MAX_PAYLOAD_EDGES,
+                        max_corners: int = 400,
                         angle_deg: float = FEATURE_ANGLE_DEG,
-                        max_faces: int = 9000) -> dict:
-        """Wireframe and pickable corners, trimmed to something a browser can
-        orbit at 60 fps.
+                        max_faces: int = MAX_PAYLOAD_FACES) -> dict:
+        """The whole model, plus its pickable corners, ordered so that any
+        smaller budget is a prefix.
 
-        A production CAD model runs to hundreds of thousands of triangles, which
-        is both unsendable and unreadable. Feature edges already cut that by one
-        or two orders of magnitude; what survives is thinned longest-first, since
-        the long edges are the ones that carry the shape.
+        This used to leave most of the part behind. Feature edges were cut to
+        6000 and triangles to 9000 before anything was sent, on the reasoning
+        that a browser cannot orbit more -- which was true of a software
+        renderer on a 2D canvas and is not true of the GPU. The cost of being
+        wrong about it was that a 222,000-triangle bracket reached the 3D view
+        as 6000 of its 329,000 edges and no surface at all: a handful of
+        disconnected lines where the part should be, which is exactly as useful
+        for judging a placement as nothing.
 
-        ``angle_deg`` belongs to the caller because the right value is a property
-        of the part, not of the format. The filter drops every facet-to-facet
-        transition gentler than it, so a fillet or a finely tessellated cylinder
-        vanishes completely while a coarse one survives -- which means a model
-        exported at finer tolerance draws FEWER lines, the opposite of what
-        anyone expects. A part whose shape lives in its curves needs a lower
-        angle, and the only way to settle on one is to look at the result.
+        So the full mesh goes out, and the thinning that remains is a transport
+        ceiling rather than a drawing budget -- see :data:`MAX_PAYLOAD_FACES`.
+
+        **Both lists are sorted by how much of the shape each item carries**:
+        edges longest-first, triangles largest-area-first. That is what makes
+        them safe to truncate anywhere. A consumer that genuinely has a small
+        budget -- the wireframe drawn over a photograph, which is still canvas
+        2D and still counts every line -- takes the first N and gets the N
+        edges that carry the silhouette, with no sorting of its own and no
+        risk of the stride subsampling that used to scatter a part into
+        unmatchable fragments.
+
+        ``angle_deg`` belongs to the caller because the right value is a
+        property of the part, not of the format. The filter drops every
+        facet-to-facet transition gentler than it, so a fillet or a finely
+        tessellated cylinder vanishes completely while a coarse one survives --
+        which means a model exported at finer tolerance draws FEWER lines, the
+        opposite of what anyone expects. A part whose shape lives in its curves
+        needs a lower angle, and the only way to settle on one is to look at
+        the result. With the surface now drawn as a surface, that choice is
+        about the wireframe alone and no longer decides whether the body is
+        visible at all.
         """
+        v = self.vertices
+
         edges = self.feature_edges(angle_deg)
-        if len(edges) > max_edges:
-            v = self.vertices
+        n_feature_edges = int(len(edges))
+        if n_feature_edges:
             lengths = np.linalg.norm(v[edges[:, 0]] - v[edges[:, 1]], axis=1)
             edges = edges[np.argsort(-lengths)[:max_edges]]
 
-        # Faces as well as edges, for the shaded overlay. A wireframe is
-        # genuinely ambiguous -- a box drawn in lines reads as either of two
-        # orientations and the eye picks whichever it saw last, which is how a
-        # body ends up placed half a turn out behind a respectable residual.
-        # Filled faces settle it, so the faces have to reach the browser.
-        #
-        # Thinned by area rather than by length, and for the same reason the
-        # edges are thinned longest-first: the big facets are the ones that
-        # carry the silhouette and the shading, and a few thousand of them read
-        # the same as a hundred thousand. A part whose surface is finely
-        # tessellated loses its small facets here and keeps its shape.
         faces = self.faces
-        if len(faces) > max_faces:
-            tri = self.vertices[faces]
+        if len(faces):
+            tri = v[faces]
             area = np.linalg.norm(
                 np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1
             )
             faces = faces[np.argsort(-area)[:max_faces]]
 
+        # Per-vertex normals, averaged over the faces meeting at each vertex
+        # and weighted by their (un-normalised) cross products, which weights
+        # by area for free. Computed here and not in the client for one
+        # reason: the client would have to walk every triangle to do it, in
+        # JavaScript, on the main thread, every time a model is loaded -- and
+        # numpy does it here in one scatter-add.
+        #
+        # Averaged, so a tessellated cylinder shades as a cylinder rather than
+        # as a drum of flat strips. It is wrong across a genuine crease, where
+        # the average smears two surfaces into one, so the renderer blends it
+        # with the flat face normal rather than trusting it outright.
+        normals = np.zeros_like(v)
+        if len(self.faces):
+            tri = v[self.faces]
+            fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+            for k in range(3):
+                np.add.at(normals, self.faces[:, k], fn)
+        lens = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / np.maximum(lens, 1e-18)
+
         picks = self.anchor_candidates(max_candidates=max_corners)
         lo, hi = self.bounds()
         return {
-            "vertices": self.vertices.round(6).tolist(),
+            "vertices": v.round(6).tolist(),
+            "normals": normals.round(4).tolist(),
             "edges": edges.tolist(),
             "faces": faces.tolist(),
             "n_faces_sent": int(len(faces)),
+            "n_edges_sent": int(len(edges)),
             "picks": [p.to_dict() for p in picks],
             "pick_counts": {
                 kind: sum(1 for p in picks if p.kind == kind)
@@ -490,7 +542,7 @@ class Mesh:
             "centroid": self.centroid().round(6).tolist(),
             "n_vertices": self.n_vertices,
             "n_faces": self.n_faces,
-            "n_feature_edges": int(len(edges)),
+            "n_feature_edges": n_feature_edges,
             "n_all_edges": self.all_edges(),
             "crease_angle": float(angle_deg),
             "source": self.source,

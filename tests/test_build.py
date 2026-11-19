@@ -169,6 +169,139 @@ def test_the_module_list_is_not_also_written_in_the_front_end() -> None:
         )
 
 
+def test_the_worker_is_shipped_and_versioned() -> None:
+    """The browser's Python runs in `worker.js`, which only the build can name.
+
+    It is the one script the page loads that is not a `<script src>` in
+    `index.html` -- `backend.js` constructs it -- so the index's content-hash
+    rewrite cannot reach it and nothing else refers to it by name. Two ways that
+    breaks without a word, both ending in a page that loads, draws its whole UI,
+    and then does nothing at all when Solve is pressed: the file is never copied
+    into the bundle, or it is copied unversioned and ten minutes of Pages cache
+    pairs last build's worker with this build's `backend.js`.
+    """
+    assert (ROOT / "web" / "worker.js").is_file(), "web/worker.js is missing"
+    assert "worker.js" in build_static.WEB_FILES, (
+        "worker.js is not in WEB_FILES, so the build will not copy it and the static "
+        "page will have no Python at all"
+    )
+    assert "MULTISPY_WORKER_URL" in build_static.CONFIG_JS, (
+        "config.js must tell the page where the worker is, with a content hash on it"
+    )
+    js = (ROOT / "web" / "backend.js").read_text(encoding="utf-8")
+    assert "MULTISPY_WORKER_URL" in js, (
+        "backend.js should take the worker's versioned URL from config.js"
+    )
+
+
+def test_the_3d_view_has_both_of_its_layers() -> None:
+    """The 3D view is a GL canvas under a 2D one, and both ends have to agree.
+
+    Three separate pieces, in three files, none of which fails loudly on its
+    own: `index.html` has to carry the second canvas, `app.js` has to hand it
+    to `Viewer3D.attach` as its third argument, and `viewer3d.js` has to accept
+    one. Drop any of them and the viewer keeps working -- it silently falls
+    back to the 2D wireframe, which is the exact state this change exists to
+    get out of, and which looks from the outside like a CAD model that renders
+    as a few primitive lines.
+
+    The stacking is checked too. The 2D canvas sits on top and had no z-index
+    before; giving it one put the toolbar underneath it, where it was visible
+    through the transparent layer and not clickable.
+    """
+    html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    viewer = (ROOT / "web" / "viewer3d.js").read_text(encoding="utf-8")
+
+    assert 'id="canvas3dgl"' in html, (
+        "index.html has no GL canvas, so the 3D view can only draw wireframes"
+    )
+    assert 'id="v3-solid"' in html, "the view bar has no control for the solid layer"
+    assert "$('canvas3dgl')" in app, (
+        "app.js never passes the GL canvas to Viewer3D.attach, so gpu.init gets "
+        "nothing and every body falls back to the 2D wireframe"
+    )
+    assert "function attach(canvas, hooks, glCanvas)" in viewer, (
+        "viewer3d.js does not take a GL canvas any more"
+    )
+    assert "z-index: 2" in html.split("#view3dbar {")[1].split("}")[0], (
+        "#view3dbar has no z-index above the two canvases; it will be drawn "
+        "under them and cannot be clicked"
+    )
+
+
+def test_the_viewer_can_live_without_a_gpu() -> None:
+    """No WebGL context must mean a wireframe, never a blank view.
+
+    A headless run, an old browser or a blocklisted driver all end in the same
+    place, and the view still has to show the scene. The guard is that the
+    shading path is reached through `gpu.ready()` rather than assumed.
+    """
+    viewer = (ROOT / "web" / "viewer3d.js").read_text(encoding="utf-8")
+    assert "state.solid && gpu.ready()" in viewer, (
+        "render() does not check for a GL context before taking the solid path"
+    )
+    assert "solidAvailable" in viewer and "solidWhy" in viewer, (
+        "viewer3d.js does not expose whether shading is possible, so the UI "
+        "cannot say why the control is dead"
+    )
+
+
+def test_the_payload_order_the_front_end_relies_on_is_stated() -> None:
+    """The overlays take a prefix, so the server has to promise a sort.
+
+    `app.js` stopped sorting edges for itself and now takes the first N of
+    whatever arrives, on the understanding that `display_payload` sorted them
+    longest-first. That understanding lives in two files and is enforced by
+    neither, and getting it wrong is silent: the overlay would draw an
+    arbitrary handful of edges and look merely sparse.
+    """
+    mesh = (ROOT / "multispy" / "mesh.py").read_text(encoding="utf-8")
+    app = (ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    assert "np.argsort(-lengths)" in mesh and "np.argsort(-area)" in mesh, (
+        "display_payload no longer sorts edges by length and faces by area, "
+        "which is what makes the front end's prefix correct"
+    )
+    assert "edgesByLength" not in app, (
+        "app.js still sorts edges for itself; the server's order is the one "
+        "that counts and two orders will disagree"
+    )
+
+
+def test_python_does_not_run_on_the_main_thread() -> None:
+    """The freeze this architecture exists to prevent, as an assertion.
+
+    Pyodide used to be loaded into the page, and every call into it was an
+    ordinary synchronous function call. The numbers were right and the window
+    was dead for the duration: nothing could repaint during a solve, so a nine
+    second solve showed nine seconds of a frozen UI with no indication it was
+    working rather than hung -- which on a page whose only persistence is a
+    download costs the user their marks when they close the tab.
+
+    Nothing about that is visible from a terminal, and the obvious way to
+    regress it is to reach for `pyodide` in `backend.js` again because one new
+    call is easier to write synchronously. So: the runtime belongs to the
+    worker, and the main thread may not speak to it directly.
+    """
+    js = (ROOT / "web" / "backend.js").read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in js.splitlines() if not line.lstrip().startswith(("*", "/*", "//"))
+    )
+    for token in ("loadPyodide", "pyodide.FS", "pyodide.globals", "pyodide.runPython"):
+        assert token not in code, (
+            f"backend.js uses {token!r}, which means Python is being driven from the main "
+            f"thread again. That is the freeze: a synchronous call cannot repaint, so the "
+            f"page cannot say it is working. Route it through worker.js instead."
+        )
+
+    worker = (ROOT / "web" / "worker.js").read_text(encoding="utf-8")
+    assert "_ms_dispatch" in worker, "worker.js should hold the Python bridge"
+    assert "_ms_dispatch" not in code, (
+        "the Python bridge is written in backend.js as well as worker.js. Stating it "
+        "twice is what broke the module list the first time; one copy, in the worker."
+    )
+
+
 def test_the_omissions_are_real_modules() -> None:
     """A stale name in NOT_SHIPPED would silence a genuine miss.
 

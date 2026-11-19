@@ -1143,6 +1143,186 @@ def fit_instances(
     return True, description
 
 
+def _triangulate_plane_corners(
+    project: Project, problem: "_Problem", x: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Where the drawn surfaces' corners landed, against the finished cameras.
+
+    The same easy direction of the problem :func:`place_muted_instances` uses:
+    the cameras are done and fixed, so each corner is triangulated from its own
+    marks alone and can influence nothing. A corner marked in one photograph
+    has a direction and no position, so it is skipped rather than guessed at.
+    """
+    corners = project.plane_corner_points()
+    if not corners:
+        return {}
+
+    poses, cams, _X, _objects = problem.unpack(x)
+    cameras: dict[str, SolvedCamera] = {}
+    for iid in problem.image_ids:
+        im = project.image(iid)
+        R, t = poses[iid]
+        cameras[iid] = SolvedCamera(
+            iid=iid, R=R, t=np.asarray(t, dtype=float),
+            cam=cams[problem.group_of_image[iid]],
+            width=im.width, height=im.height,
+        )
+
+    marks: dict[str, list[tuple[str, list[float]]]] = {}
+    for im in project.active_images():
+        if im.id not in cameras:
+            continue
+        for pid, uv in im.observations.items():
+            if pid in corners:
+                marks.setdefault(pid, []).append((im.id, list(uv)))
+
+    out: dict[str, np.ndarray] = {}
+    for pid, seen in marks.items():
+        if len(seen) < 2:
+            continue
+        X, worst, _angle = triangulate_views(
+            [cameras[iid] for iid, _uv in seen],
+            [np.asarray(uv, dtype=float) for _iid, uv in seen],
+        )
+        if not np.all(np.isfinite(X)) or not np.isfinite(worst):
+            continue
+        out[pid] = X
+        # the corner's own point carries the position too, so the 3D view and
+        # the exports see it without knowing where it came from
+        pt = next((p for p in project.points if p.id == pid), None)
+        if pt is not None:
+            pt.xyz = X
+    return out
+
+
+def fit_drawn_planes(
+    project: Project, report: SolveReport, corner_xyz: dict | None = None
+) -> int:
+    """Fit every plane that was drawn on the photographs to its solved corners.
+
+    A typed plane states a direction and a distance and is believed. A drawn
+    one names four tie points and has to be *measured*, which is this: take
+    where the solve put the corners, fit the least-squares plane through them,
+    and project the corners onto it so the face that reaches CAD is exactly
+    planar rather than nearly so.
+
+    The projection is where the honesty lives. Four marked corners are never
+    coplanar to the last micron, and a face built straight from them would be
+    either rejected by CAD or silently warped by it. Projecting makes the
+    surface exact and leaves a number -- how far the worst corner had to move
+    -- which is reported rather than discarded. A fence marked carelessly says
+    so in millimetres instead of arriving as a plausible-looking plane.
+
+    The normal's sign is chosen to point towards the cameras. There is no
+    intrinsic front to a surface fitted through four points, and a plane whose
+    normal faces away from the viewer is the kind of thing that is only
+    noticed once an offset in CAD has gone the wrong way.
+
+    Runs after the bundle, like :func:`place_muted_instances`, because it reads
+    the finished point positions and must not influence them: a drawn plane is
+    a conclusion about the scene, never a constraint on it.
+    """
+    drawn = [pl for pl in project.reference_planes if pl.is_drawn]
+    if not drawn:
+        return 0
+
+    xyz = dict(corner_xyz or {})
+    for pt in project.points:
+        if pt.xyz is not None:
+            xyz.setdefault(pt.id, pt.xyz)
+    scale = float(project.nominal_scale or 0.001)
+    eyes = [
+        -im.R.T @ im.t
+        for im in project.images
+        if im.enabled and im.R is not None and im.t is not None
+    ]
+    centre = np.mean(eyes, axis=0) if eyes else None
+
+    fitted = 0
+    for plane in drawn:
+        missing = [c for c in plane.corners if c not in xyz]
+        if missing or len(plane.corners) < 3:
+            plane.quad = None
+            plane.flatness = None
+            report.warnings.append(
+                f"plane {plane.label or plane.id!r} was not fitted: corner(s) "
+                f"{', '.join(missing) or '(too few)'} have no position. A corner needs "
+                f"marking in two photographs whose rays actually cross; a mark in one "
+                f"photo, or two marks that disagree, leaves it without one."
+            )
+            continue
+        pts = [xyz[c] for c in plane.corners]
+
+        # Every corner, not merely three of them. Fitting whatever happened to
+        # be solved is the worst of the available behaviours: three points are
+        # exactly coplanar by definition, so a surface missing a corner comes
+        # out as a triangle with a flatness of zero -- an answer that is wrong
+        # about its own shape and claims to be perfect while doing it. Seen
+        # for real on a four-corner panel whose third corner failed to
+        # triangulate.
+
+        P = np.asarray(pts, dtype=float)          # metres, world frame
+        origin = P.mean(axis=0)
+        # the smallest singular direction of the centred corners IS the normal:
+        # the direction in which they spread least is the one they do not span
+        _u, sv, vt = np.linalg.svd(P - origin)
+
+        # Corners strung out along a line do not define a plane: every plane
+        # containing that line fits them perfectly, so the normal is free to
+        # spin and `flatness` comes out at zero, which reads as a flawless
+        # surface. That is the worst possible failure here -- an answer that is
+        # arbitrary and looks exact -- so it is caught by how little the
+        # corners spread in their second direction, not by their residual,
+        # which is exactly the quantity this case fakes.
+        if len(sv) >= 2 and sv[1] < 0.02 * max(float(sv[0]), 1e-12):
+            plane.quad = None
+            plane.flatness = None
+            report.warnings.append(
+                f"plane {plane.label or plane.id!r} was not fitted: its corners lie "
+                f"almost along a line ({sv[1] / max(float(sv[0]), 1e-12):.1%} as wide as "
+                f"they are long), and every plane through that line fits them equally "
+                f"well. Mark corners that spread in two directions, or check that two of "
+                f"them are not the same feature."
+            )
+            continue
+
+        normal = vt[2]
+        normal = normal / max(float(np.linalg.norm(normal)), 1e-12)
+
+        if centre is not None and float(normal @ (centre - origin)) < 0:
+            normal = -normal
+
+        gaps = (P - origin) @ normal
+        flat = P - np.outer(gaps, normal)
+
+        plane.normal = [float(v) for v in normal]
+        plane.offset = float(origin @ normal) / scale
+        plane.quad = [[float(v) / scale for v in c] for c in flat]
+        # three corners cannot disagree about a plane, so their residual is
+        # zero as a matter of arithmetic and says nothing about the marking.
+        # None rather than 0.0: the panel prints what it is given, and a stated
+        # zero here would be a measurement nobody made.
+        plane.flatness = (
+            float(np.max(np.abs(gaps))) / scale if len(pts) > 3 else None
+        )
+        fitted += 1
+
+    worst = max(
+        (pl for pl in drawn if pl.flatness is not None),
+        key=lambda pl: pl.flatness,
+        default=None,
+    )
+    if worst is not None:
+        report.messages.append(
+            f"{fitted} drawn plane(s) fitted to their marked corners; the worst corner "
+            f"sat {worst.flatness:.3g} {project.nominal_units} off its own surface "
+            f"({worst.label or worst.id}). That gap is the plane's own error bar -- the "
+            f"exported face is exactly flat, so everything the corners disagreed about "
+            f"is in this number and nowhere else."
+        )
+    return fitted
+
+
 def place_muted_instances(
     project: Project, problem: "_Problem", x: np.ndarray, report: SolveReport
 ) -> int:
@@ -3351,7 +3531,17 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     # reason to delete its clicks.
     valid_anchors = set(project.solving_anchor_points())
     tables = _observation_tables(project, set(intrinsics), valid_anchors)
-    all_tracks = {p.id for p in project.points} | valid_anchors
+    # A drawn plane's corners are marked like tie points and are deliberately
+    # not treated as evidence: they are excluded here and triangulated against
+    # the finished cameras afterwards, exactly as a muted body's anchors are.
+    # The principle is the one ReferencePlane has always stated -- a surface is
+    # what the measurement is reported *against*, not an input to it -- and the
+    # practical half is sharper: four corners clicked roughly along a fence are
+    # a worse constraint than anything else in the project, and letting them
+    # into the bundle would let a decoration move the cameras. Measured on a
+    # 7-photo set, four careless corners took the solve from 1.41 px to 82 px.
+    plane_corners = project.plane_corner_points()
+    all_tracks = ({p.id for p in project.points} - plane_corners) | valid_anchors
 
     keep_images, keep_tracks = _prune_to_solvable(tables, all_tracks)
     dropped_images = sorted(set(intrinsics) - set(keep_images))
@@ -3431,6 +3621,10 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     report.stage = "placing the bodies that are not voting"
     n_placed_muted = place_muted_instances(project, problem, x_final, report)
     _report_muting(project, report, n_placed_muted)
+    # after the cameras and points are final, and reading only from them: a
+    # drawn plane is a conclusion about the scene, not a constraint on it
+    fit_drawn_planes(
+        project, report, _triangulate_plane_corners(project, problem, x_final))
 
     report.stage = "done"
     _fill_statistics(project, problem, x_final, report)

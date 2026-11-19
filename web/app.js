@@ -23,6 +23,8 @@ const state = {
   project: null,
   report: null,
   meta: {},
+  // per-template: whether the model file the template names is actually there
+  modelMeta: {},
   current: null,
   mode: 'lines',
   axis: 0,
@@ -62,6 +64,7 @@ const state = {
   partFit: null,       // the latest fit report, which outlives one solve
   partPlacement: null,
   refine: null,        // the latest edge-alignment outcomes, per image
+  planeDraw: null,     // {id, idx} while a surface's corners are being clicked
 };
 
 /* Anchors are keyed "<instance>/<anchor>" to match the project format, where
@@ -640,9 +643,11 @@ function setStatus(text, cls) {
  * could not be closed. So the app asks its own questions, in the page, where
  * nothing can switch them off.
  *
- * Both helpers return a promise. `askConfirm` resolves true or false;
+ * Each helper returns a promise. `askConfirm` resolves true or false;
  * `askText` resolves the string, or null if the user backed out -- the same
  * contract the native calls had, so the call sites only had to learn to wait.
+ * `askPick` resolves the chosen value, or null, and is the one answer to a
+ * question the page has no room to put in the toolbar.
  */
 
 function dialogHost() {
@@ -654,6 +659,7 @@ function dialogHost() {
   host.innerHTML =
     '<div class="box"><div class="msg"></div>'
     + '<input class="val" type="text" hidden>'
+    + '<select class="pick" hidden></select>'
     + '<div class="row"><button class="smallbtn cancel">Cancel</button>'
     + '<button class="action primary ok">OK</button></div></div>';
   document.body.appendChild(host);
@@ -662,15 +668,21 @@ function dialogHost() {
 
 /** Ask one question in the page. Blank lines split `text` into paragraphs:
  *  the first is the question, the rest are the consequences. Passing a string
- *  for `value` makes it a text entry instead of a yes/no. */
-function askDialog(text, { value = null, ok = 'OK', danger = false } = {}) {
+ *  for `value` makes it a text entry instead of a yes/no; passing `choices`,
+ *  a list of `[value, label]` pairs, makes it a pick from those instead, with
+ *  `value` the one selected to begin with. */
+function askDialog(
+  text, { value = null, choices = null, ok = 'OK', danger = false } = {},
+) {
   const host = dialogHost();
   const box = host.querySelector('.box');
   const msg = host.querySelector('.msg');
   const input = host.querySelector('.val');
+  const pick = host.querySelector('.pick');
   const okBtn = host.querySelector('.ok');
   const cancelBtn = host.querySelector('.cancel');
-  const asking = value !== null;
+  const picking = Array.isArray(choices) && choices.length > 0;
+  const asking = !picking && value !== null;
 
   msg.innerHTML = '';
   for (const para of String(text).split(/\n{2,}/)) {
@@ -682,8 +694,19 @@ function askDialog(text, { value = null, ok = 'OK', danger = false } = {}) {
   okBtn.classList.toggle('danger', !!danger);
   input.hidden = !asking;
   input.value = asking ? String(value) : '';
+  pick.hidden = !picking;
+  if (picking) {
+    pick.innerHTML = choices
+      .map(([v, label]) => (
+        `<option value="${escapeHtml(v)}">${escapeHtml(label)}</option>`
+      ))
+      .join('');
+    pick.value = value == null ? String(choices[0][0]) : String(value);
+  }
   host.hidden = false;
-  if (asking) { input.focus(); input.select(); } else { okBtn.focus(); }
+  if (asking) { input.focus(); input.select(); }
+  else if (picking) { pick.focus(); }
+  else { okBtn.focus(); }
 
   return new Promise((resolve) => {
     const done = (answer) => {
@@ -691,8 +714,8 @@ function askDialog(text, { value = null, ok = 'OK', danger = false } = {}) {
       document.removeEventListener('keydown', onKey, true);
       resolve(answer);
     };
-    const accept = () => done(asking ? input.value : true);
-    const cancel = () => done(asking ? null : false);
+    const accept = () => done(picking ? pick.value : asking ? input.value : true);
+    const cancel = () => done(picking || asking ? null : false);
     function onKey(ev) {
       // capture, so the canvas shortcuts -- Enter solves, Escape leaves the
       // 3D view -- never fire underneath an open question
@@ -713,6 +736,13 @@ const askConfirm = (text, opts) => askDialog(text, { ...(opts || {}), value: nul
 /** Ask for a line of text. Resolves null if the user backs out. */
 const askText = (text, value = '') =>
   askDialog(text, { value: value == null ? '' : String(value) });
+
+/** Pick one of a few named options. `choices` is `[value, label]` pairs, and
+ *  the label is where the trade-off between them goes -- a picker whose
+ *  options are bare words makes the reader guess what they cost. Resolves the
+ *  chosen value, or null if the user backs out. */
+const askPick = (text, choices, value = null, ok = 'OK') =>
+  askDialog(text, { choices, value, ok });
 
 /** Is a question on screen? The canvas shortcuts stand down while one is. */
 function dialogOpen() {
@@ -867,6 +897,7 @@ function projectPayload() {
   const copy = JSON.parse(JSON.stringify(state.project));
   delete copy._path;
   delete copy._images_meta;
+  delete copy._models_meta;
   delete copy._origin_stale;
   return copy;
 }
@@ -876,6 +907,7 @@ function adopt(data) {
   state.cadCheck = null;   // and the bodies-vs-photographs verdict with it
   state.project = data.project;
   state.meta = data.project._images_meta || {};
+  state.modelMeta = data.project._models_meta || {};
   if (data.report !== undefined) state.report = data.report;
   if (!state.current && state.project.images.length) state.current = state.project.images[0].id;
 
@@ -941,6 +973,23 @@ const meshFor = (tid) => {
   const m = state.meshes.get(tid);
   return m && !m.error ? m : null;
 };
+
+/** Templates whose model file the server cannot find, by name.
+ *
+ *  This is a different question from `meshFor` returning nothing. A mesh that
+ *  has not loaded yet is a mesh that will; a model file that is not there
+ *  never will, and it is the reason a STEP export comes out with every camera
+ *  and every anchor cross in it and no solid bodies at all. Worth saying
+ *  before the export rather than after. */
+function missingModels() {
+  const meta = state.modelMeta || {};
+  return Object.keys(state.project.templates || {})
+    .filter((tid) => meta[tid] && !meta[tid].exists)
+    .map((tid) => {
+      const t = state.project.templates[tid];
+      return (t && (t.name || t.id)) || tid;
+    });
+}
 
 /** Upload one CAD model; the server creates a template for it. */
 async function uploadModel(file) {
@@ -1049,12 +1098,23 @@ async function openProjectFile(file) {
     syncViewer();
     render();
 
+    /* Both halves of "what came with this project", because a bare
+     * `.multispy` has neither its photos nor its models and only the photos
+     * ever said so. A project whose models are absent still solves, still
+     * draws its anchors and still exports -- it just exports a scene with no
+     * bodies in it, which is the one failure that looks like a broken
+     * exporter rather than a missing file. */
     const missing = Object.values(state.meta).filter((m) => !m.exists).length;
+    const noModel = missingModels();
+    const parts = [];
+    if (missing) parts.push(`${missing} photo(s)`);
+    if (noModel.length) parts.push(`${noModel.length} CAD model(s)`);
     setStatus(
-      missing
-        ? `opened — ${missing} photo(s) are not in this file; drop them back in to see them`
+      parts.length
+        ? `opened — ${parts.join(' and ')} are not in this file; drop them back in`
+          + ` to draw and export the bodies`
         : `opened ${state.project.name}`,
-      missing ? 'warn' : 'ok'
+      parts.length ? 'warn' : 'ok'
     );
   } catch (err) {
     setStatus(`could not open: ${err.message}`, 'bad');
@@ -1138,23 +1198,75 @@ async function exportNow() {
   }
 }
 
+/** How a CAD body can travel in scene.step, as the shift-click offers them.
+ *
+ *  The same four as `--step-shape`, in the same order, each labelled with the
+ *  thing that actually decides between them: which seats will read the
+ *  result. A picker whose options are the bare words `wireframe` and
+ *  `tessellated` asks the reader to already know the answer.
+ */
+const STEP_SHAPE_CHOICES = [
+  ['none', 'No geometry — the tree and the poses only (every seat)'],
+  ['wireframe', 'Feature edges, as polylines (every seat)'],
+  ['brep', 'Faceted solid, one face per triangle — small parts (every seat)'],
+  ['tessellated', 'Every triangle, compact — AP242, so not CATIA V5'],
+];
+
 /** The STEP scene on its own, which is the one export a CAD seat wants.
  *
- *  Shift picks the wireframe. The default carries every triangle as AP242
- *  tessellated geometry, which is compact and right for anything built on
- *  OpenCASCADE, NX, CATIA or Creo -- and silently unreadable to a CAD system
- *  that does not do AP242, where the file opens with the cameras present and
- *  the bodies missing. That is the one case this needs an escape hatch for,
- *  and in the browser build there is no command line to be the escape hatch.
+ *  The plain click writes the tree, the poses, the cameras and the points and
+ *  no body geometry at all, which is both the form every CAD seat reads and
+ *  usually the one wanted: the bodies are that seat's own CAD models, so each
+ *  arrives as a named node at its solved pose for the real part to drop into.
+ *
+ *  Shift asks which shape instead. The browser build has no command line, and
+ *  the answer depends on the seat the file is going to -- including the
+ *  compact AP242 form, which is right for anything built on OpenCASCADE and
+ *  unreadable to CATIA V5, which does not say so. One more modifier per shape
+ *  would hide that behind folklore; a question states it.
  */
-async function exportStepNow(wireframe) {
+async function exportStepNow(choose) {
   try {
-    const shape = wireframe ? 'wireframe' : 'tessellated';
-    setStatus(wireframe ? 'writing scene.step (wireframe)…' : 'writing scene.step…');
+    let shape = 'none';
+    if (choose) {
+      shape = await askPick(
+        'How should the CAD bodies travel in scene.step?\n\n'
+        + 'Either way every body is a named node at its solved pose, so your '
+        + 'own CAD model of it drops in on the other side. This is only about '
+        + 'whether its geometry goes into the file as well.',
+        STEP_SHAPE_CHOICES,
+        'wireframe',
+        'Write',
+      );
+      if (shape === null) return;
+    }
+    setStatus(
+      shape === 'none'
+        ? 'writing scene.step…'
+        : `writing scene.step (${shape})…`,
+    );
     await api('/api/state', { project: projectPayload() });
     clearDirty();
     const data = await Backend.exportStep(shape, projectPayload());
-    setStatus(`scene.step written to ${data.out_dir}`, 'ok');
+    /* Said after the write and not instead of it: the file is still worth
+     * having -- it has the cameras, the tie points and the nominals in it --
+     * and the export is not the place to refuse. But it is the place to say
+     * which bodies are not in it, because the file itself looks complete and
+     * the reason is not visible from inside a CAD seat. The STEP's own
+     * FILE_DESCRIPTION carries the same list for whoever opens it later.
+     * Only when the bodies were asked for: an export with no geometry in it
+     * has none of them by design, so naming the models whose files are
+     * missing would be answering a question nobody asked. */
+    const gone = shape === 'none' ? [] : missingModels();
+    setStatus(
+      gone.length
+        ? `scene.step written to ${data.out_dir} — but with no body for `
+          + `${gone.slice(0, 3).join(', ')}${gone.length > 3 ? ` and ${gone.length - 3} more` : ''}`
+          + `: their model files are not in this project. Drop the models back in`
+          + ` and export again.`
+        : `scene.step written to ${data.out_dir}`,
+      gone.length ? 'warn' : 'ok'
+    );
   } catch (err) {
     // the browser build runs Python in the page, so a refusal arrives as a
     // whole traceback; the status bar is one line, and the useful line is the
@@ -1764,10 +1876,9 @@ function drawFilmstripOverlays() {
       const mesh = template && meshFor(inst.template);
       if (!mesh || !mesh.edges || !mesh.edges.length) continue;
       // a thumbnail cannot show more than an outline, so spend the edges on
-      // being drawn at all rather than on being complete
-      const budget = 240;
-      const order = edgesByLength(mesh);
-      const shown = Math.min(order.length, budget);
+      // being drawn at all rather than on being complete. Longest-first from
+      // the server, so the shortest list still has the shape in it.
+      const shown = Math.min(mesh.edges.length, 240);
       // project only the vertices those edges actually use. This runs for
       // every photo on every frame of a drag, and a real machined part brings
       // tens of thousands of vertices -- projecting all of them seven times a
@@ -1784,7 +1895,7 @@ function drawFilmstripOverlays() {
       };
       c.beginPath();
       for (let k = 0; k < shown; k++) {
-        const e = mesh.edges[order[k]];
+        const e = mesh.edges[k];
         const a = at(e[0]), b = at(e[1]);
         if (!a || !b) continue;              // the edge passes behind the camera
         c.moveTo(a.x * s, a.y * s);
@@ -1959,7 +2070,47 @@ function drawExpected(im, z) {
   }
 }
 
+/** The outline of every drawn surface whose corners are marked in this photo.
+ *
+ *  Drawn under the marks rather than over them, and only from corners this
+ *  photograph actually has: a quad completed from three marks and a guess
+ *  would be a drawing of something nobody clicked. A partial surface shows as
+ *  an open run of edges, which is also what it is. */
+function drawPlaneQuads(im, z) {
+  for (const pl of state.project.reference_planes || []) {
+    const corners = pl.corners || [];
+    if (corners.length < 3) continue;
+    const uv = corners.map((c) => im.observations[c] || null);
+    const drawing = state.planeDraw && state.planeDraw.id === pl.id;
+    ctx.strokeStyle = drawing ? '#ffd24a' : '#d2aa50';
+    ctx.lineWidth = (drawing ? 2.0 : 1.4) / z;
+    ctx.setLineDash(uv.every(Boolean) ? [] : [5 / z, 4 / z]);
+    ctx.beginPath();
+    let open = true;
+    for (let i = 0; i < uv.length; i++) {
+      const a = uv[i];
+      const b = uv[(i + 1) % uv.length];
+      if (!a || !b) { open = true; continue; }
+      if (open) { ctx.moveTo(a[0], a[1]); open = false; }
+      ctx.lineTo(b[0], b[1]);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (uv.every(Boolean) && pl.label) {
+      const mx = uv.reduce((s, c) => s + c[0], 0) / uv.length;
+      const my = uv.reduce((s, c) => s + c[1], 0) / uv.length;
+      ctx.fillStyle = drawing ? '#ffd24a' : '#d2aa50';
+      ctx.font = `${12 / z}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.fillText(pl.label, mx, my);
+      ctx.textAlign = 'left';
+    }
+  }
+}
+
 function drawObservations(im, z) {
+  drawPlaneQuads(im, z);
   const pointErr = {};
   if (state.report && state.report.residual_lines) {
     for (const rl of state.report.residual_lines) {
@@ -1999,36 +2150,28 @@ function drawObservations(im, z) {
   }
 }
 
-/** Edge indices for one mesh, longest first.
+/** How many of a mesh's edges, or faces, this canvas can afford to draw.
  *
- *  There is never room to draw every edge of a real part, so the question is
- *  which ones to drop. Taking every Nth -- what this used to do -- is the one
- *  answer that is certainly wrong: it keeps edges by their position in an
- *  array, which has nothing to do with the model, so a part arrives as a
- *  scatter of disconnected segments with half of its outline missing. That is
- *  unmatchable against a photograph, which is the entire job of this overlay.
+ *  There is never room to draw every edge of a real part *on a photograph*:
+ *  this overlay is canvas 2D, it costs one path segment per edge and one
+ *  fill() per triangle, and a part now arrives with a hundred thousand edges
+ *  and a quarter of a million triangles because the 3D view draws all of them
+ *  on the GPU.
  *
- *  Length is the proxy that works, and ``display_payload`` already thins the
- *  same way on its way out of the server; this is that rule applied again at
- *  the smaller budget a canvas has. Measured in model space, not on screen:
- *  screen length would be marginally better per frame and would have to be
- *  re-sorted on every one of them, and a drag cannot afford that on a part with
- *  tens of thousands of edges. So it is computed once and kept on the mesh. */
-function edgesByLength(mesh) {
-  if (mesh._byLength) return mesh._byLength;
-  const v = mesh.vertices, e = mesh.edges;
-  const len2 = new Float64Array(e.length);
-  for (let i = 0; i < e.length; i++) {
-    const a = v[e[i][0]], b = v[e[i][1]];
-    if (!a || !b) continue;
-    const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
-    len2[i] = dx * dx + dy * dy + dz * dz;   // squared: same order, no sqrt
-  }
-  const order = new Array(e.length);
-  for (let i = 0; i < e.length; i++) order[i] = i;
-  order.sort((p, q) => len2[q] - len2[p]);
-  mesh._byLength = order;
-  return order;
+ *  Which ones to drop is already settled, upstream: ``display_payload`` sorts
+ *  edges longest-first and triangles largest-area-first precisely so that any
+ *  budget here is a prefix. So this is a `Math.min` and nothing more -- no
+ *  sort, no stride, and the N kept are the N that carry the silhouette.
+ *
+ *  Both of the alternatives were tried and are worse. Taking every Nth keeps
+ *  edges by their position in an array, which has nothing to do with the
+ *  model, so a part came out as a scatter of disconnected segments with half
+ *  its outline missing -- unmatchable against a photograph, which is this
+ *  overlay's whole job. Sorting by screen length would be marginally better
+ *  per frame and would have to be redone on every one of them, which a drag
+ *  cannot afford. */
+function overlayBudget(count, placedCount, cap) {
+  return Math.min(count, Math.max(400, Math.floor(cap / Math.max(placedCount, 1))));
 }
 
 /* Each placed object's model, projected through this camera.
@@ -2080,7 +2223,9 @@ function drawObjectShaded(im, z) {
       R[2][0] * X[0] + R[2][1] * X[1] + R[2][2] * X[2] + im.t[2]);
 
     const faces = [];
-    for (let i = 0; i < mesh.faces.length; i++) {
+    // largest-area-first from the server, so a prefix is the silhouette
+    const shown = overlayBudget(mesh.faces.length, placed.length, 24000);
+    for (let i = 0; i < shown; i++) {
       const f = mesh.faces[i];
       const a = screen[f[0]], b = screen[f[1]], c = screen[f[2]];
       if (!a || !b || !c) continue;                       // crosses behind the camera
@@ -2129,8 +2274,6 @@ function drawObjectModels(im, z) {
   if (!im.R || !im.t) return;
   const placed = instanceList().filter(isPlaced);
   if (!placed.length) return;
-  const budget = Math.max(400, Math.floor(4000 / placed.length));
-
   for (const inst of placed) {
     const template = templateOf(inst);
     const mesh = template && meshFor(inst.template);
@@ -2138,12 +2281,11 @@ function drawObjectModels(im, z) {
 
     const world = mesh.vertices.map((v) => objectToWorld(inst, template, v));
     const screen = world.map((X) => projectWorld(im, X));
-    const order = edgesByLength(mesh);
-    const shown = Math.min(order.length, budget);
+    const shown = overlayBudget(mesh.edges.length, placed.length, 6000);
 
     ctx.beginPath();
     for (let k = 0; k < shown; k++) {
-      const e = mesh.edges[order[k]];
+      const e = mesh.edges[k];
       const a = screen[e[0]];
       const b = screen[e[1]];
       if (!a || !b) continue; // the edge crosses behind the camera
@@ -2953,6 +3095,16 @@ canvas.addEventListener('mousedown', (ev) => {
 
   const hit = hitTest(p);
   if (hit && hit.kind === 'obs') {
+    // While a surface's corners are being clicked, landing on a point that is
+    // already there means "this corner is that point" -- the gesture for two
+    // surfaces meeting along an edge. Checked before the drag below, because
+    // the drag is what a press on a marker means everywhere else and would
+    // otherwise swallow it.
+    if (state.planeDraw && adoptCornerPoint(hit.point)) {
+      renderPanels();
+      render();
+      return;
+    }
     state.activePoint = hit.point;
     state.drag = { kind: 'moveobs', point: hit.point };
     renderPanels();
@@ -2996,6 +3148,14 @@ canvas.addEventListener('mousedown', (ev) => {
     im.observations[state.activePoint] = [p.x, p.y];
     markDirty();
     const pid = state.activePoint;
+    if (state.planeDraw) {
+      // round the quad in this photo first; the plane's own advance decides
+      // when to move on, and it is not "next photo missing this one point"
+      advancePlaneCorner();
+      renderPanels();
+      render();
+      return;
+    }
     renderPanels();
     render();
     if (state.autoAdvance) advanceToMissing(pid);
@@ -3273,6 +3433,9 @@ window.addEventListener('keydown', (ev) => {
       return;
     }
     if (k === 'r') { Viewer3D.levelRoll(); return; }
+    // the same letter the photo overlay's Shaded box answers to, for the same
+    // thing, so there is one key for "fill the bodies in" wherever you are
+    if (k === 'h') { $('v3-solid').click(); return; }
     if (k === 'q' || k === 'e') {
       Viewer3D.rollBy(((ev.shiftKey ? 15 : 5) * (k === 'e' ? 1 : -1) * Math.PI) / 180);
       return;
@@ -3609,13 +3772,18 @@ function updateHint() {
     select: `Drag markers or whole control lines; click a line to reverse it. `
           + `Right-click or Delete removes one, <b>U</b> flags it uncertain.`,
   };
-  $('hint').innerHTML = hints[state.mode]
-    + ` &nbsp;·&nbsp; wheel zoom, space-drag pan, <b>F</b> fit`
+  /* The mode's instruction is wrapped on its own so it can fold down to its
+   * first sentence, the way a panel message does. The tail after it stays:
+   * those are the always-true shortcuts, they are three words each, and they
+   * are the half of this bar worth having in peripheral vision. */
+  const tail = ` &nbsp;·&nbsp; wheel zoom, space-drag pan, <b>F</b> fit`
     // which frame a turn uses survives every other gesture, so it is shown
     // wherever pose mode is, not only while an axis happens to be held
     + (state.mode === 'pose' || state.mode === 'objects'
         ? ` &nbsp;·&nbsp; turning in <b>${spaceLabel()}</b> space (tap <b>S</b>)` : '')
     + (state.showResid ? ` &nbsp;·&nbsp; residuals ×${RESIDUAL_GAIN}` : '');
+  $('hint').innerHTML = `<span class="hintmain">${hints[state.mode]}</span>${tail}`;
+  clampMessage($('hint').querySelector('.hintmain'));
 }
 
 /* ----------------------------------------------------------------- filmstrip */
@@ -3707,6 +3875,7 @@ function renderPanels() {
   renderConstraintsPanel();
   renderImageListPanel();
   updateHint();
+  clampMessages();
   scheduleObservability();
 }
 
@@ -4225,6 +4394,194 @@ function setFolded(key, folded) {
 
 function toggleFold(key) {
   setFolded(key, !isFolded(key));
+}
+
+/* ------------------------------------------------- folding the explanations
+ *
+ * Nearly every message in these panels is one measurement followed by what it
+ * means: "15 mark(s) disagreed with everything else badly enough to be left
+ * out of the final solve. They are still drawn in the residual view so you can
+ * see them, and re-clicking one is usually better than..." The first sentence
+ * is the finding and has to be on screen. The rest is why it matters, which is
+ * worth reading once and then gets in the way of the numbers it explains --
+ * twelve panels came to about nine thousand characters, of which seven
+ * thousand were that tail.
+ *
+ * So it is split at render time rather than rewritten. Two reasons for doing
+ * it here instead of at the fifty-odd places that build these strings: the
+ * strings stay readable as prose in the source, where they are maintained, and
+ * a message added later folds without anyone having to remember to make it.
+ *
+ * What is never folded: anything with a control in it. A message carrying a
+ * button is not a note, it is UI, and hiding half of it would hide the thing
+ * the user is meant to press.
+ */
+
+/* Do not fold a message that is barely longer than its own first sentence:
+ * a toggle that reveals eight more words costs more attention than it saves.
+ * The head bound is low because several findings are a short clause and then
+ * a long justification -- "0 anchor(s) reach 2+ photos" is the whole finding,
+ * at 27 characters. */
+const MIN_HEAD = 24;
+const MIN_TAIL = 40;
+
+/** Where the finding ends and the explanation starts, or -1 if it does not.
+ *
+ *  A full stop only counts when what follows looks like a new sentence, which
+ *  keeps "+-0.4%." and "e.g. the" from being read as breaks. Failing that, an
+ *  em dash is taken as the seam, because a good few of these are written as
+ *  finding-then-advice across one: "origin sits 568 mm off the geometry -- use
+ *  fit selection in the 3D view". */
+function explanationStart(text) {
+  const re = /[.!?](?=\s+[A-Z(])/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const at = m.index + 1;            // the stop belongs to the sentence it ends
+    if (at >= MIN_HEAD && text.length - at >= MIN_TAIL) return at;
+  }
+  /* No sentence break. A fair number are written as one sentence that turns
+   * from finding to advice at a dash or a semicolon -- "0 of 8 marked
+   * anchor(s) reached 2+ photos; a placement needs 3..." -- so those count
+   * too, whichever comes first. A colon deliberately does not: these messages
+   * open with one ("camera group cam0:", "EXIF:") and the useful half is
+   * always after it. */
+  let best = -1;
+  for (const seam of [' — ', '; ']) {
+    const at = text.indexOf(seam);
+    if (at < MIN_HEAD || text.length - at < MIN_TAIL) continue;
+    if (best < 0 || at < best) best = at;
+  }
+  return best;
+}
+
+/** Fold one message's tail away behind a toggle.
+ *
+ *  Done over the live DOM with a Range rather than on the HTML string, because
+ *  a dozen of these carry markup -- a bolded number, a coloured count -- and
+ *  cutting an HTML string at a character offset would cut through a tag. */
+function clampMessage(el) {
+  if (el.dataset.clamped) return;
+  el.dataset.clamped = '1';
+  if (el.querySelector('button, input, select, a, textarea')) return;
+
+  const at = explanationStart(el.textContent || '');
+  if (at < 0) return;
+
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let seen = 0;
+  let node = null;
+  let offset = 0;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const len = n.nodeValue.length;
+    if (seen + len >= at) { node = n; offset = at - seen; break; }
+    seen += len;
+  }
+  if (!node) return;
+
+  const range = document.createRange();
+  range.setStart(node, offset);
+  range.setEnd(el, el.childNodes.length);
+  const rest = document.createElement('span');
+  rest.className = 'rest';
+  rest.appendChild(range.extractContents());
+
+  const tog = document.createElement('button');
+  tog.type = 'button';
+  tog.className = 'moretog';
+  tog.textContent = '›';
+  tog.title = 'why this matters';
+  tog.onclick = (ev) => {
+    ev.stopPropagation();
+    el.classList.toggle('open');
+    tog.textContent = el.classList.contains('open') ? '⌄' : '›';
+  };
+
+  el.appendChild(rest);
+  el.appendChild(tog);
+}
+
+function clampMessages() {
+  // `.empty` is the "nothing here yet, and here is what this panel is for"
+  // text. It is the longest prose in the file and the most purely explanatory,
+  // so it folds like the rest -- the first sentence still says what is missing.
+  for (const el of document.querySelectorAll('#panel .msg, #panel .note, #panel .empty')) {
+    clampMessage(el);
+  }
+}
+
+const EXPLAIN_KEY = 'explain:all';
+
+function applyExplainAll() {
+  const on = isFolded(EXPLAIN_KEY);   // stored as "the full text is showing"
+  $('panel').classList.toggle('explain-all', on);
+  const btn = $('explaintog');
+  if (btn) btn.textContent = on ? 'less' : 'explain';
+  if (btn) {
+    btn.title = on
+      ? 'fold every explanation back to its first sentence'
+      : 'show the reasoning behind every message at once';
+  }
+}
+
+function initExplainToggle() {
+  const btn = $('explaintog');
+  if (!btn) return;
+  btn.onclick = () => { toggleFold(EXPLAIN_KEY); applyExplainAll(); };
+  applyExplainAll();
+}
+
+/* ------------------------------------------------------------ fold the lot
+ *
+ * Sections and model cards have folded individually for a while, which is no
+ * help at all on the project this was asked for: seven model cards and twelve
+ * sections is nineteen clicks to get to a quiet panel, and nineteen more to
+ * get back. The prose toggle above does nothing for them either, because what
+ * makes that panel long is not explanation -- it is twenty-eight bodies, each
+ * stating a handful of perfectly short facts.
+ *
+ * So one control for the lot, driving the fold keys that already exist rather
+ * than a second mechanism beside them: whatever is folded here stays folded
+ * the next time the project is opened, exactly as a hand-folded section does.
+ */
+
+const FOLD_ALL_KEY = 'fold:all';
+
+function sectionFoldKey(sec) {
+  const h = sec.querySelector('h3');
+  if (!h) return null;
+  return 'sec:' + (sec.querySelector('.inner')?.id || h.textContent.trim());
+}
+
+function setAllFolded(folded) {
+  for (const sec of document.querySelectorAll('#panel .section')) {
+    const key = sectionFoldKey(sec);
+    if (!key) continue;
+    setFolded(key, folded);
+    sec.classList.toggle('folded', folded);
+  }
+  // model cards are rebuilt from their keys, so setting the key is the whole
+  // job; the render below is what puts it on screen
+  for (const tid of Object.keys(templates() || {})) setFolded('tpl:' + tid, folded);
+  setFolded(FOLD_ALL_KEY, folded);
+  renderPanels();
+  applyFoldAll();
+}
+
+function applyFoldAll() {
+  const btn = $('foldalltog');
+  if (!btn) return;
+  const folded = isFolded(FOLD_ALL_KEY);
+  btn.textContent = folded ? 'open all' : 'fold all';
+  btn.title = folded
+    ? 'open every section and model card'
+    : 'fold every section and model card down to its heading';
+}
+
+function initFoldAll() {
+  const btn = $('foldalltog');
+  if (!btn) return;
+  btn.onclick = () => setAllFolded(!isFolded(FOLD_ALL_KEY));
+  applyFoldAll();
 }
 
 /* Section headers are in the static markup, so they are wired once and their
@@ -5234,6 +5591,22 @@ function renderObjectsPanel() {
           +     `${nInst ? ` · ${nInst} object(s)` : ''}</span></div>`
           + `<div class="tplbody">`;
 
+    /* A model file that is not there, said on the row that owns it.
+     *
+     * This is the only place the fact is actionable: the fix is to drop the
+     * file back in, and this is where the file is named. Without it, the
+     * symptom turned up two steps away -- no body in the 3D view, and a STEP
+     * export with cameras and anchor crosses and no solids -- where it reads
+     * as a renderer or an exporter that cannot do CAD. */
+    const fileMeta = (state.modelMeta || {})[tid];
+    if (fileMeta && fileMeta.attached && !fileMeta.exists) {
+      html += `<div class="note bad">The model file for this object is not in the `
+            + `project: <code>${escapeHtml(t.mesh_path || fileMeta.absolute || '')}</code>. `
+            + `Its anchors and its solved placement are intact, but nothing can draw `
+            + `or export the body until the file is back — drop the model onto the `
+            + `window again.</div>`;
+    }
+
     if (mesh === null) {
       html += `<div class="msg">loading model…</div>`;
     } else if (mesh && mesh.error) {
@@ -5247,8 +5620,17 @@ function renderObjectsPanel() {
         (v) => +((v * t.unit_scale) / nominalScale()).toPrecision(3));
       const spanLocal = modelSpanLocal(t);
       const spanNom = spanLocal > 0 ? modelSpanNominal(t) : null;
-      html += `<div class="msg">${mesh.n_faces} faces, ${mesh.n_feature_edges} of `
-            +   `${mesh.n_all_edges || mesh.n_feature_edges} edges drawn</div>`
+      /* Three numbers, because they answer three different questions: how
+       * big the model is, how much of it the 3D view got (all of it, unless
+       * the transport ceiling bit), and how many of its edges the crease
+       * filter below calls real. The last one used to read "6000 of 329286",
+       * which was the thinning talking and not the part. */
+      const sentFaces = mesh.n_faces_sent != null ? mesh.n_faces_sent : mesh.n_faces;
+      const whole = sentFaces >= mesh.n_faces;
+      html += `<div class="msg">${mesh.n_faces.toLocaleString()} triangles`
+            +   (whole ? '' : `, ${sentFaces.toLocaleString()} of them sent`)
+            +   `, ${mesh.n_feature_edges.toLocaleString()} of `
+            +   `${(mesh.n_all_edges || mesh.n_feature_edges).toLocaleString()} edges creased</div>`
             // the angle that decides which edges those are. A filleted or finely
             // tessellated part loses its curves at the default, and nothing on
             // screen says so -- the count above is the only clue, and this is
@@ -6255,6 +6637,237 @@ function parseDirection(raw) {
  *  dimensioned against once the scene is open in CAD, which is why the only
  *  place it shows up is the 3D view and the STEP export.
  */
+/* ---------------------------------------------------------- drawn planes
+ *
+ * A surface drawn on the photographs rather than typed off a print. The four
+ * corners are ordinary tie points -- that is the whole design, and the reason
+ * this adds so little: they are marked with the marking tool that already
+ * exists, triangulated by the solve that already runs, and carry the residuals
+ * every other point carries. What is new here is only the order they are
+ * clicked in, and the quad drawn through them.
+ *
+ * Deliberately not a plane fitted to one photograph. Four points in a single
+ * image fix a plane's orientation only if the quad is a parallelogram in
+ * space, and nothing about a fence, a floor or a tooling plate guarantees
+ * that. Marking the corners twice costs four more clicks and assumes nothing.
+ */
+
+/** How far along a drawn plane is: a corner counts once two photos have it,
+ *  because one ray fixes a direction and no position. */
+function planeCornerProgress(plane) {
+  const corners = plane.corners || [];
+  const seen = Object.fromEntries(corners.map((c) => [c, 0]));
+  for (const im of state.project.images) {
+    if (!im.enabled) continue;
+    for (const c of corners) if (c in im.observations) seen[c] += 1;
+  }
+  return {
+    total: corners.length,
+    ready: corners.filter((c) => seen[c] >= 2).length,
+    here: corners.filter((c) => currentImage() && c in currentImage().observations).length,
+  };
+}
+
+/** Remove tie points by id, and every mark of them. */
+function dropPoints(ids) {
+  const gone = new Set(ids);
+  state.project.points = state.project.points.filter((p) => !gone.has(p.id));
+  for (const im of state.project.images) {
+    for (const id of gone) delete im.observations[id];
+  }
+  if (gone.has(state.activePoint)) state.activePoint = null;
+}
+
+/** Begin clicking a plane's corners, in this photo, starting at corner one. */
+function startPlaneDraw(plane) {
+  if (!plane || !(plane.corners || []).length) return;
+  const im = currentImage();
+  // picking up where this photograph left off, which for a surface sharing an
+  // edge with one already drawn is corner three
+  const first = Math.max(0, im
+    ? plane.corners.findIndex((c) => !(c in im.observations))
+    : 0);
+  state.planeDraw = { id: plane.id, idx: first };
+  state.activePoint = plane.corners[first];
+  setMode('points');
+  renderPanels();
+  render();
+  setStatus(
+    `${plane.label || plane.id}: click corner ${first + 1} of ${plane.corners.length}, `
+    + `in order round the surface — click a point that is already there to share it`);
+}
+
+/** Two significant figures, without `toPrecision` reaching for an exponent.
+ *
+ *  `(111.4).toPrecision(2)` is `"1.1e+2"`, which on a panel reporting
+ *  millimetres is a worse answer than the number it replaced. */
+function shortNum(v) {
+  const x = Math.abs(+v);
+  if (!Number.isFinite(x)) return '—';
+  if (x === 0) return '0';
+  if (x >= 100) return String(Math.round(+v));
+  if (x >= 10) return (+v).toFixed(1);
+  if (x >= 1) return (+v).toFixed(2);
+  return (+v).toPrecision(2);
+}
+
+/** Corners this surface holds in common with another, and the worst gap.
+ *
+ *  The gap is measured between the two faces' *own* versions of the same
+ *  corner, which is the thing a CAD user will see as a seam. `null` until
+ *  both surfaces have been fitted, because before that there is nothing to
+ *  measure and a zero would read as agreement. */
+function planeSeam(plane, planes) {
+  const mine = plane.corners || [];
+  let shared = 0;
+  let gap = null;
+  for (const other of planes) {
+    if (other === plane) continue;
+    for (const c of other.corners || []) {
+      const i = mine.indexOf(c);
+      if (i < 0) continue;
+      shared += 1;
+      if (!plane.quad || !other.quad) continue;
+      const a = plane.quad[i];
+      const b = other.quad[other.corners.indexOf(c)];
+      if (!a || !b) continue;
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+      if (gap === null || d > gap) gap = d;
+    }
+  }
+  return { shared, gap };
+}
+
+/** Has this point been marked anywhere yet? */
+function pointIsUnmarked(pid) {
+  return !state.project.images.some((im) => pid in im.observations);
+}
+
+/** Make the corner being clicked *be* an existing point, if one was clicked.
+ *
+ *  Two surfaces that meet along an edge share that edge's two corners, and the
+ *  alternative is marking the same physical feature twice and hoping the two
+ *  marks triangulate to the same place. They will not, quite: a tooling plate
+ *  built that way comes out as panels that nearly meet, with a seam whose
+ *  width is the disagreement between two clicks. Sharing the point makes the
+ *  edge exact by construction instead of by luck.
+ *
+ *  Only a corner that has never been marked can be redirected. Once a corner
+ *  carries a mark it is a real feature with a position, and a press on some
+ *  other marker means what it means everywhere else -- pick it up and drag it.
+ *
+ *  Returns true when the press was consumed.
+ */
+function adoptCornerPoint(pid) {
+  const plane = (state.project.reference_planes || [])
+    .find((p) => p.id === state.planeDraw.id);
+  if (!plane) return false;
+
+  const slot = state.planeDraw.idx;
+  const own = plane.corners[slot];
+  if (own === pid) {
+    // they clicked the very corner they were asked for, which is already
+    // marked here: take it as done rather than as a drag
+    advancePlaneCorner();
+    return true;
+  }
+  if (plane.corners.includes(pid)) {
+    setStatus(
+      `${plane.label || plane.id}: that point is already corner `
+      + `${plane.corners.indexOf(pid) + 1} of this surface — a quad needs four `
+      + `different ones`, 'warn');
+    return true;
+  }
+  if (!pointIsUnmarked(own)) return false;
+
+  plane.corners[slot] = pid;
+  // the placeholder made for this slot never got a mark and is now unreferenced
+  const stillUsed = new Set(
+    (state.project.reference_planes || []).flatMap((p) => p.corners || []));
+  if (!stillUsed.has(own)) dropPoints([own]);
+
+  state.activePoint = pid;
+  markDirty();
+  const sharedWith = (state.project.reference_planes || [])
+    .filter((p) => p.id !== plane.id && (p.corners || []).includes(pid))
+    .map((p) => p.label || p.id);
+  setStatus(
+    `${plane.label || plane.id}: corner ${slot + 1} is `
+    + `${state.project.points.find((q) => q.id === pid)?.label || pid}`
+    + (sharedWith.length ? `, shared with ${sharedWith.join(', ')}` : ''), 'ok');
+  advancePlaneCorner();
+  return true;
+}
+
+/** After a corner is marked: on to the next, or on to the next photograph.
+ *
+ *  The cycle is corners-within-a-photo rather than photos-within-a-corner,
+ *  which is the opposite of how a lone tie point is marked. Four corners of
+ *  one surface are visible together and are recognised together -- going round
+ *  the quad once per photo is how a person actually sees it, and it keeps the
+ *  winding order right, which a corner-at-a-time pass does not. */
+function advancePlaneCorner() {
+  const plane = (state.project.reference_planes || [])
+    .find((p) => p.id === state.planeDraw.id);
+  if (!plane) { state.planeDraw = null; return; }
+  const corners = plane.corners;
+
+  /* The next corner this photograph is missing, rather than simply the next
+   * one along. Shared corners are the reason: the second panel of a fence
+   * already has two of its four marked here, inherited from the first, and
+   * asking for them again would either duplicate work or -- worse -- invite a
+   * second click on the same feature a few pixels away, which is exactly the
+   * seam that sharing the point exists to prevent. */
+  const missingHere = (from) => {
+    const im = currentImage();
+    if (!im) return -1;
+    for (let k = from; k < corners.length; k++) {
+      if (!(corners[k] in im.observations)) return k;
+    }
+    return -1;
+  };
+
+  const next = missingHere(state.planeDraw.idx + 1);
+  if (next >= 0) {
+    state.planeDraw.idx = next;
+    state.activePoint = corners[next];
+    setStatus(`${plane.label || plane.id}: corner ${next + 1} of ${corners.length}`);
+    return;
+  }
+
+  const prog = planeCornerProgress(plane);
+  if (prog.ready >= prog.total) {
+    state.planeDraw = null;
+    setStatus(
+      `${plane.label || plane.id}: all ${prog.total} corners are in two or more photos — `
+      + `press Solve and the surface is fitted through them`, 'ok');
+    return;
+  }
+
+  // the next photograph that is missing any corner at all, and the first
+  // corner it is missing -- again so that shared ones are not re-asked
+  let target = null;
+  let first = -1;
+  for (const im of state.project.images) {
+    if (!im.enabled || im.id === state.current) continue;
+    const k = corners.findIndex((c) => !(c in im.observations));
+    if (k >= 0) { target = im; first = k; break; }
+  }
+  if (!target) {
+    state.planeDraw = null;
+    setStatus(
+      `${plane.label || plane.id}: corners marked here, but no other photo is left to `
+      + `mark them in. A corner needs two views before it has a position.`, 'warn');
+    return;
+  }
+  state.planeDraw.idx = first;
+  state.activePoint = corners[first];
+  selectImage(target.id, true);
+  setStatus(
+    `${plane.label || plane.id}: same surface in the next photo, starting at corner `
+    + `${first + 1}`);
+}
+
 function renderPlanesPanel() {
   const el = $('plpanel');
   const planes = state.project.reference_planes || (state.project.reference_planes = []);
@@ -6263,9 +6876,10 @@ function renderPlanesPanel() {
 
   let html = '<div class="cons"><ul>';
   if (!planes.length) {
-    html += `<li style="color:var(--text-dim);font-style:italic">None. Add the drawing's `
-          + `datums and they come through the STEP export as real surfaces you can `
-          + `dimension to.</li>`;
+    html += `<li style="color:var(--text-dim);font-style:italic">None. Draw one on the `
+          + `photos to capture a surface nothing describes — a fence, a floor, the face of `
+          + `a tooling plate — or type a datum off the drawing. Both come through the STEP `
+          + `export as real surfaces you can dimension to.</li>`;
   }
   planes.forEach((pl, i) => {
     const n = pl.normal || [0, 0, 1];
@@ -6274,10 +6888,59 @@ function renderPlanesPanel() {
       ? `${AXIS_NAME[axis]} = ${+(pl.offset * (n[axis] < 0 ? -1 : 1)).toFixed(4)} ${units}`
       : `n=(${n.map((v) => (+v).toFixed(2)).join(', ')}) at ${+(+pl.offset).toFixed(4)} ${units}`;
     const label = pl.label ? `${escapeHtml(pl.label)} — ` : '';
-    html += `<li title="${escapeHtml(where)}"><span>${label}${where}</span>`
-          + `<button class="x-btn" data-pli="${i}">×</button></li>`;
+
+    if ((pl.corners || []).length) {
+      const prog = planeCornerProgress(pl);
+      /* An edge held in common with another surface, and how far the two
+       * faces actually are apart along it.
+       *
+       * Sharing the point removes one error and not the other. Both surfaces
+       * are now fitted through the same measured corner, so they no longer
+       * disagree about where the feature is -- but each still projects it onto
+       * its own plane to keep its own face exactly flat, and two planes that
+       * are not quite coplanar project it to two places. That residual gap is
+       * the seam, it is bounded by the two surfaces' flatness, and it is
+       * invisible on the photograph, where a shared corner looks like any
+       * other mark. So it is stated. */
+      const seam = planeSeam(pl, planes);
+      const sharedNote = seam.shared
+        ? ` · ${seam.shared} corner(s) shared`
+          + (seam.gap != null ? `, meeting to ${shortNum(seam.gap)} ${units}` : '')
+        : '';
+      // flatness is null for a three-cornered surface, whose corners cannot
+      // disagree about a plane; saying "0 mm off" there would report a
+      // measurement that arithmetic made rather than marking
+      const flatNote = pl.flatness == null
+        ? 'fitted · three corners, so nothing to disagree'
+        : `fitted · worst corner ${shortNum(pl.flatness)} ${units} off`;
+      const state_ = pl.quad
+        ? `<span class="est">${flatNote}${sharedNote}</span>`
+        : `<span class="est">${prog.ready} of ${prog.total} corner(s) in 2+ photos`
+          + `${sharedNote}</span>`;
+      html += `<li title="${escapeHtml(where)}">`
+            +   `<span>${label}${pl.quad ? where : 'drawn, not solved yet'}<br>${state_}</span>`
+            +   `<button class="smallbtn" data-plmark="${i}" title="mark these corners in `
+            +     `another photo">mark</button>`
+            +   `<button class="x-btn" data-pli="${i}">×</button></li>`;
+    } else {
+      html += `<li title="${escapeHtml(where)}"><span>${label}${where}</span>`
+            + `<button class="x-btn" data-pli="${i}">×</button></li>`;
+    }
   });
   html += '</ul>';
+
+  html += `<div style="display:flex;gap:4px;margin-top:7px;align-items:center">`
+        + `<input type="text" id="pl-drawname" placeholder="fence, floor, tooling plate…" `
+        +   `style="flex:1;min-width:0">`
+        + `<button class="smallbtn" id="pl-draw">draw on photos</button></div>`;
+  html += `<div class="msg">Click the four corners of the surface, in order round it, `
+        + `then the same four in a second photo. They are ordinary tie points, so the `
+        + `solve triangulates them and fits the surface through where they land, at any `
+        + `orientation at all — nothing here is axis-aligned. Clicking a point that is `
+        + `already on the photo shares it instead of making a new one: both surfaces are `
+        + `then fitted through the same measured corner, so the seam between them is the `
+        + `width of their own flatness rather than of two clicks disagreeing about one `
+        + `feature. It is not zero, and the row above says what it is.</div>`;
 
   html += `<div style="display:flex;gap:4px;margin-top:7px;align-items:center">`
         + `<input type="text" id="pl-name" placeholder="name" style="flex:1;min-width:0">`
@@ -6293,10 +6956,41 @@ function renderPlanesPanel() {
 
   for (const b of el.querySelectorAll('.x-btn')) {
     b.onclick = () => {
-      planes.splice(+b.dataset.pli, 1);
-      markDirty(); renderPanels(); syncViewer();
+      const [gone] = planes.splice(+b.dataset.pli, 1);
+      // A drawn plane's corners exist for it and nothing else, so they go with
+      // it: leaving four unlabelled points behind would be a strange thing to
+      // hand someone who deleted a fence. Unless another surface is still
+      // using one, which is how two panels that meet along an edge would be
+      // marked -- deleting one of those must not take the other's corner.
+      if (gone && (gone.corners || []).length) {
+        const stillUsed = new Set(planes.flatMap((p) => p.corners || []));
+        dropPoints(gone.corners.filter((c) => !stillUsed.has(c)));
+      }
+      if (state.planeDraw && gone && state.planeDraw.id === gone.id) state.planeDraw = null;
+      markDirty(); renderPanels(); syncViewer(); render();
     };
   }
+  for (const b of el.querySelectorAll('[data-plmark]')) {
+    b.onclick = () => startPlaneDraw(planes[+b.dataset.plmark]);
+  }
+  const draw = $('pl-draw');
+  if (draw) draw.onclick = () => {
+    const used = new Set(planes.map((p) => p.id));
+    let k = 0;
+    while (used.has(`pl${k}`)) k += 1;
+    const name = $('pl-drawname').value.trim();
+    const corners = [];
+    for (let c = 0; c < 4; c++) {
+      corners.push(newPoint(`${name || `plane ${k}`} · corner ${c + 1}`).id);
+    }
+    const plane = {
+      id: `pl${k}`, label: name, normal: [0, 0, 1], offset: 0, size: null,
+      corners, quad: null, flatness: null,
+    };
+    planes.push(plane);
+    markDirty();
+    startPlaneDraw(plane);
+  };
   const add = $('pl-add');
   if (add) add.onclick = () => {
     const axis = +$('pl-axis').value;
@@ -6497,6 +7191,8 @@ function buildScene() {
       R: inst.R,
       t: inst.t,
       unitScale: template ? template.unit_scale : 1,
+      // the part gets its own fill in the 3D view, as it does on the photos
+      isPart: !!inst.is_part,
       mesh: template ? meshFor(inst.template) : null,
       anchors: template
         ? (template.anchors || []).map((a) => ({
@@ -6585,6 +7281,10 @@ function buildScene() {
       normal: n,
       origin: n.map((v) => v * (pl.offset || 0) * nominalScale),
       size: pl.size != null ? pl.size * nominalScale : null,
+      // present only once the solve has fitted the drawn corners; until then
+      // there is nothing to draw and the plane is absent from the view, which
+      // is the honest state for a surface whose corners have no positions yet
+      quad: pl.quad ? pl.quad.map((c) => c.map((v) => v * nominalScale)) : null,
     };
   });
 
@@ -6632,6 +7332,12 @@ function updateViewerBar() {
   $('view3dtitle').textContent = model ? `Model: ${t ? t.name || t.id : 'none'}` : 'Scene';
   $('v3-scene').classList.toggle('on', !model);
   $('v3-template').classList.toggle('on', model);
+  const solidOn = Viewer3D.solidOn();
+  $('v3-solid').classList.toggle('on', solidOn);
+  $('v3-solid').textContent = solidOn ? 'solid' : 'wires';
+  // A dead control with no explanation is worse than an absent one, so when
+  // there is no GL context the button stays and says what it is instead.
+  $('v3-solid').disabled = !Viewer3D.solidAvailable();
   const trackball = Viewer3D.orbitMode() === 'trackball';
   $('v3-orbit').textContent = trackball ? 'trackball' : 'turntable';
   $('v3-orbit').classList.toggle('on', trackball);
@@ -6919,6 +7625,33 @@ $('v3-orbit').onclick = () => {
   updateViewerBar();
 };
 $('v3-level').onclick = () => Viewer3D.levelRoll();
+/* Surfaces on or off.
+ *
+ * Worth a control rather than being always on: a shaded body hides the tie
+ * points and the anchors inside it, and when what you are checking is where
+ * the marked points landed relative to the model, seeing through it is the
+ * whole point. Shaded is the default because the question asked far more
+ * often is "is this body the right way round", which a wireframe cannot
+ * answer. */
+$('v3-solid').onclick = () => {
+  if (!Viewer3D.solidAvailable()) {
+    setStatus(`shaded bodies need WebGL — ${Viewer3D.solidWhy()}`, 'warn');
+    return;
+  }
+  Viewer3D.setSolid(!Viewer3D.solidWanted());
+  updateViewerBar();
+  const mesh = meshFor(state.activeTemplate);
+  const cost = Viewer3D.solidOn() ? Viewer3D.meshCost(mesh) : null;
+  setStatus(
+    Viewer3D.solidOn()
+      ? (cost
+          ? `shaded: ${cost.triangles.toLocaleString()} triangles and `
+            + `${cost.edges.toLocaleString()} edges of the full model`
+          : 'shaded, with hidden lines removed')
+      : 'wireframe — the bodies are see-through again',
+    'ok'
+  );
+};
 $('v3-scene').onclick = () => { Viewer3D.setMode('scene'); updateViewerBar(); };
 $('v3-template').onclick = () => openTemplatePicker();
 
@@ -6944,7 +7677,7 @@ Viewer3D.attach($('canvas3d'), {
     syncViewer();
     updateHint();
   },
-});
+}, $('canvas3dgl'));
 document.addEventListener('click', (ev) => {
   const menu = $('projmenu');
   if (!menu.hidden && !$('projwrap').contains(ev.target)) menu.hidden = true;
@@ -7033,14 +7766,52 @@ function showLauncher() {
   });
 }
 
+/** Say that Python is working, and for how long.
+ *
+ *  Held back for the first half-second, because most calls answer inside it
+ *  and a badge that flashes on every click is worse than no badge. Past that
+ *  the elapsed seconds are the whole point: the complaint this answers is not
+ *  "it is slow", it is "I could not tell whether it was still going", and a
+ *  running count is the difference between waiting and closing the tab. */
+function initBusyBadge() {
+  const badge = $('busy');
+  if (!badge || !Backend.onBusy) return;
+  let timer = null;
+  let since = 0;
+  let label = 'working';
+
+  const paint = () => {
+    const secs = Math.floor((Date.now() - since) / 1000);
+    if (secs < 1) return;
+    badge.hidden = false;
+    badge.textContent = `${label}… ${secs}s`;
+  };
+
+  Backend.onBusy((s) => {
+    if (s.busy) {
+      label = s.label || 'working';
+      since = s.since || Date.now();
+      if (!timer) timer = setInterval(paint, 250);
+      paint();
+    } else {
+      if (timer) { clearInterval(timer); timer = null; }
+      badge.hidden = true;
+      badge.textContent = '';
+    }
+  });
+}
+
 async function start() {
   setMode('lines');
   setAxis(0);
   resizeCanvas();
+  initBusyBadge();
   if (Backend.isStatic()) await showLauncher();
   try {
     await loadState();
     initSectionFolding();
+    initExplainToggle();
+    initFoldAll();
     // fit once the grid has actually laid the canvas out, otherwise the first
     // fitView measures a stale (usually too small) rect
     requestAnimationFrame(() => { resizeCanvas(); fitView(); render(); });

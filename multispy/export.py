@@ -615,26 +615,32 @@ def export_ply(project: Project, out_path: str | Path, include_cameras: bool = T
 # STEP: the whole scene in one CAD file
 # --------------------------------------------------------------------------
 
-STEP_SHAPES = ("tessellated", "wireframe", "brep", "none")
+STEP_SHAPES = ("none", "wireframe", "brep", "tessellated")
 """How a placed CAD body is carried into the file.
 
-``tessellated``
-    Every triangle, as one AP242 ``TESSELLATED_SHELL``. Two entities for a
-    whole body, so a 180,000-triangle casting is a few megabytes rather than a
-    few hundred. Needs a reader that does AP242 tessellated geometry:
-    OpenCASCADE 7.5+ (FreeCAD and most viewers), NX, CATIA, Creo.
+``none``
+    Placements only: the tree, the poses, the cameras and the points, with no
+    body geometry at all. **The default**, because the bodies are CAD models
+    the seat opening this file already has, and each one still arrives as a
+    named node at its solved pose for the real part to drop into -- so what
+    the file adds is where they are, in a form every seat reads.
 ``wireframe``
     The body's feature edges as polylines -- the same edges MultiSpy draws over
-    a photograph. Tiny, and read by everything back to AP203, at the cost of
-    having no faces to snap or section. The fallback when ``tessellated`` opens
-    empty.
+    a photograph. Read by everything back to AP203, at the cost of having no
+    faces to snap or section. The one to ask for when the geometry has to
+    travel in the file; note that the edges of a dense mesh are not cheap, and
+    can come out larger than ``tessellated``.
 ``brep``
     A real faceted solid, one planar face per triangle. Universally read and
     properly solid, but about nine entities per triangle, so it is capped and
     is only sensible for a machined part rather than a scanned one.
-``none``
-    Placements only: the tree, the poses, the cameras and the points, with no
-    body geometry at all.
+``tessellated``
+    Every triangle, as one AP242 ``TESSELLATED_SHELL``. Two entities for a
+    whole body, so a 180,000-triangle casting is a few megabytes rather than a
+    few hundred. Needs a reader that does AP242 tessellated geometry:
+    OpenCASCADE 7.5+ (FreeCAD and most viewers), NX, Creo, 3DEXPERIENCE.
+    **Not CATIA V5**, which has no AP242 tessellated geometry at all and does
+    not say so -- it reads the file to the end of the progress bar and closes.
 """
 
 STEP_COLOURS = {
@@ -749,7 +755,8 @@ def _step_body(
             raise ValueError(
                 f"{name} has {mesh.n_faces} triangles, past the {faceted_limit} a "
                 "faceted B-rep can carry sensibly -- export it with "
-                'shape="tessellated" (AP242) or shape="wireframe" instead'
+                'shape="wireframe", or shape="tessellated" if the seat '
+                "opening it reads AP242"
             )
         return step.mesh_faceted(verts, mesh.faces, name)
     if shape == "wireframe":
@@ -759,6 +766,23 @@ def _step_body(
         lines = [step.polyline([verts[a], verts[b]]) for a, b in edges]
         return step.curve_set(lines, name)
     return None
+
+
+def _step_missing_bodies(project: Project, shape: str) -> list[str]:
+    """Names of the templates whose geometry this export cannot include.
+
+    Separate from :func:`_step_template`, and run first, because the header of
+    a Part 21 file is written before its entities and the warning belongs in
+    the header.
+    """
+    if shape == "none":
+        return []
+    out: list[str] = []
+    for tid, template in project.templates.items():
+        path = project.resolve_mesh_path(template)
+        if path is None or not path.exists():
+            out.append(template.name or tid)
+    return out
 
 
 def _step_template(
@@ -773,6 +797,7 @@ def _step_template(
     depth: float,
     anchors: bool,
     faceted_limit: int,
+    skipped: list[str] | None = None,
 ) -> object:
     """One template as a node holding its body, its anchors and its optics.
 
@@ -780,13 +805,34 @@ def _step_template(
     so that what a CAD user replaces when a better model turns up is a single
     leaf, and the transform that located it -- which is the measurement, and the
     expensive part -- lives a level above and never moves.
+
+    ``skipped`` collects a line for every template whose geometry could not be
+    written, and it exists because the alternative was the worst failure this
+    exporter had: a body whose model file was not where the project says it is
+    was dropped in silence. The export then succeeded, the file opened, the
+    cameras and the anchor crosses were all present, and the CAD bodies simply
+    were not -- with nothing anywhere to say why, and the obvious reading being
+    that the exporter cannot carry meshes at all. It can; it could not find
+    them.
+
+    A missing model file is routine rather than exotic: a bare ``.multispy``
+    opened without its bundle has every ``models/`` path pointing at nothing,
+    which is exactly the case that produced the complaint.
     """
     name = template.name or template.id
     comp = step.component(name)
 
+    def note(why: str) -> None:
+        if skipped is not None:
+            skipped.append(f"{name}: {why}")
+
     if shape != "none":
         mesh_path = project.resolve_mesh_path(template)
-        if mesh_path is not None and mesh_path.exists():
+        if mesh_path is None:
+            note("no model file is attached to this object")
+        elif not mesh_path.exists():
+            note(f"its model file is missing ({mesh_path})")
+        else:
             body = _step_body(
                 step,
                 name,
@@ -796,7 +842,9 @@ def _step_template(
                 template.crease_angle,
                 faceted_limit,
             )
-            if body is not None:
+            if body is None:
+                note(f"it has no geometry to write as shape={shape!r}")
+            else:
                 tessellated = shape == "tessellated"
                 leaf = step.component(
                     f"{name}_body", [body], tessellated=tessellated
@@ -843,7 +891,7 @@ def export_step(
     project: Project,
     out_path: str | Path,
     *,
-    shape: str = "tessellated",
+    shape: str = "none",
     units: str = "mm",
     frustum: float | None = None,
     marker: float | None = None,
@@ -854,6 +902,7 @@ def export_step(
     origin: bool = True,
     label_limit: int = 400,
     faceted_limit: int = STEP_FACETED_LIMIT,
+    skipped: list[str] | None = None,
 ) -> Path:
     """The whole solved scene as one STEP assembly.
 
@@ -873,9 +922,22 @@ def export_step(
     by definition -- which is exactly what makes the export comparable with the
     drawing rather than merely pretty.
 
-    ``shape`` picks how bodies are carried; see :data:`STEP_SHAPES`, and reach
-    for ``"wireframe"`` if a CAD system opens the default with the cameras
-    present and the bodies missing.
+    ``shape`` picks how bodies are carried; see :data:`STEP_SHAPES`. The
+    default carries none of them, which is not a limitation but the usual
+    answer: the bodies are the seat's own CAD models, already on disk there and
+    better than anything this file could restate, so the default hands over the
+    one thing only the solve knows -- where each of them is -- as a named node
+    at its pose. Ask for ``"wireframe"`` or ``"brep"`` when the geometry has to
+    travel with the poses. ``"tessellated"`` is the only shape that needs
+    AP242; the others are written as AP214, which every seat reads.
+
+    Pass a list as ``skipped`` to find out which bodies did not make it, and
+    why. Whether or not one is passed, the reasons also go into the file's own
+    FILE_DESCRIPTION, so the person who opens the STEP and finds no solids in
+    it can read the answer out of the file in front of them instead of coming
+    back to ask. Bodies missing from a scene that still has all its cameras
+    and anchor crosses is the one failure here that looks exactly like an
+    exporter that cannot carry geometry.
     """
     if shape not in STEP_SHAPES:
         raise ValueError(f"shape must be one of {STEP_SHAPES}, not {shape!r}")
@@ -913,11 +975,27 @@ def export_step(
     mark = marker * scale if marker is not None else max(extent * 0.012, 1e-3)
     depth = frustum * scale if frustum is not None else max(extent * 0.15, 1e-3)
 
+    if skipped is None:
+        skipped = []
+    # Worked out before the StepFile exists, because the file's description
+    # has to carry the verdict and Part 21 puts FILE_DESCRIPTION in the header
+    # -- which means knowing what is missing before the first entity is
+    # written. Cheap: it stats a handful of files and reads none of them.
+    missing = _step_missing_bodies(project, shape)
+
+    note = f"MultiSpy scene: {project.name}"
+    if missing:
+        note += (
+            f" -- WARNING: {len(missing)} object(s) carry no geometry in this"
+            " file because their model files could not be read: "
+            + ", ".join(missing)
+        )
+
     step = StepFile(
         out_path.name,
         schema="ap242" if shape == "tessellated" else "ap214",
         units=units,
-        description=f"MultiSpy scene: {project.name}",
+        description=note,
     )
     root = step.component(f"MultiSpy_{project.name}")
 
@@ -1004,6 +1082,7 @@ def export_step(
                 depth=depth,
                 anchors=anchors,
                 faceted_limit=faceted_limit,
+                skipped=skipped,
             )
             built[inst.template] = comp
 
@@ -1039,6 +1118,7 @@ def export_step(
                 depth=depth,
                 anchors=anchors,
                 faceted_limit=faceted_limit,
+                skipped=skipped,
             )
             built[tid] = comp
             step.place(root, comp, name=f"{template.name or tid} (unplaced)")
@@ -1052,14 +1132,25 @@ def export_step(
         # nominal units -> metres -> the file's units, the same chain a nominal
         # takes, because a plane typed as "Z = 995" means the same 995 a point
         # nominal does
-        origin_out = plane.origin() * project.nominal_scale * scale
-        half = (
-            plane.size * project.nominal_scale * scale
-            if plane.size is not None
-            else max(extent * 0.6, 1e-3)
-        )
-        u, _v, _n = plane.basis()
-        face = step.plane_face(origin_out, plane.unit_normal(), half, name, u=u)
+        if plane.quad:
+            # drawn on the photographs: it has four measured corners, so the
+            # face is those corners. Only the unit chain is applied here --
+            # the corners were already projected onto the fitted plane by the
+            # solve, which is what lets this be an exact planar face.
+            corners_out = [
+                np.asarray(c, dtype=float) * project.nominal_scale * scale
+                for c in plane.quad
+            ]
+            face = step.polygon_face(corners_out, name, normal=plane.unit_normal())
+        else:
+            origin_out = plane.origin() * project.nominal_scale * scale
+            half = (
+                plane.size * project.nominal_scale * scale
+                if plane.size is not None
+                else max(extent * 0.6, 1e-3)
+            )
+            u, _v, _n = plane.basis()
+            face = step.plane_face(origin_out, plane.unit_normal(), half, name, u=u)
         comp = step.component(name, [face])
         step.colour([face], STEP_COLOURS["plane"])
         step.place(root, comp, name=name)

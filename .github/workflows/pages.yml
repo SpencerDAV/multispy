@@ -37,12 +37,19 @@ jobs:
       - name: Check the bundle has what the browser needs
         run: |
           set -e
-          for f in index.html app.js backend.js viewer3d.js config.js .nojekyll \
+          for f in index.html app.js backend.js viewer3d.js worker.js config.js .nojekyll \
                    py/multispy/__init__.py py/multispy/solve.py py/multispy/webapp.py \
                    docs/readme.html docs/tutorial.html samples/index.json; do
             test -f "dist/$f" || { echo "missing dist/$f"; exit 1; }
           done
           grep -q "pyodide" dist/config.js || { echo "config.js is not the static one"; exit 1; }
+          # worker.js is the only script the page loads that index.html does not
+          # name, so the index's content-hash rewrite cannot version it. Without
+          # the hash in config.js, Pages' ten-minute cache can pair a fresh
+          # backend.js with the previous worker, which is a page that loads and
+          # then does nothing when Solve is pressed.
+          grep -q "MULTISPY_WORKER_URL = 'worker.js?v=" dist/config.js \
+            || { echo "config.js does not point at a versioned worker"; exit 1; }
           # every sample the manifest advertises has to be there to click on,
           # and a sample that 404s is worse than one the menu never offered
           python - <<'PY'

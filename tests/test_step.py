@@ -921,6 +921,95 @@ def test_colours(model: Model, project: Project) -> list[str]:
     return bad
 
 
+def test_geometry_is_not_shared(model: Model) -> list[str]:
+    """No geometric entity belongs to two shape representations at once.
+
+    A representation_item belongs to one representation, and in an assembly
+    every representation sits in its own coordinate system -- so a
+    CARTESIAN_POINT reachable from two of them is a point claiming to be in
+    two frames at the same time. The writer dedupes coordinates, which is how
+    this got in: every drawing nominal is a cross at its own origin, so all of
+    them shared one set of six points and differed only in their placement.
+    OpenCASCADE recovered the scene from that file regardless. CATIA V5 read
+    it to the end of the progress bar and then closed.
+    """
+
+    def reachable(entity: Entity) -> list[int]:
+        out: list[int] = []
+
+        def walk(value):
+            if isinstance(value, Ref):
+                out.append(value.id)
+            elif isinstance(value, Typed):
+                for item in value.args:
+                    walk(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item)
+
+        for args in entity.parts.values():
+            walk(args)
+        return out
+
+    reps = [
+        e
+        for e in model.entities.values()
+        if {"SHAPE_REPRESENTATION", "TESSELLATED_SHAPE_REPRESENTATION"} & set(e.parts)
+    ]
+    bad = check(bool(reps), "the file holds no shape representation")
+    owners: dict[int, set[int]] = {}
+    for rep in reps:
+        # (name, items, context): only the items are the representation's own
+        stack = [r.id for r in rep.args[1] if isinstance(r, Ref)]
+        seen: set[int] = set()
+        while stack:
+            eid = stack.pop()
+            if eid in seen or eid not in model.entities:
+                continue
+            seen.add(eid)
+            stack += reachable(model.entities[eid])
+        for eid in seen:
+            owners.setdefault(eid, set()).add(rep.id)
+    shared = sorted(eid for eid, who in owners.items() if len(who) > 1)
+    for eid in shared[:5]:
+        bad.append(
+            "#%d (%s) is reachable from %d shape representations"
+            % (eid, model.entities[eid].name, len(owners[eid]))
+        )
+    bad += check(
+        not shared,
+        f"{len(shared)} entities are shared between shape representations",
+    )
+    return bad
+
+
+def test_styles_apply_to_their_items(model: Model) -> list[str]:
+    """A curve is styled with a pen, a surface with a fill, neither with both.
+
+    A SURFACE_STYLE_USAGE assigned to a GEOMETRIC_CURVE_SET is a style for
+    something the item has none of. Presentation is the last thing a reader
+    does with a file, which is why this one reads as a crash at the end of an
+    import that looked like it was working.
+    """
+    curves = {"POLYLINE", "GEOMETRIC_CURVE_SET", "LINE", "CIRCLE"}
+    surfaces = {"FACETED_BREP", "TESSELLATED_SHELL", "SHELL_BASED_SURFACE_MODEL"}
+    styled = model.of_type("STYLED_ITEM")
+    bad = check(bool(styled), "nothing in the file is styled")
+    for item in styled:
+        _name, assignments, target = item.args
+        applied: set[str] = set()
+        for assignment in assignments:
+            for style in model.deref(assignment).args[0]:
+                applied |= set(model.deref(style).parts)
+        subject = model.deref(target)
+        kinds = set(subject.parts)
+        if kinds & curves and "SURFACE_STYLE_USAGE" in applied:
+            bad.append(f"#{item.id} gives a surface style to a {subject.name}")
+        if kinds & surfaces and "CURVE_STYLE" in applied:
+            bad.append(f"#{item.id} gives a curve style to a {subject.name}")
+    return bad
+
+
 def test_units(model: Model, units: str) -> list[str]:
     """The unit context says what the numbers mean."""
     bad: list[str] = []
@@ -1024,7 +1113,7 @@ def test_missing_mesh_still_places_the_body(root: Path) -> list[str]:
     """
     project = build_scene(root)
     project.templates["tplcam"].mesh_path = "models/gone.obj"
-    out = export.export_step(project, root / "missing.step")
+    out = export.export_step(project, root / "missing.step", shape="tessellated")
     model = Model(out)
     placed = model.placements()
     bad = check(
@@ -1047,6 +1136,42 @@ def test_missing_mesh_still_places_the_body(root: Path) -> list[str]:
     bad += check(
         "array_camera_body" not in model.products(),
         "a template with no mesh file still produced a body node",
+    )
+
+    # ...and it has to SAY so. This is the half that was missing, and it is
+    # the half the user met: the export succeeded, the file opened, every
+    # camera and every anchor cross was in it, and the bodies simply were not.
+    # Nothing anywhere named the reason, so the file read as an exporter that
+    # cannot carry meshes rather than as one that could not find them.
+    reported: list[str] = []
+    out2 = export.export_step(
+        project, root / "missing_reported.step", shape="tessellated", skipped=reported
+    )
+    bad += check(
+        any("array_camera" in line for line in reported),
+        f"a skipped body was not reported: {reported}",
+    )
+    bad += check(
+        any("missing" in line for line in reported),
+        f"the report does not say the file is missing: {reported}",
+    )
+    header = out2.read_text(encoding="utf-8", errors="replace").split("DATA;")[0]
+    bad += check(
+        "WARNING" in header and "array_camera" in header,
+        "the STEP header does not warn that a body has no geometry in it",
+    )
+
+    # and the same export with its mesh present must stay quiet, or the
+    # warning is noise and will be ignored on the day it matters
+    clean: list[str] = []
+    ok = build_scene(root)
+    out3 = export.export_step(
+        ok, root / "present.step", shape="tessellated", skipped=clean
+    )
+    bad += check(not clean, f"a healthy export reported skipped bodies: {clean}")
+    bad += check(
+        "WARNING" not in out3.read_text(encoding="utf-8", errors="replace").split("DATA;")[0],
+        "a healthy export warns about missing geometry anyway",
     )
     return bad
 
@@ -1119,7 +1244,7 @@ def test_unplaced_templates(root: Path) -> list[str]:
         units="mm",
         unit_scale=0.001,
     )
-    out = export.export_step(project, root / "unplaced.step")
+    out = export.export_step(project, root / "unplaced.step", shape="tessellated")
     model = Model(out)
     placed = model.placements()
     bad = check(
@@ -1138,7 +1263,11 @@ def test_unplaced_templates(root: Path) -> list[str]:
     )
 
     # and it can be turned off, for a file that states only what was measured
-    strict = Model(export.export_step(project, root / "strict.step", unplaced=False))
+    strict = Model(
+        export.export_step(
+            project, root / "strict.step", shape="tessellated", unplaced=False
+        )
+    )
     bad += check(
         not any("unplaced" in name for name in strict.placements()),
         "unplaced=False still wrote unplaced templates",
@@ -1227,6 +1356,275 @@ def test_reference_planes(root: Path) -> list[str]:
     return bad
 
 
+def test_drawn_plane(root: Path) -> list[str]:
+    """A surface drawn on the photographs: fitted to its corners, exported as them.
+
+    The three things that can go quietly wrong, in the order they would bite.
+    The fit has to find the plane the corners actually lie in, including its
+    tilt -- an axis-aligned answer would look plausible and be wrong. The
+    corners have to come out of the fit exactly coplanar, because a CAD face
+    cannot be nearly planar and the alternative to projecting them is a warped
+    or rejected surface. And the face in the file has to be bounded by those
+    four corners rather than by a tidy square around their middle, which for a
+    fence would reach past both ends.
+    """
+    from multispy.solve import SolveReport, fit_drawn_planes
+
+    project = build_scene(root)
+    project.nominal_scale = 0.001
+    project.nominal_units = "mm"
+
+    # a deliberately tilted square, one metre across, with one corner 2 mm
+    # proud of the other three -- so there is something for the fit to resolve
+    # and something for it to report
+    n = np.array([0.0, -0.3, 1.0])
+    n /= np.linalg.norm(n)
+    u = np.array([1.0, 0.0, 0.0])
+    u -= n * (u @ n)
+    u /= np.linalg.norm(u)
+    v = np.cross(n, u)
+    o = np.array([0.5, 0.2, 1.0])
+    truth = [o - u * 0.5 - v * 0.5, o + u * 0.5 - v * 0.5,
+             o + u * 0.5 + v * 0.5, o - u * 0.5 + v * 0.5]
+    marked = list(truth)
+    marked[2] = marked[2] + n * 0.002
+
+    ids = []
+    for i, c in enumerate(marked):
+        pid = f"corner{i}"
+        project.points.append(TiePoint(id=pid, label=pid, xyz=np.asarray(c)))
+        ids.append(pid)
+    project.reference_planes = [ReferencePlane(id="pl0", label="fence", corners=ids)]
+
+    report = SolveReport()
+    fitted = fit_drawn_planes(project, report)
+    plane = project.reference_planes[0]
+    bad = check(fitted == 1, f"fitted {fitted} drawn plane(s), expected 1")
+    bad += check(plane.is_drawn, "a plane with four corners did not report as drawn")
+
+    # Within a couple of milliradians of the truth, and not tighter: the fit is
+    # through the *marked* corners, one of which is 2 mm proud, so the best
+    # plane through them genuinely is tilted about a milliradian off the one
+    # they were generated from. Either sign passes -- which way a fitted
+    # surface faces is decided by where the cameras are, and this fixture has
+    # no opinion about that.
+    tilt = math.degrees(math.acos(min(1.0, abs(float(plane.unit_normal() @ n)))))
+    bad += check(
+        tilt < 0.2,
+        f"fitted normal {plane.unit_normal()} is {tilt:.3f}° off the plane the corners "
+        f"lie in ({n}); an axis-aligned answer would look like this",
+    )
+    bad += check(
+        plane.flatness is not None and abs(plane.flatness - 0.5) < 0.05,
+        f"flatness came out {plane.flatness}, expected about 0.5 mm",
+    )
+
+    # every exported corner must lie exactly on the surface that was reported
+    un = plane.unit_normal()
+    off = [
+        abs(float(np.asarray(c) * project.nominal_scale @ un)
+            - plane.offset * project.nominal_scale)
+        for c in plane.quad
+    ]
+    bad += check(
+        max(off) < 1e-9,
+        f"a corner sits {max(off):.2e} m off its own plane; the face is not planar",
+    )
+
+    out = export.export_step(project, root / "drawn.step")
+    text = out.read_text(encoding="utf-8")
+    bad += check("PLANE('fence'" in text, "the drawn surface is not named in the file")
+
+    loop = re.search(r"POLY_LOOP\('',\(([^)]*)\)\)", text)
+    bad += check(loop is not None, "no bounding loop was written for the drawn surface")
+    if loop is not None:
+        coords = []
+        for ref in loop.group(1).split(","):
+            vid = ref.strip().lstrip("#")
+            vp = re.search(rf"#{vid}\s*=\s*VERTEX_POINT\('',#(\d+)\)", text)
+            pid = vp.group(1) if vp else vid
+            m = re.search(rf"#{pid}\s*=\s*CARTESIAN_POINT\('',\(([^)]*)\)\)", text)
+            if m:
+                coords.append([float(x) for x in m.group(1).split(",")])
+        bad += check(
+            len(coords) == 4, f"the face is bounded by {len(coords)} corners, expected 4"
+        )
+        for want in plane.quad:
+            bad += check(
+                any(np.allclose(want, got, atol=1e-6) for got in coords),
+                f"corner {want} is not in the exported face, so it was squared off",
+            )
+    return bad
+
+
+def test_drawn_plane_refuses_what_it_cannot_measure(root: Path) -> list[str]:
+    """The two ways a drawn surface can look perfect while being nonsense.
+
+    Both were found by reading the numbers rather than by anything failing.
+
+    A corner that did not triangulate used to be skipped, so a four-corner
+    panel missing one came out as a *triangle* -- and three points are exactly
+    coplanar by definition, so it reported a flatness of zero. Wrong about its
+    own shape, claiming perfection while doing it.
+
+    Corners strung out along a line are the same trap by another route: every
+    plane containing that line fits them exactly, so the residual is zero and
+    the normal is whatever the arithmetic happened to land on. Neither case can
+    be caught by looking at the residual, because the residual is the thing
+    they fake.
+    """
+    from multispy.solve import SolveReport, fit_drawn_planes
+
+    bad: list[str] = []
+
+    # --- a corner with no position
+    project = build_scene(root)
+    ids = []
+    for i, c in enumerate([(0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]):
+        pid = f"gap{i}"
+        # the third corner never triangulated
+        xyz = None if i == 2 else np.array(c, dtype=float)
+        project.points.append(TiePoint(id=pid, label=pid, xyz=xyz))
+        ids.append(pid)
+    project.reference_planes = [ReferencePlane(id="pl0", label="gappy", corners=ids)]
+    report = SolveReport()
+    fit_drawn_planes(project, report)
+    plane = project.reference_planes[0]
+    bad += check(
+        plane.quad is None,
+        "a surface with an unsolved corner was fitted anyway, as a triangle",
+    )
+    bad += check(
+        plane.flatness is None,
+        f"it also reported a flatness of {plane.flatness}, which nothing measured",
+    )
+    bad += check(
+        any("gap2" in w for w in report.warnings),
+        f"nothing named the missing corner; warnings were {report.warnings}",
+    )
+
+    # --- corners along a line
+    project = build_scene(root)
+    direction = np.array([1.0, 0.3, 0.1])
+    direction /= np.linalg.norm(direction)
+    ids = []
+    for i, t in enumerate([0.0, 0.33, 0.66, 1.0]):
+        pid = f"rail{i}"
+        xyz = np.array([0.0, 0.0, 1.0]) + direction * t
+        xyz = xyz + np.array([0.0, 0.0, 0.0005 * (i % 2)])   # half a millimetre of wobble
+        project.points.append(TiePoint(id=pid, label=pid, xyz=xyz))
+        ids.append(pid)
+    project.reference_planes = [ReferencePlane(id="pl0", label="rail", corners=ids)]
+    report = SolveReport()
+    fit_drawn_planes(project, report)
+    plane = project.reference_planes[0]
+    bad += check(
+        plane.quad is None,
+        "corners lying along a line were fitted to a plane, which cannot be determined",
+    )
+    bad += check(
+        any("line" in w for w in report.warnings),
+        f"nothing said why; warnings were {report.warnings}",
+    )
+    return bad
+
+
+def test_drawn_planes_share_corners(root: Path) -> list[str]:
+    """Two surfaces meeting along an edge share that edge's corner points.
+
+    The alternative is marking one physical feature twice and hoping the two
+    marks triangulate to the same place, which they do not: the seam between
+    the panels is then as wide as the two clicks disagree. Sharing the point
+    removes that error.
+
+    It does *not* make the edge exact, and this checks the honest version:
+    each surface still projects the shared corner onto its own plane to keep
+    its own face flat, so two surfaces that are not quite coplanar put it in
+    two places. What is asserted here is that the gap is bounded by how far
+    the planes are from each other, not by a second independent click.
+    """
+    from multispy.solve import SolveReport, fit_drawn_planes
+
+    project = build_scene(root)
+    # two panels folded along a shared edge, at a slight angle to each other
+    shared = [np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 1.0])]
+    left = [np.array([-1.0, 0.0, 1.0]), np.array([-1.0, 1.0, 1.0])]
+    right = [np.array([1.0, 0.0, 1.05]), np.array([1.0, 1.0, 1.05])]
+
+    named = {}
+    for name, xyz in [
+        ("s0", shared[0]), ("s1", shared[1]),
+        ("l0", left[0]), ("l1", left[1]),
+        ("r0", right[0]), ("r1", right[1]),
+    ]:
+        project.points.append(TiePoint(id=name, label=name, xyz=xyz))
+        named[name] = xyz
+
+    project.reference_planes = [
+        ReferencePlane(id="pl0", label="left", corners=["l0", "s0", "s1", "l1"]),
+        ReferencePlane(id="pl1", label="right", corners=["s0", "r0", "r1", "s1"]),
+    ]
+    report = SolveReport()
+    fitted = fit_drawn_planes(project, report)
+    bad = check(fitted == 2, f"fitted {fitted} surfaces, expected 2")
+
+    bad += check(
+        project.plane_corner_points() == {"l0", "l1", "r0", "r1", "s0", "s1"},
+        "a point shared by two surfaces should be named once in the corner set",
+    )
+
+    a, b = project.reference_planes
+    if a.quad and b.quad:
+        for pid in ("s0", "s1"):
+            pa = np.asarray(a.quad[a.corners.index(pid)])
+            pb = np.asarray(b.quad[b.corners.index(pid)])
+            seam = float(np.linalg.norm(pa - pb)) * project.nominal_scale
+            # both panels are flat and pass through the shared edge, so the
+            # projections must land on top of each other
+            bad += check(
+                seam < 1e-6,
+                f"{pid} sits {seam:.2e} m apart in the two faces that share it",
+            )
+    return bad
+
+
+def test_drawn_plane_is_not_evidence(root: Path) -> list[str]:
+    """A drawn surface's corners are kept out of the solve that measures the part.
+
+    This is the property that lets someone sketch a fence without paying for
+    it. The corners are marked like tie points and are deliberately not treated
+    like them: they are excluded from the bundle and triangulated against the
+    finished cameras afterwards, so four corners clicked roughly cannot move a
+    camera. Without it, adding a decoration to a 7-photo project took its
+    reprojection RMS from 1.41 px to 82 px.
+    """
+    project = build_scene(root)
+    ids = [p.id for p in project.points[:4]]
+    bad = check(
+        len(ids) == 4, f"the fixture has {len(project.points)} points, need 4 for this"
+    )
+    if len(ids) < 4:
+        return bad
+
+    bad += check(
+        project.plane_corner_points() == set(),
+        "a project with no drawn planes claims to have corner points",
+    )
+    project.reference_planes = [ReferencePlane(id="pl0", label="fence", corners=ids)]
+    bad += check(
+        project.plane_corner_points() == set(ids),
+        f"plane_corner_points gave {project.plane_corner_points()}, expected {set(ids)}",
+    )
+
+    # the solve's own track set is built by subtracting exactly this
+    tracks = {p.id for p in project.points} - project.plane_corner_points()
+    bad += check(
+        not (tracks & set(ids)),
+        "a drawn plane's corners are still in the set the bundle solves",
+    )
+    return bad
+
+
 def test_planes_round_trip(root: Path) -> list[str]:
     """A plane survives the project file, which is where the UI leaves it."""
     project = build_scene(root)
@@ -1285,9 +1683,15 @@ def test_front_end_paths(root: Path) -> list[str]:
         landed == ["scene.step"],
         f"asking for step alone left {landed} in the folder",
     )
+    default = Model(out / "scene.step")
     bad += check(
-        "AP242" in Model(out / "scene.step").header["FILE_SCHEMA"],
-        "the default shape did not write AP242",
+        "AUTOMOTIVE_DESIGN" in default.header["FILE_SCHEMA"],
+        "the default shape did not write AP214, which is the one every seat reads",
+    )
+    bad += check(
+        not default.of_type("TRIANGULATED_FACE")
+        and not default.of_type("FACETED_BREP"),
+        "the default shape wrote body geometry",
     )
 
     # the shape has to survive the trip, or the shift-click does nothing
@@ -1295,11 +1699,15 @@ def test_front_end_paths(root: Path) -> list[str]:
     model = Model(out / "scene.step")
     bad += check(
         "AUTOMOTIVE_DESIGN" in model.header["FILE_SCHEMA"],
-        "step_shape='wireframe' still wrote the AP242 default",
+        "step_shape='wireframe' did not write AP214",
     )
     bad += check(
         not model.of_type("TRIANGULATED_FACE"),
         "step_shape='wireframe' still wrote tessellated geometry",
+    )
+    bad += check(
+        len(model.entities) > len(default.entities),
+        "step_shape='wireframe' carried no more than the body-less default",
     )
 
     # browser mode: bytes, no folder, and callable more than once
@@ -1375,7 +1783,7 @@ def main() -> int:
         project = build_scene(root)
 
         print("tessellated, in millimetres")
-        out = export.export_step(project, root / "scene.step")
+        out = export.export_step(project, root / "scene.step", shape="tessellated")
         model = Model(out)
         for name, result in (
             ("references resolve", test_every_reference_resolves(model)),
@@ -1387,6 +1795,8 @@ def main() -> int:
             ("bodies are swappable", test_bodies_are_swappable(model, project)),
             ("mesh in file units", test_mesh_is_in_file_units(model, project, "mm")),
             ("colours", test_colours(model, project)),
+            ("geometry is not shared", test_geometry_is_not_shared(model)),
+            ("styles apply", test_styles_apply_to_their_items(model)),
             ("units", test_units(model, "mm")),
         ):
             print(f"  {'ok  ' if not result else 'FAIL'} {name}")
@@ -1395,7 +1805,9 @@ def main() -> int:
 
         for units in ("cm", "m", "in", "ft"):
             print(f"tessellated, in {units}")
-            out = export.export_step(project, root / f"scene_{units}.step", units=units)
+            out = export.export_step(
+                project, root / f"scene_{units}.step", shape="tessellated", units=units
+            )
             model = Model(out)
             for name, result in (
                 ("references resolve", test_every_reference_resolves(model)),
@@ -1416,6 +1828,8 @@ def main() -> int:
             ("header", test_header(model, "AUTOMOTIVE_DESIGN")),
             ("assembly tree", test_tree(model, project, "mm")),
             ("edges only", test_wireframe(model, project)),
+            ("geometry is not shared", test_geometry_is_not_shared(model)),
+            ("styles apply", test_styles_apply_to_their_items(model)),
         ):
             print(f"  {'ok  ' if not result else 'FAIL'} {name}")
             failures += result
@@ -1429,6 +1843,8 @@ def main() -> int:
             ("header", test_header(model, "AUTOMOTIVE_DESIGN")),
             ("assembly tree", test_tree(model, project, "mm")),
             ("faceted solid", test_faceted(model, project)),
+            ("geometry is not shared", test_geometry_is_not_shared(model)),
+            ("styles apply", test_styles_apply_to_their_items(model)),
         ):
             print(f"  {'ok  ' if not result else 'FAIL'} {name}")
             failures += result
@@ -1448,6 +1864,7 @@ def main() -> int:
                     "shape='none' wrote body geometry",
                 ),
             ),
+            ("geometry is not shared", test_geometry_is_not_shared(model)),
         ):
             print(f"  {'ok  ' if not result else 'FAIL'} {name}")
             failures += result
@@ -1460,6 +1877,11 @@ def main() -> int:
             ("the front end's two routes", test_front_end_paths(root)),
             ("unplaced templates", test_unplaced_templates(root)),
             ("reference planes", test_reference_planes(root)),
+            ("drawn planes", test_drawn_plane(root)),
+            ("drawn planes refuse bad corners",
+             test_drawn_plane_refuses_what_it_cannot_measure(root)),
+            ("drawn planes share corners", test_drawn_planes_share_corners(root)),
+            ("drawn planes are not evidence", test_drawn_plane_is_not_evidence(root)),
             ("planes survive the file", test_planes_round_trip(root)),
         ):
             print(f"  {'ok  ' if not result else 'FAIL'} {name}")

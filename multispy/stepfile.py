@@ -19,9 +19,11 @@ Two schemas are supported, and the difference matters in practice:
 ``ap242``
     Needed for tessellated geometry (``TRIANGULATED_FACE``), which is the only
     compact way to carry a 180,000-triangle body. Read by OpenCASCADE 7.5+
-    (so FreeCAD, and most viewers), NX, CATIA and Creo; support in older
-    mid-range CAD is patchy, which is why :mod:`multispy.export` offers the
-    wireframe fallback rather than assuming.
+    (so FreeCAD, and most viewers), NX, Creo and 3DEXPERIENCE; support in
+    older mid-range CAD is patchy, which is why :mod:`multispy.export` offers
+    the wireframe fallback rather than assuming. **CATIA V5 is not on that
+    list** -- its STEP reader has no AP242 tessellated geometry at all -- so a
+    V5 seat wants ``shape="wireframe"`` or ``shape="brep"``.
 
 Entity attribute order follows the merged AIM schema; the tessellated entities
 in particular are easy to get subtly wrong, so the shapes written here are
@@ -64,10 +66,15 @@ SCHEMAS = {
         2000,
     ),
     "ap242": (
-        "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 3 1 4 }",
+        # Edition 1 (442 1 1 4) on purpose, not edition 3. Nothing written
+        # here is newer than edition 1 -- tessellated geometry is already in
+        # ISO 10303-242:2014 -- and a reader handed a schema identifier it
+        # does not know does not degrade gracefully: CATIA V5 parses the whole
+        # file and then falls over on the way out.
+        "AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }",
         "managed model based 3d engineering",
         "managed_model_based_3d_engineering",
-        2020,
+        2014,
     ),
 }
 
@@ -211,6 +218,7 @@ class StepFile:
         self._lines: list[str | None] = []
         self._points: dict[tuple, int] = {}
         self._dirs: dict[tuple, int] = {}
+        self._item_kinds: dict[int, str] = {}
         self._products: list[int] = []
         self._components: list[Component] = []
         self._styles: list[int] = []
@@ -231,6 +239,15 @@ class StepFile:
 
     def fill(self, entity_id: int, body: str) -> None:
         self._lines[entity_id - 1] = body
+
+    def _kind(self, entity_id: int, kind: str) -> int:
+        """Remember whether an item is drawn with a pen or filled.
+
+        Only :meth:`colour` needs it, and it needs it badly enough to be worth
+        the dict: see there.
+        """
+        self._item_kinds[entity_id] = kind
+        return entity_id
 
     # -------------------------------------------------------------- context
 
@@ -284,12 +301,35 @@ class StepFile:
 
     # ------------------------------------------------------------- geometry
 
+    def _end_scope(self) -> None:
+        """Close the current representation: stop reusing its geometry.
+
+        :meth:`point` and :meth:`direction` dedupe, which is what keeps a
+        welded mesh from writing every vertex three times -- but a
+        representation_item belongs to exactly one representation, and in an
+        assembly every representation is in its own coordinate system. A
+        CARTESIAN_POINT shared between two components is a point claiming to
+        be in two frames at once. It is easy to do by accident here: the
+        drawing nominals are all a cross at their component's origin, so
+        without this they shared one set of six points between them and
+        differed only in their placement. OpenCASCADE forgives that. CATIA V5
+        reads the whole file and then dies building the assembly.
+
+        So the caches live for one representation and are dropped at its
+        boundary -- the end of :meth:`component` and of :meth:`place`, the two
+        points at which the next entity written belongs to a different
+        representation than the last.
+        """
+        self._points.clear()
+        self._dirs.clear()
+
     def point(self, xyz, name: str = "") -> int:
         """A CARTESIAN_POINT, reused when the same coordinate comes back.
 
         Welded meshes share vertices between triangles, and a faceted solid
         names every vertex of every face: without this the 8,400-triangle
-        bracket writes 25,000 points instead of 4,200.
+        bracket writes 25,000 points instead of 4,200. Reuse is confined to
+        one representation; see :meth:`_end_scope`.
         """
         x, y, z = (float(v) for v in xyz)
         key = (name, round(x, PRECISION), round(y, PRECISION), round(z, PRECISION))
@@ -331,7 +371,7 @@ class StepFile:
 
     def polyline(self, pts: Sequence[Sequence[float]], name: str = "") -> int:
         ids = [self.point(p) for p in pts]
-        return self.add(f"POLYLINE({text(name)},{refs(ids)})")
+        return self._kind(self.add(f"POLYLINE({text(name)},{refs(ids)})"), "curve")
 
     def curve_set(self, elements: Sequence[int], name: str = "") -> int:
         """A GEOMETRIC_CURVE_SET: loose curves and points with no topology.
@@ -339,7 +379,9 @@ class StepFile:
         The right container for a frustum or a point marker -- there is no
         solid there to pretend about, and every reader back to AP203 takes it.
         """
-        return self.add(f"GEOMETRIC_CURVE_SET({text(name)},{refs(elements)})")
+        return self._kind(
+            self.add(f"GEOMETRIC_CURVE_SET({text(name)},{refs(elements)})"), "curve"
+        )
 
     def cross(self, size: float, center=(0.0, 0.0, 0.0)) -> list[int]:
         """Three axis-aligned segments through ``center``.
@@ -386,7 +428,9 @@ class StepFile:
         face = self.add(
             f"TRIANGULATED_FACE({text(name)},#{clist},{len(verts)},(),$,(),{faces})"
         )
-        return self.add(f"TESSELLATED_SHELL({text(name)},(#{face}),$)")
+        return self._kind(
+            self.add(f"TESSELLATED_SHELL({text(name)},(#{face}),$)"), "surface"
+        )
 
     # -------------------------------------------------------- faceted solid
 
@@ -423,7 +467,7 @@ class StepFile:
         if not faces:
             raise ValueError("mesh has no non-degenerate triangles")
         shell = self.add(f"CLOSED_SHELL('',{refs(faces)})")
-        return self.add(f"FACETED_BREP({text(name)},#{shell})")
+        return self._kind(self.add(f"FACETED_BREP({text(name)},#{shell})"), "surface")
 
     # ------------------------------------------------------ bounded surfaces
 
@@ -456,12 +500,51 @@ class StepFile:
             o + u * half + v * half,
             o - u * half + v * half,
         ]
+        return self._patch(corners, o, n, u, name)
+
+    def polygon_face(self, corners, name: str = "", normal=None) -> int:
+        """A plane patch bounded by the corners given, rather than a square.
+
+        For a surface that was drawn on the photographs instead of typed off a
+        print: it has four measured corners, so the face in the file is those
+        corners and not a square centred on them. A fence exported as a tidy
+        square around its own middle would be a worse answer than the one that
+        was measured, and would reach past the ends of the real thing.
+
+        The corners are expected to be coplanar already -- the solve projects
+        them onto the fitted plane precisely so that this can be true -- and
+        the plane's own origin is taken as their centroid.
+        """
+        pts = [np.asarray(c, dtype=float) for c in corners]
+        if len(pts) < 3:
+            raise ValueError("a face needs at least three corners")
+        o = np.mean(pts, axis=0)
+        if normal is None:
+            _u, _s, vt = np.linalg.svd(np.asarray(pts) - o)
+            n = vt[2]
+        else:
+            n = np.asarray(normal, dtype=float)
+        n = n / max(float(np.linalg.norm(n)), 1e-12)
+        u = pts[1] - pts[0]
+        u = u - n * float(u @ n)
+        u = u / max(float(np.linalg.norm(u)), 1e-12)
+        return self._patch(pts, o, n, u, name)
+
+    def _patch(self, corners, o, n, u, name: str) -> int:
+        """The shared tail of both: a bounded face on a plane, in an open shell.
+
+        An open shell and not a closed one, because a surface model is a claim
+        about a surface; a closed shell would be a claim to bound a volume,
+        which a single datum face does not.
+        """
         plane = self.add(f"PLANE({text(name)},#{self.axis(o, n, u)})")
         loop = self.add("POLY_LOOP('',%s)" % refs([self.point(c) for c in corners]))
         bound = self.add(f"FACE_OUTER_BOUND('',#{loop},.T.)")
         face = self.add(f"FACE_SURFACE({text(name)},(#{bound}),#{plane},.T.)")
         shell = self.add(f"OPEN_SHELL('',(#{face}))")
-        return self.add(f"SHELL_BASED_SURFACE_MODEL({text(name)},(#{shell}))")
+        return self._kind(
+            self.add(f"SHELL_BASED_SURFACE_MODEL({text(name)},(#{shell}))"), "surface"
+        )
 
     # ------------------------------------------------------------ structure
 
@@ -496,6 +579,7 @@ class StepFile:
         )
         self._products.append(product)
         self._components.append(comp)
+        self._end_scope()
         return comp
 
     def place(
@@ -540,9 +624,11 @@ class StepFile:
             "SHAPE_REPRESENTATION_RELATIONSHIP() )"
             % (child.shape, parent.shape, transform)
         )
-        return self.add(
+        placed = self.add(
             f"CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#{relationship},#{occurrence})"
         )
+        self._end_scope()
+        return placed
 
     # --------------------------------------------------------------- colour
 
@@ -564,29 +650,45 @@ class StepFile:
         nominals and the part itself, colour is the only thing that keeps them
         apart once they are all grey in a CAD tree. Curves get a pen, surfaces
         get a fill, and both kinds can be in one call.
+
+        A curve gets *only* the pen and a surface *only* the fill. Handing
+        both to every item assigns a style that does not apply to the thing it
+        is assigned to, and presentation is the last thing a reader does: a
+        SURFACE_STYLE_USAGE on a GEOMETRIC_CURVE_SET is CATIA V5 importing a
+        whole file and then crashing as it finishes.
         """
         if not items:
             return
         col = self._colour(rgb)
-        if self._font is None:
-            self._font = self.add("DRAUGHTING_PRE_DEFINED_CURVE_FONT('continuous')")
-        font = self._font
-        curve_style = self.add(
-            "CURVE_STYLE('',#%d,POSITIVE_LENGTH_MEASURE(%s),#%d)"
-            % (font, real(width), col)
-        )
-        fill = self.add(f"FILL_AREA_STYLE_COLOUR('',#{col})")
-        area = self.add(f"FILL_AREA_STYLE('',(#{fill}))")
-        fill_style = self.add(f"SURFACE_STYLE_FILL_AREA(#{area})")
-        side = self.add(f"SURFACE_SIDE_STYLE('',(#{fill_style}))")
-        surface_style = self.add(f"SURFACE_STYLE_USAGE(.BOTH.,#{side})")
-        assignment = self.add(
-            f"PRESENTATION_STYLE_ASSIGNMENT((#{curve_style},#{surface_style}))"
-        )
+        groups: dict[str, list[int]] = {}
         for item in items:
-            self._styles.append(
-                self.add(f"STYLED_ITEM('colour',(#{assignment}),#{item})")
-            )
+            # an item of unrecorded kind keeps the old both-styles assignment:
+            # better an over-broad style than a body that imports uncoloured
+            groups.setdefault(self._item_kinds.get(item, "both"), []).append(item)
+        for kind, members in groups.items():
+            styles: list[int] = []
+            if kind in ("curve", "both"):
+                if self._font is None:
+                    self._font = self.add(
+                        "DRAUGHTING_PRE_DEFINED_CURVE_FONT('continuous')"
+                    )
+                styles.append(
+                    self.add(
+                        "CURVE_STYLE('',#%d,POSITIVE_LENGTH_MEASURE(%s),#%d)"
+                        % (self._font, real(width), col)
+                    )
+                )
+            if kind in ("surface", "both"):
+                fill = self.add(f"FILL_AREA_STYLE_COLOUR('',#{col})")
+                area = self.add(f"FILL_AREA_STYLE('',(#{fill}))")
+                fill_style = self.add(f"SURFACE_STYLE_FILL_AREA(#{area})")
+                side = self.add(f"SURFACE_SIDE_STYLE('',(#{fill_style}))")
+                styles.append(self.add(f"SURFACE_STYLE_USAGE(.BOTH.,#{side})"))
+            assignment = self.add(f"PRESENTATION_STYLE_ASSIGNMENT({refs(styles)})")
+            for item in members:
+                self._styles.append(
+                    self.add(f"STYLED_ITEM('colour',(#{assignment}),#{item})")
+                )
 
     # ---------------------------------------------------------------- output
 
