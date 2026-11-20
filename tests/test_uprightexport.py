@@ -22,6 +22,7 @@ Run directly::
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -173,17 +174,37 @@ def test_transforms_json_points_at_the_copies():
 
 
 def test_blender_points_at_the_copies():
+    """Asked of the filesystem, not of the spelling.
+
+    The first version of this compared the path in the script against one built
+    here, after juggling separators by hand. It passed on the machine it was
+    written on and failed on the hosted Windows runner, whose temporary
+    directory is the 8.3 short name ``C:\\Users\\RUNNER~1\\...``: ``resolve()``
+    expands that and the script's own string does not, so two names for one
+    file compared unequal. ``samefile`` asks the filesystem which file is
+    meant, which is the question, and is indifferent to short names, case and
+    separators alike.
+    """
     project, out = solved_project("rotated")
     export.export_blender(project, out / "import_cameras.py", out / "images")
+    # checked before samefile is asked anything, so that "no copies at all"
+    # reads as a failed assertion rather than as FileNotFoundError from the
+    # comparison below
+    assert (out / "images").is_dir(), "no upright copies were written at all"
     text = (out / "import_cameras.py").read_text(encoding="utf-8")
-    for im in project.images:
-        if im.R is None:
-            continue
-        copy = out / "images" / Path(im.path).name
-        assert copy.resolve().as_posix().replace("/", "\\") in text.replace("\\\\", "\\") or (
-            copy.resolve().as_posix() in text.replace("\\\\", "/")
-        ), f"the script does not reference the upright {copy.name}"
-        assert f'"{(out / im.path).resolve().as_posix()}"' not in text.replace("\\\\", "/"), (
+    # the template embeds these as JSON, so let JSON unescape them
+    quoted = re.findall(r'"image":\s*("(?:[^"\\]|\\.)*")', text)
+    named = [Path(json.loads(q)) for q in quoted]
+    live = [im for im in project.images if im.R is not None]
+    assert len(named) == len(live), f"{len(named)} images named, {len(live)} solved"
+
+    for im, used in zip(live, named):
+        assert used.exists(), f"the script names {used}, which is not there"
+        assert used.name == Path(im.path).name, (used, im.path)
+        assert used.parent.samefile(out / "images"), (
+            f"the script points at {used.parent}, not at the upright copies"
+        )
+        assert not used.parent.samefile((out / im.path).parent), (
             "the script still points at the rotated original"
         )
 
