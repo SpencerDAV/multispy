@@ -114,6 +114,23 @@ class CameraGroup:
     f: float | None = None
     cx: float | None = None
     cy: float | None = None
+    pp_frame: list[int] | None = None
+    """Image size ``cx``/``cy`` were measured in, as ``[width, height]``.
+
+    A group shares one focal length because every photograph in it was taken
+    through the same lens at the same zoom. It cannot share one principal point
+    *in pixels* on the same reasoning: turn the phone on its side and the centre
+    of the frame moves from (2000, 924) to (924, 2000), while the lens has not
+    changed at all. Absolute pixels with no record of the frame they were read
+    in are therefore ambiguous, and the ambiguity is not harmless -- applied to
+    the wrong orientation they put the principal point a thousand pixels outside
+    the picture, which is a large, quiet error that no residual names.
+
+    So the frame is recorded alongside, and :meth:`principal_point_for` hands
+    back the plain image centre for any photograph this was not measured in.
+    ``None`` means either that no principal point was ever solved, or that the
+    project predates this field -- see :func:`repair_principal_points`."""
+
     k1: float = 0.0
     lock_focal: bool = False
     lock_principal_point: bool = True
@@ -125,6 +142,30 @@ class CameraGroup:
     Written by the importer so a later import of the same lens lands in this
     group rather than starting a second one for it. Advisory only: nothing in
     the solve reads it, and clearing it costs nothing but the matching."""
+
+    def principal_point_for(self, width: int, height: int) -> tuple[float, float]:
+        """Where this group's principal point falls in an image of this size.
+
+        The image centre unless this group carries a principal point that was
+        measured in a frame of exactly these dimensions. Deliberately not
+        rotated into another orientation: a real principal point sits within a
+        percent or so of the centre, the rotation that would carry it there is
+        not recorded anywhere (EXIF orientation 6 and 8 turn opposite ways and
+        the file may be long gone), and guessing it wrong costs more than
+        ignoring an offset of a few pixels. See :attr:`pp_frame`.
+        """
+        centre = (width / 2.0, height / 2.0)
+        if self.cx is None or self.cy is None:
+            return centre
+        if self.pp_frame is not None and tuple(self.pp_frame) != (width, height):
+            return centre
+        if not (0.0 <= self.cx <= width and 0.0 <= self.cy <= height):
+            # No frame recorded and it does not even land on the picture. This
+            # is the legacy case repair_principal_points exists to clean up;
+            # refusing it here too means a project read by some other path
+            # still cannot be solved with a principal point off the sensor.
+            return centre
+        return (float(self.cx), float(self.cy))
 
 
 @dataclass
@@ -888,6 +929,15 @@ class Project:
     data it was measured on so a later edit shows as stale instead of silently
     describing a project that no longer exists."""
     path: Path | None = None
+    load_notes: list[str] = field(default_factory=list)
+    """Repairs made while reading the file, for the next solve to pass on.
+
+    Not saved: by the time the project is written again the repair is in the
+    file itself and there is nothing left to report. Kept because the repairs
+    happen in :meth:`from_dict`, which has no report to write to and no user
+    watching, and silently correcting someone's intrinsics is exactly the habit
+    that produced the fault being corrected -- see
+    :func:`repair_principal_points`."""
 
     # ---------------------------------------------------------------- lookups
 
@@ -1635,6 +1685,7 @@ class Project:
             path=path,
         )
         project.pin_part()
+        project.load_notes = repair_principal_points(project)
         return project
 
     def save(self, path: str | Path | None = None) -> Path:
@@ -1654,3 +1705,67 @@ class Project:
     def load(cls, path: str | Path) -> "Project":
         path = Path(path)
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")), path=path)
+
+
+def repair_principal_points(project: "Project") -> list[str]:
+    """Work out which frame each group's principal point was measured in.
+
+    Projects written before :attr:`CameraGroup.pp_frame` existed carry a
+    principal point in bare pixels, and some of them carry one nobody ever
+    asked for: until this was fixed the bundle wrote ``cx``/``cy`` back to the
+    group on every solve, locked or not, having seeded them from whichever
+    photograph happened to come first in the group. On a group holding both
+    portrait and landscape shots of the same phone that is a coin toss, and the
+    losing half were then solved with their principal point a thousand pixels
+    off the sensor -- a large error that produces no residual of its own,
+    because every control line and every mark simply bends around it.
+
+    So: adopt the frame if exactly one of the group's own image sizes can
+    account for the stored point, and drop the point if none can. One size
+    accounting for it is the normal case, since a principal point sits within a
+    percent or two of the centre and the sizes in a group differ by far more
+    than that. Where several sizes would fit, the point is near enough to all
+    their centres to be worth little either way, so the centre is taken and
+    nothing is lost.
+
+    Returns one line per group changed, for whoever wants to tell the user.
+    """
+    notes: list[str] = []
+    for gid, group in sorted(project.groups.items()):
+        if group.cx is None or group.cy is None or group.pp_frame is not None:
+            continue
+        sizes = {(im.width, im.height) for im in project.images if im.group == gid}
+        if not sizes:
+            continue
+        # "Accounts for it" means the point lands where a principal point can:
+        # within a tenth of the frame of its centre. Generous against real
+        # manufacturing offsets (a percent or two) and still nowhere near
+        # admitting the centre of a differently shaped frame.
+        fits = [
+            (w, h)
+            for (w, h) in sizes
+            if abs(group.cx - w / 2.0) <= 0.1 * w and abs(group.cy - h / 2.0) <= 0.1 * h
+        ]
+        if len(fits) == 1:
+            group.pp_frame = [int(fits[0][0]), int(fits[0][1])]
+            if len(sizes) > 1:
+                notes.append(
+                    f"camera group {gid}: its principal point ({group.cx:.0f}, {group.cy:.0f}) "
+                    f"can only have been measured in the {fits[0][0]}x{fits[0][1]} photographs, "
+                    "so the others in the group now use their own centre."
+                )
+            continue
+        group.cx = group.cy = None
+        if len(fits) > 1:
+            notes.append(
+                f"camera group {gid}: its principal point sat near the centre of several of "
+                "these frames at once, which tells us nothing, so it has been cleared."
+            )
+        else:
+            shapes = ", ".join(f"{w}x{h}" for w, h in sorted(sizes))
+            notes.append(
+                f"camera group {gid}: its stored principal point was not near the centre of any "
+                f"photograph in it ({shapes}), so it was never measured -- an older version of "
+                "this tool wrote it there. Cleared; each photograph now uses its own centre."
+            )
+    return notes

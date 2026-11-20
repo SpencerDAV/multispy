@@ -417,10 +417,11 @@ def calibrate_all(project: Project, report: SolveReport) -> dict[str, Intrinsics
         if im.id not in per_image:
             continue
         group = project.group_of(im)
+        cx, cy = group.principal_point_for(im.width, im.height)
         cam = Intrinsics(
             f=group.f if group.f is not None else per_image[im.id].f,
-            cx=group.cx if group.cx is not None else im.width / 2.0,
-            cy=group.cy if group.cy is not None else im.height / 2.0,
+            cx=cx,
+            cy=cy,
             k1=group.k1,
         )
         try:
@@ -1165,7 +1166,7 @@ def _triangulate_plane_corners(
         R, t = poses[iid]
         cameras[iid] = SolvedCamera(
             iid=iid, R=R, t=np.asarray(t, dtype=float),
-            cam=cams[problem.group_of_image[iid]],
+            cam=problem.cam_for(cams, iid),
             width=im.width, height=im.height,
         )
 
@@ -1371,7 +1372,7 @@ def place_muted_instances(
             iid=iid,
             R=R,
             t=np.asarray(t, dtype=float),
-            cam=cams[problem.group_of_image[iid]],
+            cam=problem.cam_for(cams, iid),
             width=im.width,
             height=im.height,
         )
@@ -1721,13 +1722,31 @@ class _Problem:
         self.off_images = 0
         cursor = 6 * self.n_img
         self.group_slots: dict[str, dict[str, int]] = {}
+        self.setup_notes: list[str] = []
         for gid in self.group_ids:
             g = project.groups[gid]
             slots: dict[str, int] = {}
             if self.s.refine_focal and not g.lock_focal:
                 slots["f"] = cursor
                 cursor += 1
-            if not g.lock_principal_point:
+            frames = {
+                (project.image(i).width, project.image(i).height)
+                for i in image_ids
+                if self.group_of_image[i] == gid
+            }
+            if not g.lock_principal_point and len(frames) > 1:
+                # One shared principal point in pixels cannot describe frames of
+                # different shapes -- (2000, 924) and (924, 2000) are the same
+                # point on the sensor and different points in the picture. The
+                # focal length is still shared, which is the part worth sharing.
+                shapes = ", ".join(f"{w}x{h}" for w, h in sorted(frames))
+                self.setup_notes.append(
+                    f"camera group {gid} holds photographs of more than one size ({shapes}), so "
+                    "its principal point cannot be solved as one shared pair of pixel "
+                    "coordinates; each photograph keeps its own centre. Split the group by "
+                    "orientation if you need the principal point refined."
+                )
+            elif not g.lock_principal_point:
                 slots["cx"] = cursor
                 slots["cy"] = cursor + 1
                 cursor += 2
@@ -1761,16 +1780,30 @@ class _Problem:
         }
         self.n_params = cursor
 
+        # ---- where the principal point falls in each image
+        #
+        # Per image, not per group, and that is not a refinement: a group is a
+        # promise about the lens, and the lens does not move when the phone is
+        # turned on its side, but the centre of the frame does. Asking the
+        # group for one principal point in pixels and handing it to every
+        # member used to put it a thousand pixels outside the portrait shots of
+        # a mixed set. See CameraGroup.principal_point_for.
+        self.image_pp: dict[str, tuple[float, float]] = {}
+        for iid in image_ids:
+            im = project.image(iid)
+            g = project.groups[self.group_of_image[iid]]
+            self.image_pp[iid] = g.principal_point_for(im.width, im.height)
+
         # ---- fixed values for whatever is locked
         self.fixed: dict[str, Intrinsics] = {}
         for gid in self.group_ids:
             g = project.groups[gid]
             any_img = next(i for i in image_ids if self.group_of_image[i] == gid)
-            im = project.image(any_img)
+            cx, cy = self.image_pp[any_img]
             self.fixed[gid] = Intrinsics(
                 f=g.f if g.f is not None else intrinsics[any_img].f,
-                cx=g.cx if g.cx is not None else im.width / 2.0,
-                cy=g.cy if g.cy is not None else im.height / 2.0,
+                cx=cx,
+                cy=cy,
                 k1=g.k1,
             )
 
@@ -2030,7 +2063,7 @@ class _Problem:
                 im = self.project.image(iid)
                 if im.R is None:
                     continue
-                n = plane_normal(im.R, self.fixed[self.group_of_image[iid]].K(), line)
+                n = plane_normal(im.R, self._baseline_cam(iid).K(), line)
                 if n is not None:
                     normals.append(n)
             d0, sine, _pair = initial_direction(normals)
@@ -2136,6 +2169,32 @@ class _Problem:
             k1=x[slots["k1"]] if "k1" in slots else base.k1,
         )
 
+    def _baseline_cam(self, iid: str) -> Intrinsics:
+        """One image's pre-solve intrinsics, for setup that runs before packing."""
+        base = self.fixed[self.group_of_image[iid]]
+        cx, cy = self.image_pp[iid]
+        return Intrinsics(f=base.f, cx=cx, cy=cy, k1=base.k1)
+
+    def cam_for(self, cams: dict[str, Intrinsics], iid: str) -> Intrinsics:
+        """One image's intrinsics: its group's, with its own principal point.
+
+        Focal length and distortion are shared outright -- that is what a camera
+        group is for. The principal point is shared only when the group's
+        photographs are all the same size, which is the only case where sharing
+        it in pixels means anything; where they are not, ``image_pp`` has each
+        image's own centre and the slot was never allocated. Always go through
+        here rather than indexing ``cams`` directly, or a mixed-orientation
+        group silently projects half its images about the wrong centre.
+        """
+        gid = self.group_of_image[iid]
+        cam = cams[gid]
+        if "cx" in self.group_slots[gid]:
+            return cam
+        cx, cy = self.image_pp[iid]
+        if cam.cx == cx and cam.cy == cy:
+            return cam
+        return Intrinsics(f=cam.f, cx=cx, cy=cy, k1=cam.k1)
+
     def unpack(self, x: np.ndarray) -> tuple[dict, dict, np.ndarray, dict]:
         poses = {}
         for iid in self.image_ids:
@@ -2177,7 +2236,7 @@ class _Problem:
         depth_cursor = self.o_depth
         for (iid, idx, uv), w in zip(self.obs, self.obs_weight):
             R, t = poses[iid]
-            cam = cams[self.group_of_image[iid]]
+            cam = self.cam_for(cams, iid)
             pix, z = self._project_block(X[idx], R, t, cam)
             n = len(idx)
             out[cursor : cursor + 2 * n : 2] = w * (pix[:, 0] - uv[:, 0]) / sp
@@ -2198,7 +2257,7 @@ class _Problem:
         for (iid, inst_id, local, uv, _keys), w in zip(self.anchor_blocks, self.anchor_weight):
             R, t = poses[iid]
             R_obj, t_obj = objects[inst_id]
-            cam = cams[self.group_of_image[iid]]
+            cam = self.cam_for(cams, iid)
             pix, z = self._project_block(local @ R_obj.T + t_obj, R, t, cam)
             n = len(uv)
             # this body's own sigma, not the tie-point one: looser to begin with,
@@ -2218,7 +2277,7 @@ class _Problem:
         cursor = self.o_lines
         for (iid, axis, line, L, _ln), w in zip(self.lines, self.line_weight):
             R, _ = poses[iid]
-            cam = cams[self.group_of_image[iid]]
+            cam = self.cam_for(cams, iid)
             nrm = cam.K().T @ line
             nn = np.linalg.norm(nrm)
             if nn < 1e-12:
@@ -2243,7 +2302,7 @@ class _Problem:
         dirs = self.directions_at(x)
         for (iid, gid, line, L, _ln), w in zip(self.dir_lines, self.dir_line_weight):
             R, _ = poses[iid]
-            cam = cams[self.group_of_image[iid]]
+            cam = self.cam_for(cams, iid)
             nrm = cam.K().T @ line
             nn = np.linalg.norm(nrm)
             if nn < 1e-12:
@@ -2463,7 +2522,19 @@ class _Problem:
             im.R, im.t = poses[iid]
         for gid, cam in cams.items():
             g = self.project.groups[gid]
-            g.f, g.cx, g.cy, g.k1 = cam.f, cam.cx, cam.cy, cam.k1
+            g.f, g.k1 = cam.f, cam.k1
+            # The principal point is saved only when it was actually solved.
+            # Writing it unconditionally is what poisoned mixed-orientation
+            # projects: the value being written back was never measured, it was
+            # seeded from whichever image came first in the group, and once in
+            # the file it was applied to every photograph in it from then on.
+            # A locked parameter has nothing to report.
+            if "cx" in self.group_slots[gid]:
+                g.cx, g.cy = cam.cx, cam.cy
+                im = self.project.image(
+                    next(i for i in self.image_ids if self.group_of_image[i] == gid)
+                )
+                g.pp_frame = [im.width, im.height]
             # keep the locked-parameter baseline in step, or a later pack() would
             # reload pre-solve intrinsics over the refined ones
             self.fixed[gid] = cam.copy()
@@ -2493,7 +2564,7 @@ def _line_errors(problem: _Problem, x: np.ndarray) -> np.ndarray:
     out = np.zeros(len(problem.lines))
     for i, (iid, axis, line, L, _ln) in enumerate(problem.lines):
         R, _t = poses[iid]
-        nrm = cams[problem.group_of_image[iid]].K().T @ line
+        nrm = problem.cam_for(cams, iid).K().T @ line
         nn = np.linalg.norm(nrm)
         out[i] = 0.0 if nn < 1e-12 else abs((L / 2.0) * float((nrm / nn) @ R[:, axis]))
     return out
@@ -2511,7 +2582,7 @@ def _dir_line_errors(problem: _Problem, x: np.ndarray) -> np.ndarray:
     out = np.zeros(len(problem.dir_lines))
     for i, (iid, gid, line, L, _ln) in enumerate(problem.dir_lines):
         R, _t = poses[iid]
-        nrm = cams[problem.group_of_image[iid]].K().T @ line
+        nrm = problem.cam_for(cams, iid).K().T @ line
         nn = np.linalg.norm(nrm)
         out[i] = 0.0 if nn < 1e-12 else abs((L / 2.0) * float((nrm / nn) @ (R @ dirs[gid])))
     return out
@@ -2532,7 +2603,7 @@ def _observation_errors(
     point_errs = []
     for iid, idx, uv in problem.obs:
         R, t = poses[iid]
-        pix, _z = problem._project_block(X[idx], R, t, cams[problem.group_of_image[iid]])
+        pix, _z = problem._project_block(X[idx], R, t, problem.cam_for(cams, iid))
         point_errs.append(np.linalg.norm(pix - uv, axis=1))
 
     anchor_errs = []
@@ -2540,7 +2611,7 @@ def _observation_errors(
         R, t = poses[iid]
         R_obj, t_obj = objects[inst_id]
         pix, _z = problem._project_block(
-            local @ R_obj.T + t_obj, R, t, cams[problem.group_of_image[iid]]
+            local @ R_obj.T + t_obj, R, t, problem.cam_for(cams, iid)
         )
         anchor_errs.append(np.linalg.norm(pix - uv, axis=1))
 
@@ -2910,6 +2981,7 @@ def bundle_adjust(
     initialisation rather than towards any round's mistakes.
     """
     problem = _Problem(project, intrinsics, image_ids, point_ids)
+    report.warnings.extend(problem.setup_notes)
     x = problem.pack()
     s = project.settings
 
@@ -3159,7 +3231,7 @@ def _fill_statistics(
 
     for (iid, idx, uv), w in zip(problem.obs, problem.obs_weight):
         R, t = poses[iid]
-        cam = cams[problem.group_of_image[iid]]
+        cam = problem.cam_for(cams, iid)
         proj = project_points(R, t, cam, X[idx])
         for pid, observed, reprojected, keep in zip(problem.obs_pids[iid], uv, proj, w > 0):
             err = record(iid, pid, observed, reprojected, bool(keep))
@@ -3168,7 +3240,7 @@ def _fill_statistics(
 
     for (iid, inst_id, local, uv, keys), w in zip(problem.anchor_blocks, problem.anchor_weight):
         R, t = poses[iid]
-        cam = cams[problem.group_of_image[iid]]
+        cam = problem.cam_for(cams, iid)
         R_obj, t_obj = objects[inst_id]
         proj = project_points(R, t, cam, local @ R_obj.T + t_obj)
         for key, observed, reprojected, keep in zip(keys, uv, proj, w > 0):
@@ -3179,7 +3251,7 @@ def _fill_statistics(
     for iid in problem.image_ids:
         rep = report.images.setdefault(iid, ImageReport(id=iid))
         rep.positioned = True
-        rep.focal_px = cams[problem.group_of_image[iid]].f
+        rep.focal_px = problem.cam_for(cams, iid).f
         entries = per_image.get(iid, [])
         rep.n_observations = len(entries)
         if entries:
@@ -3203,7 +3275,7 @@ def _fill_statistics(
     per_image_lines: dict[str, list[float]] = {}
     for (iid, axis, line, L, _ln), w in zip(problem.lines, problem.line_weight):
         R, _ = poses[iid]
-        cam = cams[problem.group_of_image[iid]]
+        cam = problem.cam_for(cams, iid)
         nrm = cam.K().T @ line
         nn = np.linalg.norm(nrm)
         if nn < 1e-12:
@@ -3557,6 +3629,9 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     project.pin_part()
 
     report.stage = "checking the camera groups"
+    # Repairs made when the file was read. Said here rather than swallowed,
+    # because they change the intrinsics the answer is built on.
+    report.warnings.extend(project.load_notes)
     _check_camera_groups(project, report)
 
     report.stage = "calibrating images from control lines"

@@ -61,6 +61,24 @@ FULL_FRAME_DIAGONAL_MM = math.hypot(FULL_FRAME_WIDTH_MM, FULL_FRAME_HEIGHT_MM)
 # how far the current aspect ratio may drift from EXIF's before it is a crop
 ASPECT_TOLERANCE = 0.02
 
+NATIVE_ASPECTS = (4.0 / 3.0, 3.0 / 2.0)
+"""Long-to-short ratios that a stills sensor is actually built in.
+
+Everything else a camera offers -- 16:9, 1:1, the 19.5:9 a phone calls "Full"
+-- is the same sensor with rows or columns thrown away before the file is
+written. That matters here because ``FocalLengthIn35mmFilm`` describes the
+lens against the *whole* sensor and does not change when the capture is
+cropped, so converting it against the cropped frame's diagonal quietly
+shrinks the focal length. See :func:`native_frame_px`."""
+
+NATIVE_ASPECT_ASSUMED = 4.0 / 3.0
+"""What an off-ratio frame is assumed to have been cropped from.
+
+Nearly every phone and compact is 4:3; the cameras that are not are mostly
+3:2, and guessing 4:3 for a 3:2 body overstates the reconstructed diagonal by
+about 4%. That is worth accepting, because the error being fixed is three
+times larger and in the same direction for every frame."""
+
 
 @dataclass
 class ExifFocal:
@@ -75,6 +93,10 @@ class ExifFocal:
     rotated: bool = False
     """The file is stored one way round and handed to us the other. Harmless --
     the diagonal does not care -- but worth saying so it is not read as a crop."""
+    native_frame_px: tuple[float, float] | None = None
+    """The uncropped frame ``focal_px`` was computed against, when the capture
+    was at a cropped aspect ratio. ``None`` when the frame is its sensor's own
+    shape and nothing had to be reconstructed. See :func:`native_frame_px`."""
     make: str = ""
     model: str = ""
     note: str = ""
@@ -197,13 +219,32 @@ def read_focal(path: str | Path, width_px: int, height_px: int, image_id: str = 
             cropped = True
 
     if out.focal_35mm is not None:
-        out.focal_px = out.focal_35mm * diag_px / FULL_FRAME_DIAGONAL_MM
+        # Against the whole sensor, not against what the aspect setting kept of
+        # it: the 35mm equivalent describes the lens and does not shrink when
+        # the capture is cropped.
+        native = native_frame_px(width_px, height_px)
+        out.native_frame_px = native
+        out.focal_px = focal_px_from_35mm(out.focal_35mm, width_px, height_px)
         out.source = "35mm equivalent"
         out.confidence = "approximate"
         out.note = (
             f"{out.focal_35mm:.0f} mm equivalent; EXIF usually rounds this to a whole "
             f"millimetre, so treat it as a few percent"
         )
+        if native:
+            # Still "approximate", not "none": a reconstruction resting on a
+            # 4:3 sensor is a few percent of guesswork, where converting
+            # against the crop was 12% of plain error. Marking it unusable
+            # would also take the mixed-lens check down with it, and that check
+            # is the one that catches a group holding two cameras.
+            out.note += (
+                f". No sensor is built {width_px}x{height_px}, so this was captured at a "
+                f"cropped aspect ratio; the equivalent still describes the whole sensor, so it "
+                f"is converted against the {native[0]:.0f}x{native[1]:.0f} a 4:3 sensor would "
+                f"have given ({out.focal_px:.0f} px, against "
+                f"{out.focal_35mm * diag_px / FULL_FRAME_DIAGONAL_MM:.0f} px off the cropped "
+                f"diagonal). Believe the control lines over this"
+            )
     elif out.focal_mm is not None and out.sensor_diag_mm is not None:
         out.focal_px = out.focal_mm * diag_px / out.sensor_diag_mm
         out.source = "focal plane resolution"
@@ -239,13 +280,62 @@ def focal_px_from_mm(focal_mm: float, sensor_diag_mm_: float, width_px: int, hei
     return focal_mm * math.hypot(width_px, height_px) / sensor_diag_mm_
 
 
+def native_frame_px(width_px: int, height_px: int) -> tuple[float, float] | None:
+    """The frame this one was cropped out of, in pixels, or ``None`` if it wasn't.
+
+    A 35mm equivalent is a statement about the lens on its own sensor, and a
+    camera set to 16:9 or 19.5:9 still reports the same number it reports at
+    4:3 -- the lens has not changed, only how much of the sensor is kept. So
+    the conversion to pixels has to be done against the frame the equivalence
+    was stated for, not against what survived the crop. Done against the crop,
+    a 4000x1848 photograph off a 4:3 sensor comes out 12% short, which is
+    enough to drag a whole solve and nothing in it looks wrong.
+
+    Phone and camera aspect settings crop the long dimension's neighbours --
+    they keep the full sensor width and discard rows -- so the reconstruction
+    keeps the long side and restores the short one. A frame already at a ratio
+    a sensor is built in is returned as ``None``: there is nothing to undo, and
+    guessing otherwise would spoil the ordinary case to fix the odd one.
+    """
+    long_side, short_side = float(max(width_px, height_px)), float(min(width_px, height_px))
+    if not long_side or not short_side:
+        return None
+    ratio = long_side / short_side
+    if any(abs(ratio - a) <= ASPECT_TOLERANCE * a for a in NATIVE_ASPECTS):
+        return None
+    if ratio < min(NATIVE_ASPECTS):
+        # Taller than any sensor is built, e.g. a 1:1 capture. That crop takes
+        # columns rather than rows, so it is the short side that survived.
+        return (short_side * NATIVE_ASPECT_ASSUMED, short_side)
+    return (long_side, long_side / NATIVE_ASPECT_ASSUMED)
+
+
 def focal_px_from_35mm(focal_35mm: float, width_px: int, height_px: int) -> float:
-    return focal_35mm * math.hypot(width_px, height_px) / FULL_FRAME_DIAGONAL_MM
+    """Focal length in pixels, from the 35mm equivalent.
+
+    Against the whole sensor, via :func:`native_frame_px`, because that is what
+    the equivalent describes -- a frame captured at a cropped aspect ratio is
+    converted as though the rows the camera threw away were still there. For a
+    frame already its sensor's own shape this is the plain diagonal ratio it
+    always was.
+    """
+    native = native_frame_px(width_px, height_px)
+    diag = math.hypot(*native) if native else math.hypot(width_px, height_px)
+    return focal_35mm * diag / FULL_FRAME_DIAGONAL_MM
 
 
 def focal_px_to_35mm(focal_px: float, width_px: int, height_px: int) -> float:
-    """Inverse, for showing a pixel focal length in units people recognise."""
-    return focal_px * FULL_FRAME_DIAGONAL_MM / math.hypot(width_px, height_px)
+    """Inverse, for showing a pixel focal length in units people recognise.
+
+    Referred to the whole sensor, like the number a camera writes into EXIF, so
+    that a frame captured at a cropped aspect ratio reads back as the same
+    equivalent the camera claims rather than a longer one. Without this, a 13 mm
+    ultra-wide shot at 19.5:9 comes back as "15 mm" and looks like a different
+    lens from the one it is.
+    """
+    native = native_frame_px(width_px, height_px)
+    ref_diag = math.hypot(*native) if native else math.hypot(width_px, height_px)
+    return focal_px * FULL_FRAME_DIAGONAL_MM / ref_diag
 
 
 @dataclass

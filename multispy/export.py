@@ -141,10 +141,11 @@ def _instance_rows(project: Project) -> list[dict]:
 
 def _intrinsics_for(project: Project, image) -> Intrinsics:
     g = project.group_of(image)
+    cx, cy = g.principal_point_for(image.width, image.height)
     return Intrinsics(
         f=g.f if g.f is not None else max(image.width, image.height),
-        cx=g.cx if g.cx is not None else image.width / 2.0,
-        cy=g.cy if g.cy is not None else image.height / 2.0,
+        cx=cx,
+        cy=cy,
         k1=g.k1,
     )
 

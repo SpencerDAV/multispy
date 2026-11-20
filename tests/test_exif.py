@@ -213,6 +213,125 @@ def test_group_agrees_when_it_should():
     assert abs(g.focal_px - expected_px(28, 4000, 3000)) < 1.0
 
 
+# ------------------------------------------------- captured at a cropped ratio
+#
+# A crop made after the fact is detectable and refused (test_crop_is_refused):
+# EXIF still records the dimensions the camera wrote, and they disagree with
+# the file. A crop made *at capture* -- the phone set to 16:9 or to the 19.5:9
+# it calls "Full" -- leaves no such trace, because the camera writes the
+# cropped dimensions into EXIF too. What it does not do is change
+# FocalLengthIn35mmFilm, which describes the lens against the whole sensor. So
+# the only signal is the shape of the frame itself: no sensor is built 19.5:9.
+
+
+def test_a_nineteen_point_five_by_nine_capture_is_reconstructed():
+    """Galaxy S24+ ultra-wide, 4000x1848, EXIF says 13 mm equivalent.
+
+    Against the cropped diagonal this reads 1324 px. The photographs' own
+    control lines put it near 1625, and locking the 1324 drove reprojection to
+    64 px where the reconstructed figure managed 1.4 -- the error is large
+    enough to wreck a solve and leaves nothing behind that looks like a cause.
+    """
+    p = make_image("full_ratio.jpg", 4000, 1848, {X.TAG_FOCAL_35MM: 13},
+                   exif_dims=(4000, 1848))
+    r = X.read_focal(p, 4000, 1848)
+    assert r.native_frame_px == (4000.0, 3000.0), r.native_frame_px
+    assert abs(r.focal_px - expected_px(13, 4000, 3000)) < 1.0, r.focal_px
+    assert abs(r.focal_px - 1502.3) < 1.0, r.focal_px
+    cropped_diagonal = expected_px(13, 4000, 1848)
+    assert abs(cropped_diagonal - 1323.9) < 1.0, cropped_diagonal
+    assert r.focal_px > cropped_diagonal * 1.12
+
+
+def test_a_reconstructed_focal_is_still_usable():
+    """It must not be marked unusable: the mixed-lens check reads these.
+
+    Downgrading the confidence to "none" would take summarise_group's
+    two-cameras-in-one-group warning down with it, which is the check that
+    catches a phone's wide and main lenses sharing a camera group.
+    """
+    p = make_image("usable.jpg", 4000, 1848, {X.TAG_FOCAL_35MM: 13},
+                   exif_dims=(4000, 1848))
+    r = X.read_focal(p, 4000, 1848)
+    assert r.confidence == "approximate", r.confidence
+    assert "cropped aspect ratio" in r.note, r.note
+    assert "control lines" in r.note, r.note
+
+
+def test_the_reconstruction_survives_rotation():
+    """Held upright, the same capture must give the same focal length."""
+    land = X.read_focal(
+        make_image("land.jpg", 4000, 1848, {X.TAG_FOCAL_35MM: 13}, exif_dims=(4000, 1848)),
+        4000, 1848)
+    port = X.read_focal(
+        make_image("port.jpg", 4000, 1848, {X.TAG_FOCAL_35MM: 13}, exif_dims=(4000, 1848)),
+        1848, 4000)
+    assert abs(land.focal_px - port.focal_px) < 1e-6, (land.focal_px, port.focal_px)
+
+
+def test_a_square_capture_keeps_its_short_side():
+    """1:1 throws away columns, so it is the height that survived."""
+    assert X.native_frame_px(3000, 3000) == (4000.0, 3000.0)
+
+
+def test_native_shapes_are_left_alone():
+    """The ordinary case must not move: 4:3 and 3:2 are what sensors are."""
+    for w, h in ((4000, 3000), (3000, 4000), (6000, 4000), (4000, 6000)):
+        assert X.native_frame_px(w, h) is None, (w, h)
+        r = X.read_focal(
+            make_image(f"n{w}x{h}.jpg", w, h, {X.TAG_FOCAL_35MM: 24}), w, h)
+        assert abs(r.focal_px - expected_px(24, w, h)) < 0.01, (w, h, r.focal_px)
+        assert r.native_frame_px is None
+        assert "cropped aspect ratio" not in r.note
+
+
+def test_sixteen_nine_is_a_crop_too():
+    """No stills sensor is 16:9 either; a phone shooting it is cropping 4:3."""
+    assert X.native_frame_px(1920, 1080) == (1920.0, 1440.0)
+
+
+def test_the_focal_plane_route_is_untouched():
+    """Sensor dimensions read off the focal-plane tags already describe the crop.
+
+    Those tags give the sensor extent the output image actually covers, so a
+    cropped capture is already accounted for and reconstructing would double
+    it. Only the 35mm-equivalent route needs the correction.
+    """
+    res_per_inch = 4000 / (36.0 / 25.4)
+    p = make_image("fp_crop.jpg", 4000, 1848, {
+        X.TAG_FOCAL_LENGTH: 50.0,
+        X.TAG_FOCAL_PLANE_X_RES: res_per_inch,
+        X.TAG_FOCAL_PLANE_Y_RES: res_per_inch,
+        X.TAG_FOCAL_PLANE_UNIT: 2,
+    }, exif_dims=(4000, 1848))
+    r = X.read_focal(p, 4000, 1848)
+    assert r.source == "focal plane resolution", r.source
+    assert r.native_frame_px is None, r.native_frame_px
+    assert abs(r.focal_px - 50.0 * hypot(4000, 1848) / r.sensor_diag_mm) < 0.01
+
+
+def test_a_cropped_group_still_shows_two_lenses():
+    """The whole point of keeping these usable: the mixed-lens check works.
+
+    Seven ultra-wide frames and two off the main camera, all 4000x1848, which
+    is how the Alberto set arrived.
+    """
+    from multispy.project import CameraGroup, ImageView, Project
+
+    project = Project(name="alberto-ish", path=TMP / "mixed.multispy")
+    project.groups["cam0"] = CameraGroup(id="cam0")
+    for i, f35 in enumerate((13, 13, 13, 13, 13, 13, 13, 23, 23)):
+        img = make_image(f"m{i}.jpg", 4000, 1848, {X.TAG_FOCAL_35MM: f35},
+                         exif_dims=(4000, 1848))
+        project.images.append(ImageView(id=f"img{i}", path=str(img), width=4000,
+                                        height=1848, group="cam0"))
+    g = X.summarise_group(project, "cam0")
+    assert g.n_with_focal == 9, g.n_with_focal
+    assert g.confidence == "none", g.note
+    assert "separate camera groups" in g.note, g.note
+
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

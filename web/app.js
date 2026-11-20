@@ -4251,9 +4251,33 @@ function renderDirGroupPanel() {
 /* 35mm equivalence is a diagonal field of view, so it converts through the
  * diagonal. Dividing by the 36 mm film width instead only agrees when the image
  * is 3:2 like the film frame -- a 4:3 photo reads 3.8% low and a 16:9 frame
- * 4.8% high. Mirrors focal_px_from_35mm / focal_px_to_35mm in exif.py. */
+ * 4.8% high. Mirrors focal_px_from_35mm / focal_px_to_35mm in exif.py.
+ *
+ * The diagonal of the whole sensor, not of what an aspect-ratio setting kept
+ * of it: the equivalent describes the lens and does not shrink when the
+ * capture is cropped, so a 4000x1848 frame off a 4:3 sensor has to be
+ * converted as though its missing rows were there. Mirrors native_frame_px. */
 const FULL_FRAME_DIAGONAL_MM = Math.hypot(36, 24);
-const diagPx = (im) => Math.hypot(im.width, im.height);
+const NATIVE_ASPECTS = [4 / 3, 3 / 2];
+const NATIVE_ASPECT_ASSUMED = 4 / 3;
+
+/** The frame this one was cropped out of, or null if it is a sensor's own shape. */
+function nativeFramePx(im) {
+  const long = Math.max(im.width, im.height);
+  const short = Math.min(im.width, im.height);
+  if (!long || !short) return null;
+  const ratio = long / short;
+  if (NATIVE_ASPECTS.some((a) => Math.abs(ratio - a) <= 0.02 * a)) return null;
+  // Squarer than any sensor is built (a 1:1 capture) loses columns, not rows,
+  // so there it is the short side that survived.
+  if (ratio < Math.min(...NATIVE_ASPECTS)) return [short * NATIVE_ASPECT_ASSUMED, short];
+  return [long, long / NATIVE_ASPECT_ASSUMED];
+}
+
+const diagPx = (im) => {
+  const native = nativeFramePx(im);
+  return native ? Math.hypot(native[0], native[1]) : Math.hypot(im.width, im.height);
+};
 const pxFrom35mm = (mm, im) => mm * diagPx(im) / FULL_FRAME_DIAGONAL_MM;
 const pxTo35mm = (px, im) => px * FULL_FRAME_DIAGONAL_MM / diagPx(im);
 

@@ -215,7 +215,7 @@ def solved_digest(project: Project) -> str:
     return h.hexdigest()
 
 
-AXIS_ONLY_DIGEST = "1db384d178b527fc306af8692bd8a6840db73b76"
+AXIS_ONLY_DIGEST = "75fdfe76a927a9219a683e886a11992b172772ec"
 """``solved_digest`` of the unmodified synthetic project.
 
 A regression lock, captured from the working tree immediately *before* direction
@@ -230,6 +230,27 @@ Regenerate deliberately and never casually::
     .venv\\Scripts\\python.exe -c "import sys; sys.path[:0]=['.','tests']; \\
         from test_dirgroup import *; from test_synthetic import build_project; \\
         p,_=build_project(); solve(p); print(solved_digest(p))"
+
+Regenerated once, from ``1db384d1``, on 2026-11-20, when the bundle stopped
+writing a principal point it had never solved back into the camera group.
+``solved_digest`` hashes ``g.cx or 0.0`` next to the poses and the points, so a
+group that now keeps ``None`` where it used to be handed the image centre moves
+the hash without anything geometric having happened.
+
+That it was only the bookkeeping was checked rather than assumed: putting the
+old write-back back -- setting each group's ``cx``/``cy`` to its images' centre
+after the solve -- returns this digest to ``1db384d1`` exactly, so every pose,
+every point and the focal length are bit-identical across the change. Do not
+read that check as a reason to wave the next one through. It is the reason this
+constant moved, and the only one.
+
+**Run this file with no thread limits set.** The hash also moves with the BLAS
+thread count, which is the cross-machine fragility above reproduced in a single
+shell: on the machine this was pinned on, clean ``main`` hashed to ``1db384d1``
+at the default thread count and to ``60c6fe32`` under ``OMP_NUM_THREADS``,
+``OPENBLAS_NUM_THREADS`` or ``MKL_NUM_THREADS`` of 1, 2, 4 or 8 alike. A
+regeneration done with them set pins the constant to the wrong number, and a
+test run with them set fails for a reason that is not in the code.
 """
 
 AXIS_ONLY_FINGERPRINT = "8f93a3f84f34910e"

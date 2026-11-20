@@ -310,12 +310,8 @@ def cameras_of(project: Project) -> dict[str, _Cam]:
         g = project.groups.get(im.group)
         if g is None or g.f is None:
             continue
-        cam = Intrinsics(
-            float(g.f),
-            float(g.cx) if g.cx is not None else im.width / 2.0,
-            float(g.cy) if g.cy is not None else im.height / 2.0,
-            float(g.k1),
-        )
+        cx, cy = g.principal_point_for(im.width, im.height)
+        cam = Intrinsics(float(g.f), cx, cy, float(g.k1))
         out[im.id] = _Cam(im.id, np.asarray(im.R, float), np.asarray(im.t, float),
                           cam, int(im.width), int(im.height))
     return out

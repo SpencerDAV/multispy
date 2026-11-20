@@ -538,12 +538,8 @@ def intrinsics_for(project: Project, image: ImageView) -> Intrinsics:
     """
     group = project.group_of(image)
     f = group.f if group.f is not None else 1.2 * max(image.width, image.height)
-    return Intrinsics(
-        f=float(f),
-        cx=float(group.cx if group.cx is not None else image.width / 2.0),
-        cy=float(group.cy if group.cy is not None else image.height / 2.0),
-        k1=float(group.k1),
-    )
+    cx, cy = group.principal_point_for(image.width, image.height)
+    return Intrinsics(f=float(f), cx=cx, cy=cy, k1=float(group.k1))
 
 
 def part_vertices_world(template: ObjectTemplate, mesh: Mesh) -> np.ndarray:

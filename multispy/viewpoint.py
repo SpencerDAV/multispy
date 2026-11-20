@@ -317,8 +317,9 @@ def _in_frame(project: Project, im: ImageView, X: np.ndarray) -> bool:
     Xc = R @ np.asarray(X, dtype=float) + t
     if Xc[2] <= 1e-6:
         return False
-    x = f * Xc[0] / Xc[2] + float(g.cx)
-    y = f * Xc[1] / Xc[2] + float(g.cy)
+    cx, cy = g.principal_point_for(im.width, im.height)
+    x = f * Xc[0] / Xc[2] + cx
+    y = f * Xc[1] / Xc[2] + cy
     return 0.0 <= x < float(im.width) and 0.0 <= y < float(im.height)
 
 
