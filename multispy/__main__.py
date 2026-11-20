@@ -6,6 +6,7 @@
     python -m multispy export <project> [dir]  headless export
     python -m multispy rig <project>           print the solved object layout
     python -m multispy exif <project>          what the photos claim about focal length
+    python -m multispy regroup <project>      split the camera groups by lens and zoom
 """
 
 from __future__ import annotations
@@ -171,6 +172,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    p_regroup = sub.add_parser(
+        "regroup", help="split the camera groups by what EXIF says each photo was shot on"
+    )
+    p_regroup.add_argument("project")
+    p_regroup.add_argument(
+        "--dry-run", action="store_true", help="say what would move, change nothing"
+    )
+
     p_exif = sub.add_parser("exif", help="show what EXIF says about focal length")
     p_exif.add_argument("project")
 
@@ -178,10 +187,14 @@ def main(argv: list[str] | None = None) -> int:
     p_rig.add_argument("project")
     p_rig.add_argument("--json", action="store_true", help="dump the full payload instead")
 
-    # bare `python -m multispy [path]` means serve
-    if not argv or argv[0] not in {
-        "serve", "solve", "export", "blend", "exif", "rig", "-h", "--help",
-    }:
+    # bare `python -m multispy [path]` means serve.
+    #
+    # Taken from the subparsers rather than written out again: the literal list
+    # that used to be here had to be edited in step with every new command, and
+    # the failure when it was not is silent and baffling -- the new command's
+    # name is read as a path, `serve` is prepended, and argparse then rejects
+    # the command's own arguments as unrecognised extras on `serve`.
+    if not argv or argv[0] not in set(sub.choices) | {"-h", "--help"}:
         argv.insert(0, "serve")
 
     args = parser.parse_args(argv)
@@ -227,6 +240,35 @@ def main(argv: list[str] | None = None) -> int:
             print(exc)
             return 1
         print(f"{written}  ({written.stat().st_size / 1e6:.1f} MB)")
+        return 0
+
+    if args.command == "regroup":
+        project = Project.load(args.project)
+        before = {im.id: im.group for im in project.images}
+        moved = exif_focal.assign_camera_groups(project)
+        by_group: dict[str, list[str]] = {}
+        for im in project.images:
+            by_group.setdefault(im.group, []).append(im.id)
+        for gid in sorted(by_group):
+            g = exif_focal.summarise_group(project, gid)
+            focal = f"{g.focal_px:.0f} px" if g.focal_px else "no EXIF focal"
+            print(f"{gid}: {len(by_group[gid])} photo(s), {focal}")
+            print(f"    {' '.join(by_group[gid])}")
+        if not moved:
+            print()
+            print("nothing to move -- the grouping already matches the photographs")
+            return 0
+        print()
+        print(f"{len(moved)} photo(s) move:")
+        for iid, gid in sorted(moved.items()):
+            print(f"    {iid}: {before[iid]} -> {gid}")
+        if args.dry_run:
+            print()
+            print("--dry-run: nothing written")
+            return 0
+        project.save()
+        print()
+        print(f"written to {project.path}. Re-solve to pick up the new grouping.")
         return 0
 
     if args.command == "exif":

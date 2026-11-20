@@ -3890,6 +3890,9 @@ function imageStatus(im) {
 function buildFilmstrip() {
   const strip = $('filmstrip');
   strip.innerHTML = '';
+  // Only worth saying when there is a choice to be wrong about -- see the
+  // .film .cam rule for why a single-camera project gets no badge at all.
+  const multiCam = new Set(state.project.images.map((i) => i.group)).size > 1;
   for (const im of state.project.images) {
     const st = imageStatus(im);
     const div = document.createElement('div');
@@ -3901,7 +3904,8 @@ function buildFilmstrip() {
       `<canvas class="filmov"></canvas>` +
       `<button class="rm" title="Remove from this project">&times;</button>` +
       `<div class="meta"><span>${st.text}</span>` +
-      `<span class="dot" style="background:${st.color}"></span></div>`;
+      `<span class="dot" style="background:${st.color}"></span></div>` +
+      (multiCam ? `<div class="cam">${escapeHtml(im.group)}</div>` : '');
     // the thumbnail's source is resolved asynchronously, since in static mode it
     // is a blob the Python side has to render first
     Backend.photoSrc(im.id, true)
@@ -4049,6 +4053,11 @@ function renderImagePanel() {
 
   html += `<div class="row" style="margin-top:7px"><span class="k">camera group</span>`
         + `<input type="text" id="grpname" value="${escapeHtml(im.group)}" style="width:90px"></span></div>`;
+  html += `<button class="smallbtn" id="regroup" style="width:100%;margin-top:4px"`
+        + ` title="Read every photo's EXIF and put each one in a group of its own lens and zoom.`
+        + ` A set shot across a phone's wide, main and telephoto lenses is three cameras, and one`
+        + ` shared focal length cannot describe them. New imports do this automatically; this is`
+        + ` for a project that predates it.">split cameras by EXIF</button>`;
   html += `<label class="toggle" style="margin-top:5px"><input type="checkbox" id="imgenabled"`
         + `${im.enabled ? ' checked' : ''}> include in solve</label>`;
   html += `<label class="toggle"><input type="checkbox" id="lockpp"`
@@ -4084,6 +4093,7 @@ function renderImagePanel() {
   el.innerHTML = html;
 
   $('grpname').onchange = (e) => { im.group = e.target.value.trim() || 'cam0'; groupOf(im); markDirty(); renderPanels(); };
+  $('regroup').onclick = regroupCameras;
   $('imgenabled').onchange = (e) => { im.enabled = e.target.checked; markDirty(); buildFilmstrip(); };
   $('lockpp').onchange = (e) => { g.lock_principal_point = e.target.checked; markDirty(); };
   $('lockk1').onchange = (e) => { g.lock_k1 = e.target.checked; markDirty(); };
@@ -4980,6 +4990,43 @@ async function muteEverything() {
     renderPanels();
     render();
     if (Viewer3D.isOn()) Viewer3D.render();
+  }
+}
+
+/** Put every photo in the camera group its own EXIF says it belongs to.
+ *
+ * The repair path. Imports have done this since the grouping work landed, so
+ * this exists for the projects that predate it -- which is where every project
+ * that needs it actually is, since the symptom is a solve that will not
+ * converge rather than anything that points at the grouping.
+ *
+ * Undoable, and deliberately so: it rewrites `group` on every image at once,
+ * and a user who had split them by hand for a reason should be able to get
+ * that back without re-typing it. It does not re-solve -- the old solution is
+ * still on screen and still wrong, but re-solving on the user's behalf would
+ * hide how much the grouping was worth, which is the one thing worth seeing.
+ */
+async function regroupCameras() {
+  pushUndoBefore('split the cameras by EXIF');
+  setStatus('reading every photo’s EXIF…');
+  try {
+    const data = await api('/api/regroup', { project: projectPayload() });
+    if (data.project) adopt(data);
+    clearDirty();
+    const n = Object.keys(data.moved || {}).length;
+    const groups = (data.groups || []).join(', ');
+    setStatus(
+      n
+        ? `moved ${n} photo(s); the set is ${data.groups.length} camera(s): ${groups}. Press Enter to re-solve.`
+        : `nothing moved — the grouping already matches the photographs (${groups})`,
+      'ok',
+    );
+  } catch (err) {
+    setStatus(`could not regroup: ${err.message || err}`, 'warn');
+  } finally {
+    buildFilmstrip();
+    renderPanels();
+    render();
   }
 }
 

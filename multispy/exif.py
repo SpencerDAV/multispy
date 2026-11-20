@@ -39,6 +39,8 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
+from .project import CameraGroup
+
 # EXIF tag ids, see the Exif 2.3 specification
 TAG_MAKE = 0x010F
 TAG_MODEL = 0x0110
@@ -302,4 +304,242 @@ def summarise_group(project, group_id: str) -> GroupFocal:
             )
             return out
     out.note = usable[0].note
+    return out
+
+
+# ---------------------------------------------------------------- grouping
+
+# How far two images' focal lengths may differ and still be called one camera.
+# Deliberately the same 2% `summarise_group` refuses a group at, and that
+# agreement is the point: auto-grouping must never produce a group that the
+# existing check would then reject as zoomed. One number, stated once.
+GROUP_TOLERANCE = 0.02
+
+
+def camera_body(e: ExifFocal) -> str:
+    """Make and model, normalised, as the part of the key that must match exactly."""
+    return f"{e.make.strip().lower()}|{e.model.strip().lower()}"
+
+
+def camera_key(e: ExifFocal) -> str | None:
+    """A stable name for "which camera, at which zoom" -- or None if unknowable.
+
+    Keyed on the focal length in **pixels** rather than in millimetres, because
+    pixels is what a :class:`~multispy.project.CameraGroup` actually shares. The
+    px figure folds in all three things that make two photographs want different
+    intrinsics: the lens, the zoom, and the pixel diagonal. A phone's 0.5x and
+    1x land far apart; the same lens shot portrait and landscape lands on one
+    key, since the diagonal is unchanged by a quarter turn; and the same lens at
+    two resolutions correctly lands on two, because one focal in pixels cannot
+    describe both.
+
+    ``None`` for anything whose EXIF cannot be trusted to say -- no focal, or a
+    crop, which breaks the sensor-to-pixel correspondence the whole conversion
+    rests on. The caller leaves those where they are rather than guessing: a
+    wrong group is worse than the default one, because it is invisible.
+    """
+    if e.focal_px is None or e.confidence == "none":
+        return None
+    return f"{camera_body(e)}|{e.focal_px:.1f}"
+
+
+def key_focal(key: str) -> float | None:
+    """The focal in pixels a key was minted from, for comparing two of them."""
+    try:
+        return float(key.rsplit("|", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def keys_agree(a: str, b: str, tolerance: float = GROUP_TOLERANCE) -> bool:
+    """Do two keys name one camera? Same body, and focals within tolerance."""
+    if a.rsplit("|", 1)[0] != b.rsplit("|", 1)[0]:
+        return False
+    fa, fb = key_focal(a), key_focal(b)
+    if fa is None or fb is None:
+        return a == b
+    if fa <= 0 or fb <= 0:
+        return False
+    return abs(fa - fb) / max(fa, fb) <= tolerance
+
+
+def _next_group_id(used: set[str]) -> str:
+    n = 0
+    while f"cam{n}" in used:
+        n += 1
+    return f"cam{n}"
+
+
+def read_keys(project, images) -> dict[str, str | None]:
+    """The camera key for each of ``images``, by image id. Never raises."""
+    out: dict[str, str | None] = {}
+    for im in images:
+        try:
+            out[im.id] = camera_key(
+                read_focal(project.resolve_path(im), im.width, im.height, im.id)
+            )
+        except Exception:  # noqa: BLE001 - an unreadable file is just unknowable
+            out[im.id] = None
+    return out
+
+
+def backfill_group_keys(project, keys: dict[str, str | None] | None = None) -> None:
+    """Give every existing camera group the key its own photographs imply.
+
+    Projects made before grouping existed carry one group, ``cam0``, with no
+    key, and nothing may silently change that: the group holds a solved focal
+    length and the user's locks. So the key is *derived* rather than imposed --
+    read off the images already in the group, and only when they agree with
+    each other. A group whose own members disagree is left keyless on purpose:
+    it is already mixed, and the right thing for the next import is to land
+    beside it rather than in it.
+    """
+    by_group: dict[str, list[str]] = {}
+    for im in project.images:
+        gid = im.group
+        if gid not in project.groups:
+            continue
+        k = (keys or {}).get(im.id, "missing")
+        if k == "missing":
+            k = read_keys(project, [im])[im.id]
+        if k:
+            by_group.setdefault(gid, []).append(k)
+
+    for gid, group in project.groups.items():
+        if group.exif_key:
+            continue
+        found = by_group.get(gid) or []
+        if not found or not all(keys_agree(found[0], k) for k in found[1:]):
+            continue
+        group.exif_key = found[len(found) // 2]
+
+
+def assign_camera_groups(project, images=None) -> dict[str, str]:
+    """Put each image in the camera group its EXIF says it belongs to.
+
+    This is the step that was missing. Every import path used to write
+    ``group="cam0"`` and leave it there, so a photo set shot across a phone's
+    wide, main and telephoto lenses -- or at two digital zooms on one lens --
+    shared a single focal length between cameras that do not have one. The
+    bundle cannot represent that, and has nowhere to put the contradiction
+    except camera positions and point depths: the first pass then fails to
+    converge, every per-body sigma is measured off an unconverged state, and
+    the outlier cull starts dropping innocent marks. One wrong default, three
+    symptoms, none of them pointing at it.
+
+    Images whose EXIF cannot say are left exactly where they were, which for a
+    fresh import is ``cam0`` -- the old behaviour, unchanged, for a photo set
+    that carries nothing to group by.
+
+    Clusters are placed rather than images, so the ids come out tidy when this
+    is run over a project that is already one big mixed ``cam0``: the largest
+    camera takes the name being vacated instead of every photograph marching
+    up to ``cam1``, ``cam2``, ``cam3`` and leaving an empty ``cam0`` behind. A
+    reused id is reset rather than inherited -- the focal length and locks on a
+    group that turned out to hold three cameras describe none of them.
+
+    Returns ``{image_id: group_id}`` for the images it moved.
+    """
+    images = list(project.images if images is None else images)
+    if not images:
+        return {}
+
+    keys = read_keys(project, images)
+    backfill_group_keys(project, keys)
+
+    # Existing keyed groups first, so a second import lands beside the first
+    # rather than beginning a parallel numbering of the same cameras.
+    placed: list[tuple[str, str | None, list]] = [
+        (g.exif_key, gid, []) for gid, g in sorted(project.groups.items()) if g.exif_key
+    ]
+    fresh: list[tuple[str, str | None, list]] = []
+
+    for im in images:
+        key = keys.get(im.id)
+        if not key:
+            continue
+        hit = next((c for c in placed + fresh if keys_agree(c[0], key)), None)
+        if hit is None:
+            fresh.append((key, None, [im]))
+        else:
+            hit[2].append(im)
+
+    if not fresh:
+        return _settle(project, placed, images)
+
+    # Ids freed by this reassignment are available to the clusters that need
+    # one. Biggest first, so the main camera keeps the familiar name.
+    #
+    # By id rather than by object: ``ImageView`` is a plain dataclass, so ``in``
+    # would compare every field, and two of those fields are numpy arrays once
+    # the project has been solved. It happens to work today only because the
+    # id is the first field and tuple comparison stops at the first difference
+    # -- which is a property of the field order, not of this code, and the
+    # failure if it ever changed would be a ValueError out of the middle of an
+    # import rather than anything legible.
+    touched = {im.id for im in images}
+    staying = {c[1] for c in placed if c[2]} | {
+        im.group for im in project.images
+        if im.id not in touched or not keys.get(im.id)
+    }
+    vacated = sorted(gid for gid in project.groups if gid not in staying)
+    fresh.sort(key=lambda c: -len(c[2]))
+    named: list[tuple[str, str | None, list]] = []
+    for key, _gid, members in fresh:
+        if vacated:
+            gid = vacated.pop(0)
+            project.groups[gid] = CameraGroup(id=gid, exif_key=key)
+        else:
+            gid = _next_group_id(set(project.groups))
+            project.groups[gid] = CameraGroup(id=gid, exif_key=key)
+        named.append((key, gid, members))
+
+    return _settle(project, placed + named, images)
+
+
+def _settle(project, clusters, touched) -> dict[str, str]:
+    """Write the cluster assignment onto the images, and drop emptied groups."""
+    moved: dict[str, str] = {}
+    for _key, gid, members in clusters:
+        for im in members:
+            if im.group != gid:
+                im.group = gid
+                moved[im.id] = gid
+            project.group_of(im)
+    live = {im.group for im in project.images}
+    for gid in [g for g in project.groups if g not in live]:
+        del project.groups[gid]
+    return moved
+
+
+def cluster_group(project, group_id: str) -> list[tuple[float, list[str]]]:
+    """Which distinct cameras are sitting inside one group, largest first.
+
+    The complement of :func:`assign_camera_groups`: that one keeps a mixed set
+    from being made, this one names the mix in a set that already is. Returns
+    ``[(focal_px, [image_id, ...]), ...]``; images whose EXIF cannot say are
+    left out entirely rather than pooled into a cluster of their own, because
+    "we do not know" is not evidence of a fourth camera.
+    """
+    images = [im for im in project.active_images() if im.group == group_id]
+    keys = read_keys(project, images)
+    clusters: list[tuple[str, list[str], list[float]]] = []
+    for im in images:
+        key = keys.get(im.id)
+        if not key:
+            continue
+        focal = key_focal(key)
+        if focal is None:
+            continue
+        hit = next((c for c in clusters if keys_agree(c[0], key)), None)
+        if hit is None:
+            clusters.append((key, [im.id], [focal]))
+        else:
+            hit[1].append(im.id)
+            hit[2].append(focal)
+    out = [
+        (sorted(focals)[len(focals) // 2], ids)
+        for _key, ids, focals in clusters
+    ]
+    out.sort(key=lambda c: (-len(c[1]), c[0]))
     return out

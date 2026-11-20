@@ -56,6 +56,7 @@ SHARED_ROUTES = frozenset(
         "/api/state",
         "/api/solve",
         "/api/exif",
+        "/api/regroup",
         "/api/observability",
         "/api/mesh",
         "/api/rig",
@@ -161,6 +162,12 @@ def add_images_from_folder(project: Project, folder: str | Path) -> list[ImageVi
         )
         project.images.append(view)
         added.append(view)
+    # The group a photograph belongs in is a property of the photograph, not a
+    # default: a set shot across a phone's wide, main and telephoto lenses has
+    # three cameras in it, and calling them one is the single wrong assumption
+    # that a solve cannot recover from. Done once for the batch rather than per
+    # file, so every new image is placed knowing about the others.
+    exif.assign_camera_groups(project, added)
     return added
 
 
@@ -541,8 +548,12 @@ class Workspace:
             group="cam0",
         )
         self.project.images.append(view)
+        exif.assign_camera_groups(self.project, [view])
         self.save()
-        return {"image": view.id, "name": target.name, "width": width, "height": height}
+        return {
+            "image": view.id, "name": target.name,
+            "width": width, "height": height, "group": view.group,
+        }
 
     def add_model(self, name: str, data: bytes) -> dict:
         """Copy one CAD model in, and create a template for it."""
@@ -652,6 +663,20 @@ class Workspace:
         if route == "/api/exif":
             # read-only: a question should not move the open project
             return exif_payload(Project.from_dict(body["project"], path=self.project.path))
+
+        # Regroup what is already here. Auto-grouping on import only helps the
+        # next set of photographs; this is the same decision applied to a
+        # project that predates it, which is where every project that needs it
+        # actually is.
+        if route == "/api/regroup":
+            project = self.adopt(body["project"])
+            moved = exif.assign_camera_groups(project)
+            self.save()
+            return {
+                "project": project_payload(self.project),
+                "moved": moved,
+                "groups": sorted({im.group for im in project.images}),
+            }
 
         if route == "/api/observability":
             return observability_payload(body)

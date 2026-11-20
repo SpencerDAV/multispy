@@ -1253,13 +1253,65 @@ no new dependency.
 .venv\Scripts\python.exe -m multispy solve demo\project.multispy
 .venv\Scripts\python.exe -m multispy export demo\project.multispy out\
 .venv\Scripts\python.exe -m multispy exif demo\project.multispy
+.venv\Scripts\python.exe -m multispy regroup demo\project.multispy --dry-run
 .venv\Scripts\python.exe -m multispy rig demo_rig\project.multispy
 ```
 
 `solve` prints the full per-image residual table, including each image's
 predicted focal uncertainty, plus a per-object table and the layout. `exif`
-prints what the photo files claim, per image and per camera group. `rig` prints
-the solved object layout on its own, or the whole payload with `--json`.
+prints what the photo files claim, per image and per camera group. `regroup`
+splits the camera groups by lens and zoom, `--dry-run` to see what would move
+first. `rig` prints the solved object layout on its own, or the whole payload
+with `--json`.
+
+## Camera groups
+
+A **camera group** is a set of photographs that share intrinsics — one camera,
+one lens, one zoom, one pixel size. It is the promise the whole method rests
+on: a single focal length constrained by every image's control lines beats N
+focal lengths each constrained by four clicks.
+
+Break the promise and nothing says so. The bundle cannot represent two focal
+lengths in one group, so it puts the difference into camera positions and point
+depths instead — the first pass stops converging, every per-body sigma is then
+measured off an unconverged state, and the outlier cull starts dropping marks
+that were clicked correctly. Three symptoms, one cause, and nothing in the
+residuals that points at it.
+
+So the group is read off the photographs rather than assumed. Imports put each
+photo in a group keyed on make, model and **focal length in pixels** — pixels
+because that is the figure a group actually shares, and because it folds in all
+three things that make two photographs want different intrinsics at once: the
+lens, the zoom and the pixel diagonal. A phone's 0.5×, 1× and 5× land in three
+groups; the same lens shot portrait and landscape lands in one, since a quarter
+turn does not change the diagonal; the same lens at two resolutions correctly
+lands in two.
+
+Photographs whose EXIF cannot say — no focal length recorded, or a crop, which
+breaks the sensor-to-pixel correspondence the conversion rests on — are left
+where they are rather than guessed at. A set carrying no EXIF at all behaves
+exactly as it always did: one group, `cam0`.
+
+For a project made before this existed, **split cameras by EXIF** in the image
+panel, or `-m multispy regroup <project>`. Both are the same decision applied
+in place: the largest camera keeps `cam0`, and a group that turned out to hold
+three cameras does not pass its focal length or its locks on to whichever of
+them lands on its id. Re-solve afterwards — the grouping changes what the
+answer is, not just how it is reported.
+
+Every solve also checks, because a project can be regrouped by hand and the
+importer only ever sees the photographs it is given. A group holding more than
+one camera is named in the report, with the count at each focal length, rather
+than left to be inferred from a solve that will not settle.
+
+What it costs, said plainly: splitting is correct but it is not free. Eight
+photographs in one group means one focal length constrained by eight sets of
+control lines; eight groups of one means eight focal lengths each constrained
+by four clicks, which is fSpy again. If the zoom was dragged rather than tapped
+between the fixed lens stops, every photograph is its own camera and it will
+show. Lock each group's focal from EXIF in that case, so the bundle spends
+itself on pose rather than on re-deriving a focal length it has no evidence
+for.
 
 ## Tests
 
@@ -1267,6 +1319,7 @@ the solved object layout on its own, or the whole payload with `--json`.
 .venv\Scripts\python.exe tests\test_synthetic.py
 .venv\Scripts\python.exe tests\test_rig.py
 .venv\Scripts\python.exe tests\test_exif.py
+.venv\Scripts\python.exe tests\test_cameragroups.py
 .venv\Scripts\python.exe tests\test_muting.py
 ```
 
@@ -1288,6 +1341,15 @@ anchors are refused as a placement rather than silently resolved.
 `test_exif` writes JPEGs carrying known EXIF tags and checks each extraction
 route, including the cases that must be *refused*: a cropped frame and a group
 whose lens was zoomed between shots.
+
+`test_cameragroups` covers putting each photograph in the group its EXIF says
+it belongs to. Half of it is the split — three lenses become three groups, and
+no group it produces is one the zoom check would then reject. The other half,
+and the half more likely to break something, is that nothing else moves: a
+single-lens import still lands in one group called `cam0`, a set with no EXIF
+behaves exactly as before, a quarter turn does not split a group, and an old
+project's `cam0` is adopted with its solved focal and its locks intact rather
+than duplicated beside.
 
 `test_muting` covers taking a body's anchors out of the solve. The two
 properties it exists for are that **nothing is deleted** — the marks survive the

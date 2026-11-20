@@ -118,6 +118,13 @@ class CameraGroup:
     lock_focal: bool = False
     lock_principal_point: bool = True
     lock_k1: bool = True
+    exif_key: str | None = None
+    """Which camera, at which zoom, this group was created for -- see
+    :func:`multispy.exif.camera_key`.
+
+    Written by the importer so a later import of the same lens lands in this
+    group rather than starting a second one for it. Advisory only: nothing in
+    the solve reads it, and clearing it costs nothing but the matching."""
 
 
 @dataclass

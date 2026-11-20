@@ -101,6 +101,16 @@
     padding: 2px 5px; font-size: 10px; background: linear-gradient(transparent, #000c);
   }
   .film .dot { width: 7px; height: 7px; border-radius: 50%; align-self: center; }
+  /* Which camera a photo was shot on, drawn only when the project holds more
+     than one. A set off a single lens is the common case and a badge saying
+     "cam0" on every tile of it would be pure noise; a set across a phone's
+     wide, main and telephoto lenses is the case where being able to check the
+     grouping at a glance is the whole point. */
+  .film .cam {
+    position: absolute; top: 3px; left: 3px; padding: 1px 5px; border-radius: 3px;
+    font-size: 9px; letter-spacing: .3px; background: #0d1016cc; color: var(--accent);
+    border: 1px solid var(--accent); pointer-events: none;
+  }
   /* the posed model, drawn into every photo at once so a fit cannot be judged
      from one of them alone */
   .film canvas.filmov {

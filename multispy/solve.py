@@ -30,6 +30,7 @@ import numpy as np
 from scipy import sparse
 from scipy.optimize import least_squares
 
+from . import exif
 from .dirgroup import (
     MIN_IMAGES,
     MIN_PAIR_SINE,
@@ -3499,6 +3500,53 @@ def _fill_constraint_statistics(
     report.constraint_worst = max(violations) if violations else 0.0
 
 
+
+def _check_camera_groups(project: Project, report: SolveReport) -> None:
+    """Say so when one camera group is holding more than one camera.
+
+    A group is a promise that these photographs share intrinsics, and the whole
+    method leans on it: one focal length constrained by every image's control
+    lines beats N focals each constrained by four clicks. Break the promise and
+    the bundle has nowhere to put the contradiction except camera positions and
+    point depths, so the first pass fails to converge, every per-body sigma is
+    then measured off an unconverged state, and the outlier cull starts
+    dropping marks that were never wrong. Three symptoms, one cause, and
+    nothing in the residuals that points at it -- which is exactly why it is
+    worth a warning rather than leaving it to be inferred.
+
+    Checked here rather than left to the importer because the importer only
+    sees the photographs it is given: a project built before grouping existed,
+    or one regrouped by hand, reaches the solve with the mix already in it.
+    EXIF is advisory and often absent, so this never refuses anything -- it
+    says what it found and lets the solve run.
+    """
+    try:
+        gids = sorted({im.group for im in project.active_images()})
+    except Exception:  # noqa: BLE001 - never let a diagnostic break a solve
+        return
+    for gid in gids:
+        try:
+            clusters = exif.cluster_group(project, gid)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(clusters) < 2:
+            continue
+        focals = sorted(c[0] for c in clusters)
+        spread = 100.0 * (focals[-1] - focals[0]) / max(focals[0], 1e-9)
+        listed = ", ".join(
+            f"{len(ids)} at {focal:.0f} px" for focal, ids in clusters
+        )
+        report.warnings.append(
+            f"camera group {gid} holds {len(clusters)} different cameras according to EXIF "
+            f"({listed}), spanning {spread:.0f}%. One shared focal length cannot describe "
+            f"them, and the bundle will push the difference into the camera positions and "
+            f"point depths instead -- which usually shows up as a solve that will not "
+            f"converge and an outlier cull dropping marks that were clicked correctly. Give "
+            f"each lens and each zoom its own camera group, in the “camera group” box in "
+            f"the image panel."
+        )
+
+
 def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     """Run the whole pipeline and return a report suitable for the UI."""
     report = SolveReport()
@@ -3507,6 +3555,9 @@ def solve(project: Project, run_bundle: bool = True) -> SolveReport:
     # of the frame the nominals build rather than a value to be refined, and a
     # project reopened from a hand-edited file could carry anything here.
     project.pin_part()
+
+    report.stage = "checking the camera groups"
+    _check_camera_groups(project, report)
 
     report.stage = "calibrating images from control lines"
     intrinsics = calibrate_all(project, report)
