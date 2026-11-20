@@ -6,6 +6,184 @@ worth more than one without.
 
 ---
 
+## Done: IMAGE_ID is read out of COLMAP rather than guessed (Nov 2026)
+
+`point_triangulator` refuses a model whose `IMAGE_ID`s disagree with the
+database it is handed, and says so as `Check failed: existing_frame.DataIds() ==
+frame.DataIds()` — a line about rig bookkeeping that names nothing of the cause.
+The export used to guess that numbering by sorting on filename, on the premise
+that COLMAP's extractor walks a directory in that order. **It does not.**
+Measured on 4.1.0.dev0 over the eight photographs of `projects/rearmod3`, the
+extractor inserted `IMG_6404` as id 4 and `IMG_6403` as id 5 — its reader is
+threaded — and the check failed again, which is how the matcher investigation
+below tripped over it.
+
+So the numbering is read now. `export_colmap(..., database=...)`, exposed as
+`multispy export --colmap-db PATH`, takes the ids straight out of a database
+that already holds them, and the order of operations is export, extract, export
+again:
+
+```
+multispy export project.multispy export\
+colmap feature_extractor --database_path export\database.db --image_path export\images
+multispy export project.multispy export\ --colmap-db export\database.db
+```
+
+The second export is cheap, because a repeat export re-encodes no photograph:
+it rewrites the three text files and leaves `images/` alone.
+
+| handed to `point_triangulator` | result |
+|---|---|
+| the export as it stood, no database | **refused**, `existing_frame.DataIds() == frame.DataIds()` |
+| the same export with `--colmap-db` | 8 registered images, **61 points, 166 obs, 1.628 px** |
+
+That is the same 61 / 166 / 1.63 px the matcher work reached with a scratch
+renumbering script in the middle, so this buys the number back without the
+script. The poses moved by 4e-11 over the run, which is a text round trip and
+not a bundle adjustment.
+
+Two things deliberately left alone. A database that does not know one of the
+photographs is an **error**, not a gap to number around — the usual cause is
+features extracted from the originals rather than from the exported upright
+copies, and numbering around that would be silently wrong. And only the id
+column moves: the lines stay in filename order, because COLMAP's incremental
+triangulator walks the images in the order the file lists them and is greedy,
+so reordering them changes the point count it arrives at — by one point in 61
+here. Nobody's bug, and not worth inheriting.
+
+Filename order survives as the fallback for the first export, because something
+has to be on disk before a database can exist. It is a guess, it is now
+written down as one, and a model numbered that way is still right for Blender,
+`transforms.json` and the PLY. `point_triangulator` is the only reader that
+counts the ids.
+
+`tests/test_colmapids.py` pins the lot: a database that numbers two photographs
+the other way round from their names, one that skips numbers, one that agrees
+with filename order by coincidence, the tracks in `points3D.txt` following the
+renumbering, and both ways of being handed the wrong database.
+
+---
+
+## Rejected: a learned matcher to rescue the rearmod3 capture (Nov 2026)
+
+Eleven of the 28 image pairs in `projects/rearmod3` are more than 60 degrees
+apart in viewing direction, and SIFT matched nothing in any of them. That is
+the whole of why these eight photographs cannot feed a dense reconstruction, so
+the obvious next move was a matcher that does not depend on a repeatable
+detector. Measured, with MultiSpy's poses held fixed throughout:
+
+- **LoFTR**, kornia 0.9.2, pretrained `outdoor`, confidence 0.5, at 640, 1024
+  and 1280 px long side. 28 pairs in 4.7 s on a 4070 SUPER.
+- **ALIKED-N16ROT + LightGlue**, which COLMAP 4.1 ships as ONNX and will run
+  itself — `--FeatureExtraction.type ALIKED_N16ROT`,
+  `--FeatureMatching.type ALIKED_LIGHTGLUE`.
+
+Same upright exports, same `colmap geometric_verifier` at stock thresholds, so
+it is like for like with the SIFT baseline. Verified pairs per band, of 28,
+read as *COLMAP's own verification / scored against the poses*:
+
+| matcher | 0-20 (6) | 20-40 (5) | 40-60 (6) | **60 deg + (11)** | total | points |
+|---|---|---|---|---|---|---|
+| SIFT default | 5 / 5 | 4 / 2 | 3 / 2 | **0 / 0** | 12 / 9 | 61 |
+| LoFTR 640 | 6 / 5 | 4 / 2 | 2 / 2 | **0 / 0** | 12 / 9 | 220 |
+| LoFTR 1024 | 6 / 5 | 4 / 3 | 3 / 2 | **0 / 0** | 14 / 10 | 423 |
+| LoFTR 1280 | 6 / 5 | 4 / 3 | 3 / 2 | **3 / 0** | 16 / 10 | 613 |
+| ALIKED + LightGlue | 6 / 5 | 5 / 4 | 3 / 3 | **0 / 0** | 14 / 12 | 513 |
+
+**The wide band is dead in every run.** Three matchers, four resolutions, two
+independent scorings: 0 of 11. The capture protocol is the lever here, not the
+software.
+
+What the matchers do buy is correspondence on the pairs that already worked.
+693 verified matches becomes 3,560 (LoFTR 1024) or 3,873 (ALIKED+LightGlue),
+and `point_triangulator` with the poses fixed goes from **61 points / 166 obs /
+1.63 px** to **613 / 1700 / 1.71 px** at LoFTR's best. Seven times the points
+at the same reprojection error, which is a real improvement to a sparse model
+and may well be worth having for its own sake.
+
+It is not worth having *for a dense reconstruction*, and the dense run says so
+directly rather than by argument. Identical MVS on each model — undistort at
+2000 px, patch match with geometric consistency, stereo fusion:
+
+| | sparse points | photographs with observations | depth maps | fused points |
+|---|---|---|---|---|
+| SIFT default | 61 | 5 of 8 | 5 | **3,680** |
+| LoFTR 1024 | 423 | 5 of 8 | 5 | **3,241** |
+| ALIKED + LightGlue | 513 | 7 of 8 | 7 | **3,356** |
+
+Every richer model produced a *smaller* dense cloud than the 61-point one, on
+a 3.1 m cell. The sparse points only pick source views; patch matching works
+from the poses and the pixels, and the pixels did not change. The three
+photographs contributing nothing to the SIFT model — `IMG_6399`, `IMG_6401`,
+`IMG_6407` — are the same three after LoFTR, and they get no depth map because
+they have no source view to draw on.
+
+The ALIKED row is the one that settles it, because that matcher did the thing
+the whole exercise was hoping for: 12 of 28 pairs, seven of the eight
+photographs in the model, and **two more depth maps actually computed**. They
+fused to 324 points fewer than the baseline. `IMG_6401` and `IMG_6407` arrive
+with **12 and 13 observations** — attachment, not coverage — and fusion wants a
+depth value several views agree on, so a photograph that overlaps nothing
+contributes a depth map nothing corroborates. Registering a camera and covering
+a surface are different achievements, and only the second one makes a point
+cloud.
+
+### The number that would have fooled us
+
+LoFTR at 1280 has COLMAP verify **three of the eleven wide pairs**. Read the
+headline table alone and the dead band came alive. Scored against MultiSpy's
+poses those three are wrong by **350, 582 and 1322 px** median Sampson — not
+misplaced correspondences, different parts of the cell. Six pairs in that run
+pass COLMAP's test and fail the poses'. The same trap, smaller, is in every run
+including the baseline: SIFT 3, LoFTR 640 3, LoFTR 1024 4, LoFTR 1280 6,
+ALIKED+LightGlue 2.
+
+This is `harvest.py`'s lesson somewhere new. COLMAP calls a pair verified by
+fitting an essential matrix to the matches and counting what agrees, which is
+in-sample — hand RANSAC forty wrong correspondences on a wide pair and some
+model will usually collect eighteen of them. A solved project can settle it,
+because the poses imply an essential matrix with nothing fitted to the matches
+at all.
+
+So **`tools/pairscore.py`** is kept, and it is the only thing kept from this
+investigation. It prints both tables over the same matches at COLMAP's own
+thresholds and names the pairs that passed one and failed the other. It takes
+an export directory and any COLMAP database, so it will score a matcher nobody
+has thought of yet, and it answers the question that actually governs a dense
+run — *which pairs share a view* — before anything is reconstructed.
+
+LightGlue earns credit for the one thing neither other matcher does: on six of
+the eleven wide pairs it returns **no candidates at all**. That is evidence
+from the imagery and owes nothing to the poses, which matters, because the
+second table's reference *is* the poses and those are corroborated mostly by
+the narrow pairs. Read the two together, on a matcher that declines rather than
+guesses. A detector-free matcher never declines — LoFTR returned 20 to 55
+matches on every wide pair and all of them were wrong.
+
+### Also found — since fixed, at the top of this file
+
+`export.py` assigned `IMAGE_ID` in filename order on the premise that COLMAP's
+extractor walks the directory in that order. **It does not on COLMAP 4.1**: the
+extractor inserted `IMG_6404` as id 4 and `IMG_6403` as id 5 on this set, so
+`point_triangulator` dies with the same
+`Check failed: existing_frame.DataIds() == frame.DataIds()` the export fix
+below was written to cure. Every measurement here matches images by name and so
+is unaffected, and `pairscore.py` does the same deliberately; the triangulation
+runs here needed the model renumbered from the database by a scratch script
+first. The fix was to stop guessing the order — read the `images` table after
+extraction and write the model to match — and `multispy export --colmap-db`
+now does exactly that.
+
+### What this does not show
+
+Only `rearmod3`, only eight photographs. It says nothing about whether a
+learned matcher helps a capture shot as a sweep, and the sparse improvement it
+does measure is large enough to be worth trying on one. The claim here is the
+narrow one that was asked: no matcher recovered a single pair the capture did
+not already contain, and the dense verdict did not move.
+
+---
+
 ## Done: a Blend button that hands over a file, not a script (Nov 2026)
 
 `export_blender` wrote a script, which is the right primitive and the wrong

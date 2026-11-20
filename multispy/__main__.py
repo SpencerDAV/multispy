@@ -139,6 +139,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_export.add_argument(
+        "--colmap-db",
+        default=None,
+        metavar="PATH",
+        help=(
+            "a COLMAP database to take the sparse model's IMAGE_IDs from. "
+            "COLMAP numbers photographs as its extractor happens to reach "
+            "them, and point_triangulator refuses a model numbered any other "
+            "way, so the order is: export, run feature_extractor over the "
+            "exported images/, then export again with this flag"
+        ),
+    )
+    p_export.add_argument(
         "--step-units",
         choices=exporters.STEP_UNITS,
         default="mm",
@@ -272,7 +284,11 @@ def main(argv: list[str] | None = None) -> int:
     project = Project.load(args.project)
     out_dir = Path(args.out_dir) if args.out_dir else project.path.parent / "export"
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(exporters.export_colmap(project, out_dir / "sparse", out_dir / "images"))
+    print(
+        exporters.export_colmap(
+            project, out_dir / "sparse", out_dir / "images", database=args.colmap_db
+        )
+    )
     print(exporters.export_blender(project, out_dir / "import_cameras.py", out_dir / "images"))
     print(
         exporters.export_transforms_json(project, out_dir / "transforms.json", out_dir / "images")

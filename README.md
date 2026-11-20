@@ -1001,13 +1001,34 @@ model, `transforms.json` and the Blender script all naming the copies.
 A project whose photographs are already upright writes no copies and is
 byte-for-byte the export it always was. The same run now goes straight through:
 8 registered images, 61 points, 166 observations, 1.63 px mean reprojection
-error, with no manual step between **Export** and COLMAP.
+error, with nothing left to rotate by hand between **Export** and COLMAP.
 
-`IMAGE_ID` is now assigned in filename order for the same reason. COLMAP
-numbers images in the order its extractor walks the directory, and a model
-numbered in the order the photographs happened to be added is rejected by
-`point_triangulator` — on 3.13 with `Check failed: existing_frame.DataIds() ==
-frame.DataIds()`, which names the rig bookkeeping rather than the ids behind it.
+`IMAGE_ID` is the other thing that has to agree with COLMAP, and it is read out
+of COLMAP rather than guessed. A model numbered in the order the photographs
+happened to be added is rejected by `point_triangulator` with `Check failed:
+existing_frame.DataIds() == frame.DataIds()`, which names the rig bookkeeping
+rather than the ids behind it. This used to sort on filename instead, on the
+premise that COLMAP numbers images in the order its extractor walks the
+directory. It does not: measured on 4.1.0.dev0 over the same eight
+photographs, the extractor inserted `IMG_6404` as id 4 and `IMG_6403` as id 5 —
+its reader is threaded — and the same check failed again.
+
+So `--colmap-db` takes the ids out of a database that already has them, and the
+order of operations is export, extract, export again. The photographs have to
+exist before a database can, and the second export rewrites the three text
+files without re-encoding a single image. Measured end to end on
+`projects/rearmod3`:
+
+| handed to `point_triangulator` | result |
+|---|---|
+| `multispy export` alone | **refused**, `existing_frame.DataIds() == frame.DataIds()` |
+| `multispy export --colmap-db database.db` | 8 registered images, 61 points, 166 obs, 1.628 px |
+
+with the poses moved by 4e-11 — a text round trip, not a bundle adjustment.
+Only the id column moves; the lines stay in filename order, because COLMAP's
+incremental triangulator walks the images in the order the file lists them and
+is greedy, so reordering them changes the point count it arrives at, by one
+point in 61 here.
 
 ### The Blend button
 

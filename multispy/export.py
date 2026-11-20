@@ -270,8 +270,30 @@ def _write_upright(src: Path, dst: Path) -> None:
 # --------------------------------------------------------------------------
 
 
+def colmap_image_ids(database: str | Path) -> dict[str, int]:
+    """``name -> IMAGE_ID``, read out of a COLMAP database.
+
+    The database is the only authority on that numbering -- see
+    :func:`export_colmap`, which cannot work it out for itself.
+    """
+    import sqlite3
+
+    database = Path(database)
+    if not database.is_file():
+        raise FileNotFoundError(f"no COLMAP database at {database}")
+    conn = sqlite3.connect(str(database))
+    try:
+        rows = conn.execute("SELECT name, image_id FROM images").fetchall()
+    finally:
+        conn.close()
+    return {str(name): int(image_id) for name, image_id in rows}
+
+
 def export_colmap(
-    project: Project, out_dir: str | Path, images_dir: str | Path | None = None
+    project: Project,
+    out_dir: str | Path,
+    images_dir: str | Path | None = None,
+    database: str | Path | None = None,
 ) -> Path:
     """Write ``cameras.txt`` / ``images.txt`` / ``points3D.txt``.
 
@@ -285,6 +307,13 @@ def export_colmap(
     the one the marks were made in. ``images_dir`` says where they go and
     defaults to ``images/`` beside the model; it costs nothing on a project
     whose photographs are already upright, which writes no copies at all.
+
+    COLMAP's own numbering of the photographs cannot be predicted, so
+    ``database`` takes the IMAGE_IDs out of a database that already has them --
+    which is what ``point_triangulator`` demands of a model handed to it. The
+    order of operations is export, extract, export again -- the photographs
+    have to exist before a database can, and the second export rewrites the
+    three text files without re-encoding a single image.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -297,17 +326,41 @@ def export_colmap(
     cam_id_of = {gid: i + 1 for i, gid in enumerate(group_ids)}
 
     # IMAGE_ID has to agree with whatever COLMAP's own database assigns, or
-    # ``point_triangulator`` rejects the model outright -- on 3.13 with
-    # "Check failed: existing_frame.DataIds() == frame.DataIds()", which names
-    # the rig/frame bookkeeping rather than the ids that caused it. COLMAP
-    # numbers images in the order its extractor walks the directory, which is
-    # sorted by filename, so that is the order written here. Project order is
-    # the order photographs were added and matches nothing.
+    # ``point_triangulator`` rejects the model outright -- with "Check failed:
+    # existing_frame.DataIds() == frame.DataIds()", which names the rig/frame
+    # bookkeeping rather than the ids that caused it.
+    #
+    # The numbering cannot be worked out in advance. This used to sort by
+    # filename, on the premise that COLMAP's extractor walks the directory that
+    # way; measured against 4.1 it does not -- its reader is threaded, and on
+    # the eight photographs of rearmod3 it inserted IMG_6404 as id 4 and
+    # IMG_6403 as id 5. So ``database`` is read when it is given, which is
+    # exact, and filename order is only the fallback for a model nothing has
+    # extracted features from yet. Project order -- the order photographs were
+    # added -- matches nothing at all.
+    #
+    # Only the id column moves. The lines stay in filename order either way,
+    # because COLMAP's incremental triangulator works through the images in the
+    # order the file lists them and is greedy, so reordering them quietly
+    # changes the point count it arrives at -- by one point in 61 on rearmod3,
+    # which is nobody's bug and not worth inheriting.
     def exported_name(im) -> str:
         return written[im.id].name if im.id in written else Path(im.path).name
 
     images = sorted(images, key=lambda im: exported_name(im).lower())
-    img_id_of = {im.id: i + 1 for i, im in enumerate(images)}
+    if database is None:
+        img_id_of = {im.id: i + 1 for i, im in enumerate(images)}
+    else:
+        assigned = colmap_image_ids(database)
+        missing = sorted({exported_name(im) for im in images} - set(assigned))
+        if missing:
+            shown = ", ".join(missing[:4]) + (" ..." if len(missing) > 4 else "")
+            raise ValueError(
+                f"{Path(database).name} holds no image named {shown}. Extract "
+                f"features from the exported images/ directory rather than "
+                f"from the originals, then export again."
+            )
+        img_id_of = {im.id: assigned[exported_name(im)] for im in images}
     points = [p for p in project.points if p.xyz is not None]
     pt_id_of = {p.id: i + 1 for i, p in enumerate(points)}
 
