@@ -376,19 +376,41 @@ def write_exports(
     out_dir.mkdir(parents=True, exist_ok=True)
     formats = list(formats or EXPORT_FORMATS)
     written: dict[str, str] = {}
+    # Done once, before the three exporters that name photographs, so they all
+    # point at the same copies and only the first visit pays for writing them.
+    images_dir = out_dir / "images"
+    if {"colmap", "blender", "transforms", "blend"} & set(formats):
+        if export.upright_images(project, images_dir):
+            written["images"] = str(images_dir)
     if "colmap" in formats:
-        written["colmap"] = str(export.export_colmap(project, out_dir / "sparse"))
+        written["colmap"] = str(export.export_colmap(project, out_dir / "sparse", images_dir))
     if "blender" in formats:
-        written["blender"] = str(export.export_blender(project, out_dir / "import_cameras.py"))
+        written["blender"] = str(
+            export.export_blender(project, out_dir / "import_cameras.py", images_dir)
+        )
     if "transforms" in formats:
         written["transforms"] = str(
-            export.export_transforms_json(project, out_dir / "transforms.json")
+            export.export_transforms_json(project, out_dir / "transforms.json", images_dir)
         )
     if "ply" in formats:
         written["ply"] = str(export.export_ply(project, out_dir / "tiepoints.ply"))
     if "step" in formats:
         written["step"] = str(
             export.export_step(project, out_dir / "scene.step", shape=step_shape)
+        )
+    # Not in EXPORT_FORMATS, so Export never triggers it: this one shells out
+    # to Blender, which is slow enough to notice and absent on plenty of
+    # machines. It is asked for by name, by the Blend button or the CLI.
+    if "blend" in formats:
+        from . import blendfile
+
+        written["blend"] = str(
+            blendfile.build_blend(
+                project,
+                out_dir / "scene.blend",
+                images_dir=images_dir,
+                script_path=out_dir / "import_cameras.py",
+            )
         )
     # only worth writing when there is something placed to describe
     if "rig" in formats and project.placed_instances():

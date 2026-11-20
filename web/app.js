@@ -1199,9 +1199,39 @@ async function exportNow() {
     await api('/api/state', { project: projectPayload() });
     clearDirty();
     const data = await Backend.exportAll(undefined, projectPayload());
-    setStatus(`exported to ${data.out_dir}`, 'ok');
+    // A project whose photos are stored rotated gets upright copies written
+    // beside the model, because nothing downstream applies the EXIF tag. That
+    // is most of the size of such an export, so it should not be a surprise.
+    const copies = data.written && data.written.images ? ' · photos rewritten upright' : '';
+    setStatus(`exported to ${data.out_dir}${copies}`, 'ok');
   } catch (err) {
     setStatus(`export failed: ${err.message}`, 'bad');
+  }
+}
+
+/** Build `export/scene.blend` by running the Blender on this machine.
+ *
+ *  Longer than the other exports by a wide margin -- it starts a second
+ *  program, imports every CAD body and packs the photographs in -- so the
+ *  button is disabled while it runs and the elapsed badge carries the wait.
+ *  Blender missing, or refusing, comes back as a plain sentence rather than a
+ *  stack trace; it is the one export that can fail for a reason that has
+ *  nothing to do with the project.
+ */
+async function buildBlendNow() {
+  const btn = $('btn-blend');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try {
+    setStatus('building the .blend…');
+    await api('/api/state', { project: projectPayload() });
+    clearDirty();
+    const data = await Backend.buildBlend(projectPayload());
+    setStatus(`wrote ${data.written && data.written.blend ? data.written.blend : data.file}`, 'ok');
+  } catch (err) {
+    setStatus(err.message, 'bad');
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -7677,6 +7707,7 @@ $('showshaded').onchange = (e) => { state.showShaded = e.target.checked; render(
 $('btn-solve').onclick = solveNow;
 $('btn-export').onclick = exportNow;
 $('btn-step').onclick = (ev) => exportStepNow(ev.shiftKey);
+$('btn-blend').onclick = buildBlendNow;
 $('showvp').onchange = (e) => { state.showVP = e.target.checked; render(); };
 $('showresid').onchange = (e) => { state.showResid = e.target.checked; updateHint(); render(); };
 $('showexpected').onchange = (e) => { state.showExpected = e.target.checked; render(); };
@@ -7920,6 +7951,10 @@ async function start() {
   setAxis(0);
   resizeCanvas();
   initBusyBadge();
+  // Hidden in the markup and revealed here: a .blend is built by the Blender
+  // on the machine running the server, which the browser build cannot reach.
+  // Better absent than present and always refusing.
+  $('btn-blend').hidden = Backend.isStatic();
   if (Backend.isStatic()) await showLauncher();
   try {
     await loadState();

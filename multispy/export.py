@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -148,25 +150,163 @@ def _intrinsics_for(project: Project, image) -> Intrinsics:
 
 
 # --------------------------------------------------------------------------
+# photographs, in the frame the marks were made in
+# --------------------------------------------------------------------------
+
+#: EXIF tag 274. Any value but 1 means the stored pixels are not what is shown.
+_ORIENTATION_TAG = 274
+
+
+def _stored_orientation(path: Path) -> int:
+    """The file's EXIF orientation tag, or 1 when it has none.
+
+    Unreadable files also answer 1, which is the safe answer in both
+    directions: we neither rewrite a file we cannot open nor claim it needs
+    rewriting.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            return int(img.getexif().get(_ORIENTATION_TAG, 1) or 1)
+    except Exception:  # noqa: BLE001 - missing, truncated, not an image, no Pillow
+        return 1
+
+
+def upright_images(project: Project, images_dir: str | Path) -> dict[str, Path]:
+    """Write the photographs so a reader that ignores EXIF sees what we saw.
+
+    Every mark in a project is in the frame the *browser* draws, which is the
+    frame after EXIF orientation has been applied -- ``webapp.image_dimensions``
+    says so, and ``ImageView.width``/``height`` hold those rotated dimensions.
+    Nothing downstream agrees. COLMAP reads the file and ignores the tag, so a
+    phone photo shot in portrait arrives there as the landscape it is actually
+    stored as, and the exported model and the imagery it describes differ by a
+    quarter turn. Measured on ``projects/rearmod3``, whose eight photographs are
+    all stored 4032x3024 with orientation 6: COLMAP's database recorded them as
+    4032x3024 while the model said 3024x4032, and ``point_triangulator``
+    refused the model outright. ``ns-process-data`` drives COLMAP and inherits
+    this, and so does Blender -- 5.1.1 loads that same file as 4032x3024,
+    against 3024x4032 for the upright copy.
+
+    The fix has to be the pixels rather than the numbers. Rotating the exported
+    geometry into the stored frame would cost nothing and would be correct for
+    exactly those readers that ignore the tag -- it would then be wrong for any
+    reader that honours it. A file carrying no orientation tag at all reads the
+    same either way, so that is what this writes.
+
+    Only projects that need it pay for it. When every photograph is already
+    upright this returns ``{}`` and writes nothing, so such an export is
+    byte-for-byte what it was before. When any one of them is rotated the whole
+    set is written to ``images_dir``, because a consumer is given one directory
+    and must find all of them in it; the already-upright ones are copied
+    byte-for-byte and only the rotated ones are re-encoded. A file that cannot
+    be read is left out of the mapping and keeps its original name, which is
+    the old behaviour and the only one available for a photograph that is no
+    longer on disk.
+
+    Returns ``{image id: written path}``, empty when nothing needed writing.
+    """
+    images = _solved_images(project)
+    if not images:
+        return {}
+    orientation = {im.id: _stored_orientation(project.resolve_path(im)) for im in images}
+    if all(o == 1 for o in orientation.values()):
+        return {}
+
+    # one directory, so the basenames have to be unique within it; they are not
+    # guaranteed to be, since two photographs can come from two folders
+    names: dict[str, str] = {}
+    taken: set[str] = set()
+    for im in images:
+        base = Path(im.path).name or f"{im.id}.jpg"
+        name = base if base.lower() not in taken else f"{im.id}_{base}"
+        names[im.id] = name
+        taken.add(name.lower())
+
+    out = Path(images_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+    for im in images:
+        src = project.resolve_path(im)
+        dst = out / names[im.id]
+        try:
+            # re-exporting into the same folder should not re-encode everything
+            if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+                written[im.id] = dst
+                continue
+            if orientation[im.id] == 1:
+                shutil.copyfile(src, dst)
+            else:
+                _write_upright(src, dst)
+        except Exception:  # noqa: BLE001 - unreadable source, full disk, no Pillow
+            continue
+        written[im.id] = dst
+    return written
+
+
+def _write_upright(src: Path, dst: Path) -> None:
+    """``src`` with its EXIF rotation applied to the pixels and dropped from the
+    metadata. The rest of the metadata is kept, because a consumer that reads
+    the focal length out of it -- COLMAP's feature extractor does -- should not
+    lose it to a rotation."""
+    from PIL import Image, ImageOps
+
+    with Image.open(src) as img:
+        up = ImageOps.exif_transpose(img)
+        kwargs = {}
+        exif = up.info.get("exif")  # exif_transpose has already dropped tag 274
+        if exif:
+            kwargs["exif"] = exif
+        if dst.suffix.lower() in {".jpg", ".jpeg"}:
+            kwargs["quality"] = 95
+            if up.mode not in {"RGB", "L"}:
+                up = up.convert("RGB")
+        up.save(dst, **kwargs)
+
+
+# --------------------------------------------------------------------------
 # COLMAP sparse model (text format)
 # --------------------------------------------------------------------------
 
 
-def export_colmap(project: Project, out_dir: str | Path) -> Path:
+def export_colmap(
+    project: Project, out_dir: str | Path, images_dir: str | Path | None = None
+) -> Path:
     """Write ``cameras.txt`` / ``images.txt`` / ``points3D.txt``.
 
     This is the format everything downstream speaks, so a hand-marked solve can
     feed Meshroom's dense stage, ``ns-process-data``, or a COLMAP bundle
     adjustment that refines what we produced here.
+
+    The photographs are written alongside by :func:`upright_images` whenever
+    any of them is stored rotated, and ``images.txt`` then names those copies
+    -- without that, every reader in the list above sees a different frame from
+    the one the marks were made in. ``images_dir`` says where they go and
+    defaults to ``images/`` beside the model; it costs nothing on a project
+    whose photographs are already upright, which writes no copies at all.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     images = _solved_images(project)
     if not images:
         raise ValueError("nothing solved yet")
+    written = upright_images(project, out_dir / "images" if images_dir is None else images_dir)
 
     group_ids = sorted({im.group for im in images})
     cam_id_of = {gid: i + 1 for i, gid in enumerate(group_ids)}
+
+    # IMAGE_ID has to agree with whatever COLMAP's own database assigns, or
+    # ``point_triangulator`` rejects the model outright -- on 3.13 with
+    # "Check failed: existing_frame.DataIds() == frame.DataIds()", which names
+    # the rig/frame bookkeeping rather than the ids that caused it. COLMAP
+    # numbers images in the order its extractor walks the directory, which is
+    # sorted by filename, so that is the order written here. Project order is
+    # the order photographs were added and matches nothing.
+    def exported_name(im) -> str:
+        return written[im.id].name if im.id in written else Path(im.path).name
+
+    images = sorted(images, key=lambda im: exported_name(im).lower())
     img_id_of = {im.id: i + 1 for i, im in enumerate(images)}
     points = [p for p in project.points if p.xyz is not None]
     pt_id_of = {p.id: i + 1 for i, p in enumerate(points)}
@@ -193,7 +333,7 @@ def export_colmap(project: Project, out_dir: str | Path) -> Path:
         fh.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
         for im in images:
             q = rotmat_to_quat(im.R)
-            name = Path(im.path).name
+            name = exported_name(im)
             fh.write(
                 f"{img_id_of[im.id]} {q[0]:.10f} {q[1]:.10f} {q[2]:.10f} {q[3]:.10f} "
                 f"{im.t[0]:.10f} {im.t[1]:.10f} {im.t[2]:.10f} {cam_id_of[im.group]} {name}\n"
@@ -232,19 +372,39 @@ def export_colmap(project: Project, out_dir: str | Path) -> Path:
 # --------------------------------------------------------------------------
 
 
-def export_transforms_json(project: Project, out_path: str | Path) -> Path:
+def export_transforms_json(
+    project: Project, out_path: str | Path, images_dir: str | Path | None = None
+) -> Path:
+    """A nerfstudio / instant-ngp ``transforms.json``.
+
+    ``file_path`` is resolved against this file's own directory, so when
+    :func:`upright_images` has had to write copies they are named relative to
+    it. See that function for why a rotated photograph cannot simply be
+    pointed at where it lies.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     images = _solved_images(project)
     if not images:
         raise ValueError("nothing solved yet")
+    written = upright_images(
+        project, out_path.parent / "images" if images_dir is None else images_dir
+    )
 
     frames = []
     for im in images:
         cam = _intrinsics_for(project, im)
+        if im.id in written:
+            try:
+                rel = os.path.relpath(written[im.id], out_path.parent)
+            except ValueError:  # a different drive on Windows has no relative form
+                rel = str(written[im.id].resolve())
+            file_path = rel.replace("\\", "/")
+        else:
+            file_path = im.path.replace("\\", "/")
         frames.append(
             {
-                "file_path": im.path.replace("\\", "/"),
+                "file_path": file_path,
                 "fl_x": cam.f,
                 "fl_y": cam.f,
                 "cx": cam.cx,
@@ -362,11 +522,26 @@ def export_rig_csv(project: Project, out_path: str | Path) -> Path:
 # --------------------------------------------------------------------------
 
 
-BLENDER_TEMPLATE = '''"""Generated by MultiSpy. Run inside Blender: Scripting > Open > Run Script."""
+BLENDER_TEMPLATE = '''"""Generated by MultiSpy. Run inside Blender: Scripting > Open > Run Script.
+
+Or headless, which is what the Blend button drives:
+
+    blender --background --factory-startup --python this_script.py -- --save out.blend
+"""
 
 import bpy
 import mathutils
+import sys
 from pathlib import Path
+
+# With --save the scene is emptied first, so the file holds the project and not
+# Blender's startup cube, and the photographs are packed in at the end so it
+# travels on its own. Without it this is the same script it always was: it adds
+# a collection to whatever is already open and saves nothing.
+SAVE_TO = None
+if "--save" in sys.argv:
+    SAVE_TO = sys.argv[sys.argv.index("--save") + 1]
+    bpy.ops.wm.read_factory_settings(use_empty=True)
 
 CAMERAS = {cameras}
 POINTS = {points}
@@ -492,17 +667,42 @@ print(
     "MultiSpy: imported %d cameras, %d tie points, %d placed object(s)"
     % (len(CAMERAS), len(POINTS), len(OBJECTS))
 )
+
+if SAVE_TO:
+    # Packing is what makes the .blend worth having over the script: the photos
+    # go inside the file, so it opens on a machine that has neither them nor
+    # the CAD. Imported meshes are already real data in the file.
+    packed = True
+    try:
+        bpy.ops.file.pack_all()
+    except (RuntimeError, AttributeError) as exc:
+        packed = False
+        print("MultiSpy: could not pack the photographs in (%s)" % exc)
+    bpy.ops.wm.save_as_mainfile(filepath=SAVE_TO, compress=True)
+    print("MultiSpy: wrote %s (packed=%s)" % (SAVE_TO, packed))
 '''
 
 
-def export_blender(project: Project, out_path: str | Path) -> Path:
+def export_blender(
+    project: Project, out_path: str | Path, images_dir: str | Path | None = None
+) -> Path:
     """Write a Blender script that builds the cameras, with each photo wired up as
-    that camera's background image so the alignment can be eyeballed immediately."""
+    that camera's background image so the alignment can be eyeballed immediately.
+
+    Blender does not apply EXIF orientation when it loads an image -- 5.1.1
+    reports a photograph stored 4032x3024 with orientation 6 as 4032x3024 --
+    so a rotated photograph used to hang behind its camera a quarter turn out,
+    which made the alignment this exists to show look broken. The copy
+    :func:`upright_images` supplies carries no tag; see it for the rest.
+    """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     images = _solved_images(project)
     if not images:
         raise ValueError("nothing solved yet")
+    written = upright_images(
+        project, out_path.parent / "images" if images_dir is None else images_dir
+    )
 
     cameras = []
     for im in images:
@@ -510,7 +710,7 @@ def export_blender(project: Project, out_path: str | Path) -> Path:
         cameras.append(
             {
                 "name": f"MS_{Path(im.path).stem}",
-                "image": str(project.resolve_path(im)),
+                "image": str(written.get(im.id) or project.resolve_path(im)),
                 "width": im.width,
                 "height": im.height,
                 "f_px": cam.f,

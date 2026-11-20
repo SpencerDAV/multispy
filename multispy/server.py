@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import webapp
+from . import blendfile, webapp
 from .docpage import render_page
 from .project import CameraGroup, Project
 from .webapp import IMAGE_SUFFIXES, MAX_UPLOAD_BYTES, add_images_from_folder, list_projects
@@ -264,6 +264,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(self.state.workspace.handle(url.path, body))
             elif url.path == "/api/export":
                 self._post_export(body)
+            elif url.path == "/api/blend":
+                self._post_blend(body)
             elif url.path == "/api/add_folder":
                 self._post_add_folder(body)
             elif url.path == "/api/new_project":
@@ -277,6 +279,10 @@ class Handler(BaseHTTPRequestHandler):
         except KeyError as exc:
             self._send_json({"error": str(exc).strip("'")}, 404)
         except ValueError as exc:
+            self._send_json({"error": str(exc)}, 400)
+        except (blendfile.BlenderNotFound, blendfile.BlenderFailed) as exc:
+            # Not a fault in the request or in this server: Blender is missing
+            # or refused. The message says which, and a traceback would bury it.
             self._send_json({"error": str(exc)}, 400)
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
@@ -295,6 +301,17 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("formats"),
                 step_shape=body.get("step_shape") or "none",
             )
+        self._send_json({"written": written, "out_dir": str(out_dir)})
+
+    def _post_blend(self, body: dict) -> None:
+        """Server-only, and not merely because of where the file lands: a
+        ``.blend`` is built by running the Blender installed on this machine,
+        which the browser build has no way to reach."""
+        with self.state.lock:
+            project = self.state.workspace.adopt(body["project"])
+            base = project.path.parent if project.path else Path.cwd()
+            out_dir = Path(body.get("out_dir") or (base / "export"))
+            written = webapp.write_exports(project, out_dir, ("blend",))
         self._send_json({"written": written, "out_dir": str(out_dir)})
 
     def _post_add_folder(self, body: dict) -> None:

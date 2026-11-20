@@ -58,6 +58,14 @@ PY_MODULES = (
     "cadguard",
     "stepfile",
     "export",
+    # Shipped although the browser can never use it: it builds a .blend by
+    # running Blender, and a tab has no Blender to run. It is here because
+    # webapp.py reaches it -- from inside the one function that handles the
+    # "blend" format, so the file is only written to the Pyodide filesystem
+    # and never imported there. Leaving it out would mean teaching
+    # tests/test_build.py that some reachable imports do not count, which is
+    # a weaker guard than a few unused kilobytes are worth.
+    "blendfile",
     "webapp",
 )
 """The package as the browser needs it.

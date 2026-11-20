@@ -6,6 +6,140 @@ worth more than one without.
 
 ---
 
+## Done: a Blend button that hands over a file, not a script (Nov 2026)
+
+`export_blender` wrote a script, which is the right primitive and the wrong
+deliverable. Using it meant finding Blender's Scripting tab, opening the file
+and pressing Run; and what came out still referenced photographs and CAD
+elsewhere on disk, so moving any of it left the scene hollow. Three steps and a
+trap between a finished solve and seeing it.
+
+`blendfile.build_blend` runs the same script in the Blender already on the
+machine, with a new `--save` the template understands: the scene starts empty
+rather than on Blender's startup cube, and the photographs are packed into the
+file at the end. One file that opens anywhere.
+
+Measured on `projects/rearmod3`: **3.2 s**, 32.3 MB, 8 cameras, 28 bodies at
+124,479 vertices, 8 photographs, **8 of 8 packed**. Built by 4.3.2 and reopened
+in 5.1.1, where the tie points project through `MS_IMG_6405` onto the marks
+they were clicked at to a median 2.8 px -- the solve's own residual, so the
+round trip through Blender adds nothing.
+
+Three things worth keeping:
+
+- **Which Blender, decided by asking.** `--blender`, then `$MULTISPY_BLENDER`,
+  then `PATH`, then the newest installed -- and "newest" is settled by running
+  each candidate with `--version`, not by reading its directory name. The
+  machine this was written on has a `Blender 43` that reports 4.3.2 sitting
+  beside `Blender 4.2` and `Blender 5.1`; sorted as text, 43 wins and the tool
+  picks the second-oldest Blender on the box. There is a test for exactly that
+  arrangement.
+- **"The file is there" proves nothing**, because it was there before. The
+  build records the modification time first and treats an unchanged file as a
+  failure, with the tail of Blender's own output attached. Without that, a
+  Blender that refused to start looked like a successful re-export of
+  yesterday's scene.
+- **Not in `EXPORT_FORMATS`.** Export must not start a second program; this is
+  asked for by name, by the button or by `multispy blend`. The browser build
+  has no Blender to run, so the button is hidden there rather than present and
+  always refusing.
+
+Caught by `tests/test_build.py` while building this, which is what it is for:
+`webapp.py` reaches `blendfile` by a relative import, so the module had to be
+shipped into the browser bundle even though a tab can never use it. The
+alternative was teaching that test which reachable imports do not count, and a
+few unused kilobytes are cheaper than a weaker guard. The worker only *writes*
+the shipped files to the Pyodide filesystem -- importing happens through
+`webapp`, and this one is imported inside the function that needs it -- so it
+costs nothing at boot. Verified by booting the bundle.
+
+Also fixed in passing, because this feature needed it: **the elapsed badge
+never appeared in the server build at all.** It was written for the static
+build, where Python runs in the tab, and `call()` took the fetch path without
+counting anything -- so a server-side solve was the same silent window the
+worker was built to cure. Now counted in both. Calls finishing inside a second
+never paint, so nothing flickers.
+
+Not done: no progress *within* the Blender run. It is one subprocess and the
+badge counts seconds at it. Fine at 3 s; a hundred-body project may want
+Blender's own stdout relayed.
+
+---
+
+## Done: the exports describe the photographs that are actually there (Nov 2026)
+
+Found while measuring whether a solve could feed a dense reconstruction, which
+is the one thing the COLMAP export exists for and the one thing nobody had
+tried. It could not, and the reason was not the solve.
+
+Every mark in a project is in the frame the browser draws — the frame *after*
+EXIF orientation is applied, which `webapp.image_dimensions` is explicit about.
+Nothing downstream applies the tag. `projects/rearmod3`'s eight photographs are
+stored 4032x3024 with orientation 6 while the model says 3024x4032, so handed
+the export as it stood, `colmap point_triangulator` stopped at
+
+    Check failed: existing_camera.width == camera.width (3024 vs. 4032)
+
+That it stopped is luck: COLMAP 3.13 checks because the extractor was told
+`--single_camera`. Without that check the poses and the imagery disagree by a
+quarter turn and the output is nonsense that looks like a bad solve.
+`ns-process-data` drives COLMAP and inherits it. So does Blender, checked
+directly: `bpy.data.images.load` on `IMG_6399.JPG` reports 4032x3024 in Blender
+5.1.1 against 3024x4032 for the upright copy, which means the background images
+this tool wires to each camera — the thing offered as the quick way to see a
+bad alignment — were a quarter turn out themselves, and had been all along.
+
+Writing pixels rather than numbers is still the right call for a reason that
+does not depend on any of those three: a file carrying no orientation tag reads
+the same to a reader that honours one and a reader that does not, so the copies
+cannot be wrong for a consumer nobody has tested.
+
+The Blender end was then checked the whole way rather than at the file: the
+exported script imports 8 cameras, 33 tie points and 28 bodies into 5.1.1, and
+`world_to_camera_view` puts those tie points on the marks they were clicked at
+to a median 2.8 px, max 7.3, on a 3024x4032 frame. That is the solve's own
+residual on this image and nothing on top of it, which is the claim worth
+making about an exporter -- it adds no error of its own.
+
+`export.upright_images` writes the pixels rather than adjusting the numbers,
+and the reason is worth keeping: rotating the exported geometry into the stored
+frame costs nothing and would be correct for exactly those readers that ignore
+the tag — and wrong for any that honour it, which is not a list we can
+enumerate. A file carrying no orientation tag reads the same either way.
+Originals are copied byte-for-byte, only rotated ones are re-encoded (keeping
+their EXIF, since COLMAP's extractor seeds intrinsics from the focal length
+there), and a repeat export re-encodes nothing.
+
+A second defect sat behind the first and only surfaced once the images were
+right: `IMAGE_ID` was assigned in the order photographs were added, and COLMAP
+numbers them in the order its extractor walks the directory. The model was
+rejected with `Check failed: existing_frame.DataIds() == frame.DataIds()`,
+which names the rig bookkeeping and not the ids that caused it. Export order is
+now the filename order.
+
+| | before | after |
+|---|---|---|
+| `point_triangulator` on the export, untouched | **refused** | 8 images, 61 points, 166 obs |
+| mean reprojection error | — | **1.63 px** |
+| manual steps between Export and COLMAP | 2 (rotate, renumber) | **0** |
+
+Only projects that need it pay for it: with every photograph already upright,
+nothing is written and the export is byte-for-byte what it was. On rearmod3 it
+is 27.5 MB of copies, which is now named in the status line rather than
+appearing unexplained.
+
+Worth saying plainly about what this does *not* buy. The same investigation
+measured that these eight photographs cannot support a dense reconstruction at
+all — 50.5 deg median angle between viewing directions, 13 of 28 pairs
+verified, 90 points from 200k SIFT features with the poses handed over free.
+This fix makes the handoff correct; it does not make the data sufficient. What
+it did produce is the first check of the cameras against evidence nobody
+clicked: 1477 verified SIFT matches sit at a **median 2.46 px** Sampson error
+against these poses, which agrees with the muted-body RMS of 2.99 px below and
+says the 9.37 px headline is body-fitting error, not camera error.
+
+---
+
 ## Done: surfaces drawn on the photographs (Nov 2026)
 
 A reference plane could only be typed: a name, an axis, an offset. That is the

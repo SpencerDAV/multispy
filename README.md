@@ -952,6 +952,8 @@ is otherwise invisible.
 | `export/scene.step` | **The whole scene as one STEP assembly** — see below. |
 | `export/rig.json` | Every placed object's pose and optical frame, plus the pairwise layout. Written only when something is placed. |
 | `export/rig.csv` | The same layout as a flat table — position, optical axis, yaw and pitch per object — for a spreadsheet or a spec sheet. |
+| `export/images/` | The photographs, upright. Written **only** when some photograph is stored rotated — see below. |
+| `export/scene.blend` | **The whole scene as one Blender file** — written by the **Blend** button, not by Export. See below. |
 
 The COLMAP export is the useful one for this workspace: a hand-marked solve can
 feed Meshroom's dense stage, or be handed to COLMAP's own bundle adjuster to
@@ -959,6 +961,85 @@ refine further.
 
 Verified end to end — `colmap model_analyzer` on the demo export reports 6
 registered images, 17 points, 70 observations, 0.487 px mean reprojection error.
+
+### Why `export/images/` sometimes appears
+
+Every mark in a project is in the frame the browser draws, which is the frame
+*after* EXIF orientation has been applied; `ImageView.width`/`height` hold
+those rotated dimensions. Nothing downstream applies the tag. COLMAP reads the
+stored pixels — measured, below — and `ns-process-data` drives COLMAP, so a
+phone photo shot in portrait reaches both as the landscape it is actually
+stored as, a quarter turn from the model describing it. Blender does the same:
+loaded into Blender 5.1.1, `IMG_6399.JPG` reports 4032x3024 and the upright
+copy beside it reports 3024x4032 — so the background images this tool wires to
+each camera, which exist to make a bad alignment obvious, were themselves a
+quarter turn out.
+
+With the copies in place the Blender script lands where it should. Running
+`import_cameras.py` into Blender 5.1.1 brings in 8 cameras, 33 tie points and
+28 placed bodies, and projecting those tie points through the imported
+`MS_IMG_6405` with `world_to_camera_view` puts them on the marks they were
+clicked at to a **median 2.8 px** (max 7.3) on a 3024x4032 frame — the solve's
+own residual, with nothing added by the transfer.
+
+Measured on a real set: `projects/rearmod3`'s eight photographs are stored
+4032x3024 with orientation 6, and the model says 3024x4032. Handed the export
+as it stood, `colmap point_triangulator` stopped with
+
+```
+Check failed: existing_camera.width == camera.width (3024 vs. 4032)
+```
+
+and under other settings it would not have stopped at all, just produced
+nonsense. The fix is pixels rather than numbers: rotating the exported geometry
+into the stored frame would be free, and would be correct for exactly those
+readers that ignore the tag and wrong for any that honour it. A file carrying
+no orientation tag reads the same either way, so that is what gets written —
+originals copied byte-for-byte, only the rotated ones re-encoded, and the
+model, `transforms.json` and the Blender script all naming the copies.
+
+A project whose photographs are already upright writes no copies and is
+byte-for-byte the export it always was. The same run now goes straight through:
+8 registered images, 61 points, 166 observations, 1.63 px mean reprojection
+error, with no manual step between **Export** and COLMAP.
+
+`IMAGE_ID` is now assigned in filename order for the same reason. COLMAP
+numbers images in the order its extractor walks the directory, and a model
+numbered in the order the photographs happened to be added is rejected by
+`point_triangulator` — on 3.13 with `Check failed: existing_frame.DataIds() ==
+frame.DataIds()`, which names the rig bookkeeping rather than the ids behind it.
+
+### The Blend button
+
+**Blend** builds `export/scene.blend` by running the Blender already on this
+machine, and hands back one file: the solved cameras with each photograph
+behind them, the tie points, and every CAD body at its pose. The photographs
+are *packed into* the file and the CAD arrives as real geometry, so it opens on
+a machine that has neither.
+
+It exists because `import_cameras.py` is the right primitive and the wrong
+deliverable. Running it means finding Blender's Scripting tab, opening the file
+and pressing Run — and what you get still points at photographs and models
+elsewhere on disk, so moving any of them leaves the scene hollow.
+
+Measured on `projects/rearmod3`: **3.2 s**, a 32.3 MB file holding 8 cameras,
+28 bodies at 124,479 vertices and 8 photographs, all packed. Built by Blender
+4.3.2 and reopened in 5.1.1, where the tie points project through
+`MS_IMG_6405` onto the marks they were clicked at to a median 2.8 px.
+
+Which Blender: `--blender`, then `$MULTISPY_BLENDER`, then `PATH`, then the
+newest installed — "newest" settled by asking each binary rather than reading
+its folder name, since this machine has a `Blender 43` that is 4.3.2 sitting
+next to a `Blender 5.1`. With no Blender anywhere the button says so in a
+sentence; it is the one export that can fail for a reason that has nothing to
+do with the project.
+
+**Server build only.** A browser tab has no Blender to run, so the button is
+not shown there. From the command line:
+
+```bash
+.venv\Scripts\python.exe -m multispy blend projects\mypart\project.multispy
+```
 
 ### The STEP scene
 

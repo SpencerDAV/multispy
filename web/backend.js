@@ -183,10 +183,20 @@ const Backend = (() => {
       const opts = body === undefined
         ? {}
         : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
-      const res = await fetch(path, opts);
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-      return data;
+      // Counted here as well as in the worker. The elapsed badge was built for
+      // the static build, where Python runs in the tab, and the server build
+      // never showed it at all -- so a server-side solve, or a Blender run,
+      // was the same silent window the worker was written to cure. Calls that
+      // finish inside a second never paint, so this adds no flicker.
+      enter(labelFor(path));
+      try {
+        const res = await fetch(path, opts);
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+        return data;
+      } finally {
+        leave();
+      }
     }
 
     if (!booted) throw new Error('MultiSpy is still starting up');
@@ -217,6 +227,8 @@ const Backend = (() => {
     '/api/viewpoints': 'working out where to shoot next',
     '/api/mesh': 'reading the model',
     '/api/rig': 'measuring the rig',
+    '/api/blend': 'building the .blend in Blender',
+    '/api/export': 'writing the export',
   };
 
   function labelFor(path) {
@@ -321,6 +333,19 @@ const Backend = (() => {
     return { written: { zip: 'multispy-export.zip' }, out_dir: 'your downloads folder' };
   }
 
+  /** A packed .blend of the solved scene, built by the Blender on this machine.
+   *
+   *  Server only, and deliberately not faked in the static build: Blender is
+   *  a program on a disk, the tab has no way to reach one, and a button that
+   *  explained that every time it was pressed would be worse than no button.
+   *  `app.js` keeps it hidden there.
+   */
+  async function buildBlend(project) {
+    if (isStatic()) throw new Error('the browser build cannot run Blender');
+    const data = await call('/api/blend', { project });
+    return { ...data, file: 'scene.blend' };
+  }
+
   /** The STEP scene alone: a file next to the project, or a direct download. */
   async function exportStep(shape, project) {
     if (!isStatic()) {
@@ -382,6 +407,7 @@ const Backend = (() => {
     addFileUpload,
     exportAll,
     exportStep,
+    buildBlend,
     saveBundle,
     openFile,
     resetProject,

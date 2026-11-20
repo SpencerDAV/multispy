@@ -145,6 +145,20 @@ def main(argv: list[str] | None = None) -> int:
         help="units the STEP file is written in (default mm)",
     )
 
+    p_blend = sub.add_parser(
+        "blend", help="build a packed .blend of the solved scene (needs Blender)"
+    )
+    p_blend.add_argument("project")
+    p_blend.add_argument("out", nargs="?", default=None, help="default: export/scene.blend")
+    p_blend.add_argument(
+        "--blender",
+        default=None,
+        help=(
+            "the Blender executable. Without it: $MULTISPY_BLENDER, then PATH, "
+            "then the newest installed"
+        ),
+    )
+
     p_exif = sub.add_parser("exif", help="show what EXIF says about focal length")
     p_exif.add_argument("project")
 
@@ -153,7 +167,9 @@ def main(argv: list[str] | None = None) -> int:
     p_rig.add_argument("--json", action="store_true", help="dump the full payload instead")
 
     # bare `python -m multispy [path]` means serve
-    if not argv or argv[0] not in {"serve", "solve", "export", "exif", "rig", "-h", "--help"}:
+    if not argv or argv[0] not in {
+        "serve", "solve", "export", "blend", "exif", "rig", "-h", "--help",
+    }:
         argv.insert(0, "serve")
 
     args = parser.parse_args(argv)
@@ -180,6 +196,26 @@ def main(argv: list[str] | None = None) -> int:
         project.save()
         _print_report(report)
         return 0 if report.ok else 1
+
+    if args.command == "blend":
+        from . import blendfile
+
+        project = Project.load(args.project)
+        out = Path(args.out) if args.out else project.path.parent / "export" / "scene.blend"
+        try:
+            exe = blendfile.find_blender(args.blender)
+        except blendfile.BlenderNotFound as exc:
+            print(exc)
+            return 1
+        version = ".".join(str(v) for v in blendfile.blender_version(exe)) or "unknown version"
+        print(f"building with {exe} ({version})")
+        try:
+            written = blendfile.build_blend(project, out, blender=exe)
+        except (blendfile.BlenderFailed, ValueError) as exc:
+            print(exc)
+            return 1
+        print(f"{written}  ({written.stat().st_size / 1e6:.1f} MB)")
+        return 0
 
     if args.command == "exif":
         project = Project.load(args.project)
@@ -236,9 +272,11 @@ def main(argv: list[str] | None = None) -> int:
     project = Project.load(args.project)
     out_dir = Path(args.out_dir) if args.out_dir else project.path.parent / "export"
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(exporters.export_colmap(project, out_dir / "sparse"))
-    print(exporters.export_blender(project, out_dir / "import_cameras.py"))
-    print(exporters.export_transforms_json(project, out_dir / "transforms.json"))
+    print(exporters.export_colmap(project, out_dir / "sparse", out_dir / "images"))
+    print(exporters.export_blender(project, out_dir / "import_cameras.py", out_dir / "images"))
+    print(
+        exporters.export_transforms_json(project, out_dir / "transforms.json", out_dir / "images")
+    )
     print(exporters.export_ply(project, out_dir / "tiepoints.ply"))
     print(
         exporters.export_step(
