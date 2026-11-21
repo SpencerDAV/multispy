@@ -349,6 +349,9 @@ def calibrate_all(project: Project, report: SolveReport) -> dict[str, Intrinsics
                 + grouped
             )
             continue
+        group = project.group_of(im)
+        locked_f = group.f if (group.lock_focal and group.f is not None) else None
+        from_locked_focal = False
         try:
             calib = calibrate_image(
                 usable,
@@ -358,17 +361,46 @@ def calibrate_all(project: Project, report: SolveReport) -> dict[str, Intrinsics
                 sigma_px=project.settings.sigma_line_px,
             )
         except ValueError as exc:
-            rep.notes.append(str(exc))
-            continue
+            # This photo's own vanishing points cannot produce a real focal --
+            # two axes nearly parallel in the image, or one pointing down the
+            # optical axis. That is no reason to drop the photo when its camera
+            # group already holds a focal the user has locked: without this the
+            # image never reaches the re-derivation pass below, which is the
+            # only place the group focal is otherwise applied. Tried second so
+            # that a photo which CAN measure its own focal still contributes
+            # that measurement to the group.
+            if locked_f is None:
+                rep.notes.append(str(exc))
+                continue
+            try:
+                calib = calibrate_image(
+                    usable,
+                    im.width,
+                    im.height,
+                    solve_principal_point=project.settings.solve_principal_point,
+                    sigma_px=project.settings.sigma_line_px,
+                    fixed_focal=locked_f,
+                )
+            except ValueError as exc2:
+                rep.notes.append(str(exc2))
+                continue
+            from_locked_focal = True
+            rep.notes.append(
+                f"focal not derivable from this photo's own control lines ({exc}); "
+                f"used camera group {group.id}'s locked focal of {locked_f:.1f} px."
+            )
         rep.notes.extend(calib.warnings)
         if calib.focal_relative_sigma is not None:
             rep.focal_sigma_pct = 100.0 * calib.focal_relative_sigma
             if calib.observability and calib.observability.best:
                 rep.observability = calib.observability.best.verdict
         per_image[im.id] = calib.intrinsics
-        per_group_focals.setdefault(im.group, []).append(
-            (calib.intrinsics.f, calib.focal_relative_sigma)
-        )
+        # A focal that came from the group's lock is not a measurement of it,
+        # so it must not vote on the group focal or on how well observed it is.
+        if not from_locked_focal:
+            per_group_focals.setdefault(im.group, []).append(
+                (calib.intrinsics.f, calib.focal_relative_sigma)
+            )
         im.R = calib.R
 
     # settle one focal length per group, weighting each image by how well its own
