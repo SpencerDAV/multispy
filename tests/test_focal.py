@@ -66,10 +66,18 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from multispy.project import ObjectAnchor, ObjectInstance, ObjectTemplate, Project
-from multispy.solve import solve
+from multispy.project import (
+    AxisLine,
+    CameraGroup,
+    ImageView,
+    ObjectAnchor,
+    ObjectInstance,
+    ObjectTemplate,
+    Project,
+)
+from multispy.solve import SolveReport, calibrate_all, solve
 
-from test_part import build_part_project
+from test_part import HEIGHT, WIDTH, build_part_project
 
 # A clamp: a plain box in millimetres, with its eight corners offered as anchors.
 # No mesh file, the same way ``test_rig``'s bodies have none -- a template's
@@ -339,6 +347,110 @@ def test_the_bound_is_a_setting_and_says_so():
     # lands, and a tautology dressed as a check is worse than an honest absence.
 
 
+# --------------------------------------------------------------------------
+# a focal the group already knows
+# --------------------------------------------------------------------------
+
+DEGENERATE_VPS = ((7000.0, 940.0), (6200.0, 800.0))
+"""Two vanishing points on the same side of the principal point.
+
+Orthogonality under a pinhole is ``(v1 - c) . (v2 - c) + f^2 = 0``, so a pair
+whose dot product is *positive* asks for ``f^2 < 0`` and no real focal exists.
+That is not a contrived arrangement: it is what a photograph taken down the line
+of its own structure looks like, and it is exactly what alberto's img9 produced
+(X x Z at ``f^2 = -173671``). Such a pair is genuinely not perpendicular at any
+focal, so ``calibrate_image`` also remarks on the angle -- that warning is a
+true statement about this geometry and not a flaw in the fixture.
+"""
+
+
+def degenerate_image(group: str = "cam0", ident: str = "down_the_line") -> ImageView:
+    """A photo with two full axes of control lines that still cannot state a focal."""
+    im = ImageView(id=ident, path=f"{ident}.jpg", width=WIDTH, height=HEIGHT, group=group)
+    for axis, vp, starts in (
+        (0, DEGENERATE_VPS[0], [(200.0, 300.0), (200.0, 1500.0)]),
+        (2, DEGENERATE_VPS[1], [(300.0, 1700.0), (350.0, 120.0)]),
+    ):
+        for s in starts:
+            p0 = np.array(s, dtype=float)
+            d = np.array(vp, dtype=float) - p0
+            p1 = p0 + 1200.0 * d / np.linalg.norm(d)
+            im.axis_lines.append(
+                AxisLine(axis=axis, p0=[float(p0[0]), float(p0[1])],
+                         p1=[float(p1[0]), float(p1[1])])
+            )
+    return im
+
+
+def locked_group_scene(lock: bool):
+    """The plate scene, its focal locked at the truth, plus one photo that cannot
+    measure a focal of its own."""
+    project, truth = build_part_project()
+    project.groups["cam0"] = CameraGroup(
+        id="cam0", f=float(truth["focal"]), lock_focal=lock
+    )
+    project.images.append(degenerate_image())
+    report = SolveReport()
+    intrinsics = calibrate_all(project, report)
+    return project, truth, report, intrinsics
+
+
+def test_a_locked_focal_rescues_a_photo_that_cannot_measure_one():
+    """A photo whose own vanishing points yield no real focal still calibrates,
+    provided its camera group holds a focal the user has locked.
+
+    Dropping it instead is the expensive outcome and it is not a near miss: the
+    rotation such a photo gives is perfectly good -- its vanishing *directions*
+    are well determined, it is only their implied focal that is imaginary -- and
+    on a two-photo group losing one image loses the group. That is how alberto's
+    group B came to report ``0 images positioned`` while holding a measured,
+    locked 2342.3 px the whole time, which the calibration pass was declining to
+    use. The focal was never in question; only which code path was allowed to
+    reach for it.
+    """
+    project, truth, report, intrinsics = locked_group_scene(lock=True)
+    im = project.images[-1]
+
+    assert im.id in intrinsics, f"the photo was dropped: {report.images[im.id].notes}"
+    assert intrinsics[im.id].f == float(truth["focal"]), intrinsics[im.id].f
+    assert im.R is not None, "calibrated but no rotation"
+
+    # and it says so, because a borrowed focal is not a measured one and the
+    # difference is the reader's to see
+    notes = " ".join(report.images[im.id].notes)
+    assert "locked focal" in notes, notes
+
+    # A borrowed focal must not vote on the group's focal or on how well that
+    # focal is observed -- it is a copy of the answer, so counting it would be
+    # the group confirming itself. The photos that *can* measure one still do.
+    assert report.images[im.id].focal_sigma_pct is None, report.images[im.id].focal_sigma_pct
+    measured = [
+        iid for iid, r in report.images.items()
+        if iid != im.id and r.focal_sigma_pct is not None
+    ]
+    assert measured, "no photo contributed a focal measurement; fixture is wrong"
+    assert project.groups["cam0"].f == float(truth["focal"]), project.groups["cam0"].f
+
+
+def test_without_the_lock_the_same_photo_is_dropped():
+    """The control arm, and the reason the group focal is read rather than
+    guessed at.
+
+    Unlocked, there is no focal anyone has vouched for, so substituting the
+    group's running estimate would be inventing a measurement. The photo is
+    dropped and told why -- which is the behaviour this fallback deliberately
+    leaves untouched.
+    """
+    project, _truth, report, intrinsics = locked_group_scene(lock=False)
+    im = project.images[-1]
+
+    assert im.id not in intrinsics, "calibrated without a locked focal to borrow"
+    assert im.R is None, "no focal, yet a rotation was produced"
+    notes = " ".join(report.images[im.id].notes)
+    assert "no vanishing point pair yields a real focal" in notes, notes
+    assert "locked focal" not in notes, notes
+
+
 def main() -> int:
     tests = [
         test_a_mismarked_body_cannot_collapse_the_focal,
@@ -347,6 +459,8 @@ def main() -> int:
         test_the_wall_does_not_hide_the_bad_body,
         test_a_focal_outside_the_window_never_reaches_the_project,
         test_the_bound_is_a_setting_and_says_so,
+        test_a_locked_focal_rescues_a_photo_that_cannot_measure_one,
+        test_without_the_lock_the_same_photo_is_dropped,
     ]
     failures = 0
     for fn in tests:

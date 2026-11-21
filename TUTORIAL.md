@@ -105,9 +105,21 @@ Four rules, in order of how often they are broken:
    edge look like two lines but tell the solver one thing.
 3. **Draw along the positive direction.** The arrowhead shows which way the line
    points; it must run the way the axis increases. Get this wrong and the solve
-   comes out mirrored. **Click a drawn line to reverse it** — no need to delete
-   and redraw. Watch for this especially when two axes in one photo are both
-   backwards: that pair cancels into a legal rotation, so nothing warns you.
+   comes out mirrored, or a clean 180° out. **Click a drawn line to reverse it**
+   — no need to delete and redraw.
+
+   One backwards arrow among several on the same axis is caught for you: the
+   **Focal check** panel puts a red box at the top naming the line, the arrow is
+   ringed in white on the photo, and a **flip** button in the box corrects it.
+   Note what that costs if it is missed — the focal length, the residuals and
+   the orthogonality error all stay perfect, which is why it is worth fixing on
+   sight rather than after a solve.
+
+   Two blind spots remain, and both need your eyes rather than the check:
+   *every* line on an axis drawn backwards together is a consistent choice no
+   single photo can argue with, and two axes in one photo both backwards cancel
+   into a legal rotation. With all three axes marked the panel still complains
+   about the right-handedness; with two it cannot.
 4. **Longer is much better.** A 2 px slip on a 1000 px line matters a tenth as
    much as on a 100 px one, and the solver weights it that way.
 
@@ -498,7 +510,7 @@ Two failure modes worth recognising before you shoot:
 | Shape error high and will not come down | Anchors on features you cannot actually identify — bolt rims are the classic | Use ring (centre) and cross (filleted corner) anchors instead |
 | The corners you want are not offered | They are filleted, so no vertex sits there | Look for the **cross** marks just outside each rounded corner; that is the corner, reconstructed |
 | Nothing useful offered at all | A heavily filleted part with no round features | **type a position…** and enter coordinates from the drawing |
-| Grid skewed or floating | Frame is wrong despite good residuals | Check control-line directions — a mirrored solve |
+| Grid skewed or floating | Frame is wrong despite good residuals | Check control-line directions — a mirrored solve. A single reversed arrow is flagged in **Focal check**; a whole axis drawn backwards is not, so compare the arrowheads against the part |
 | *"hit the iteration limit"* | The solve did not converge | Treat the numbers as provisional; usually a symptom of one of the above |
 
 ---

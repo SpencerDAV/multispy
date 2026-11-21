@@ -386,6 +386,14 @@
   table.obs td.lever.hi { color: var(--bad); }
   table.obs td.lever.mid { color: var(--warn); }
   .obs-advice { color: var(--warn); font-size: 11px; margin-top: 6px; }
+  /* A reversed control line, boxed and bordered rather than set as another line
+   * of advice. Everything else in this panel is a matter of degree -- how well
+   * the focal length is observable -- and this one is a mistake with a fix, so
+   * it is the one thing here that is allowed to shout. */
+  .obs-flip { border: 1px solid var(--bad); border-radius: 5px; padding: 5px 7px; margin-bottom: 7px;
+              background: #e5604f1c; }
+  .obs-flip-head { color: var(--bad); font-weight: 600; font-size: 12px; margin-bottom: 3px; }
+  .obs-flip-acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
 
   /* ------------------------------------------------------- focal controls */
   .focalbox { border: 1px solid var(--border); border-radius: 5px; padding: 6px 7px; margin-top: 7px; }

@@ -13,6 +13,11 @@ const AXIS_NAME = ['X', 'Y', 'Z'];
  * the one mistake worth designing against is drawing one where you meant the
  * other. */
 const GROUP_COLOR = ['#ffb347', '#c792ea', '#56d4dd', '#f78fb3', '#9ccc65', '#e6b8ff'];
+/* The one colour that means "this mark is wrong", as opposed to the axis and
+ * group colours, which only say what a mark is. White, because every hue in
+ * both palettes above is already spoken for -- a reversed X line drawn in
+ * amber would read as a tray line, and in red as a correct X line. */
+const ALARM_COLOR = '#ffffff';
 const RESIDUAL_GAIN = 10; // sub-pixel errors are invisible at 1:1
 /* Screen pixels a press may wander and still count as a click rather than a
  * drag. A press on a control line is ambiguous -- it could mean "flip this"
@@ -72,6 +77,16 @@ const state = {
    * the thing being looked at. Cleared by that click, and by leaving the
    * photo. */
   repair: null,
+  /* Control lines the server says are drawn backwards, as
+   * {image, lines:Set, agreeing:Set} for the photo on screen.
+   *
+   * Held in state, and painted on the canvas rather than only written in the
+   * panel, because the whole difficulty with a reversed arrow is that it is
+   * invisible: the line is on the right edge, the vanishing point is unmoved,
+   * the residuals are clean. A sentence in a side panel about "line #2" asks
+   * someone to count control lines in a photograph. Marking the arrow itself is
+   * the only form of this warning that lands where the mistake is. */
+  lineAlarm: null,
 };
 
 /* Anchors are keyed "<instance>/<anchor>" to match the project format, where
@@ -1950,9 +1965,32 @@ function drawFilmstripOverlays() {
 }
 
 function drawControlLines(im, z) {
+  const alarm = state.lineAlarm && state.lineAlarm.image === im.id ? state.lineAlarm : null;
   im.axis_lines.forEach((ln, idx) => {
     const isHover = state.hover && state.hover.kind === 'line' && state.hover.index === idx;
+    const suspect = !!(alarm && alarm.lines.has(idx));
+    const outvoted = !!(alarm && alarm.agreeing.has(idx));
+    // The axis colour is kept on a flagged line: what is wrong with it is the
+    // direction, not which axis it is on, and recolouring it would hide the one
+    // thing about it that is still correct.
     const col = lineColor(ln);
+
+    /* A halo on the arrow that disagrees with the rest of its axis, and a
+     * fainter one on the lines it disagrees with. Both, because the minority is
+     * not necessarily the one that is wrong -- with two lines on an axis the
+     * image cannot tell -- and marking only the odd one out would be an
+     * accusation the geometry does not support. */
+    if (suspect || outvoted) {
+      ctx.save();
+      ctx.strokeStyle = suspect ? ALARM_COLOR + '66' : ALARM_COLOR + '26';
+      ctx.lineWidth = (suspect ? 11 : 7) / z;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(ln.p0[0], ln.p0[1]);
+      ctx.lineTo(ln.p1[0], ln.p1[1]);
+      ctx.stroke();
+      ctx.restore();
+    }
     ctx.strokeStyle = col;
     ctx.lineWidth = (isHover ? 3.5 : 2) / z;
     // dashed means flagged uncertain: still in the solve, at a wider sigma,
@@ -1980,8 +2018,17 @@ function drawControlLines(im, z) {
       ctx.lineTo(ln.p1[0] - a * ux + a * 0.45 * uy, ln.p1[1] - a * uy - a * 0.45 * ux);
       ctx.lineTo(ln.p1[0] - a * ux - a * 0.45 * uy, ln.p1[1] - a * uy + a * 0.45 * ux);
       ctx.closePath();
-      ctx.fillStyle = col;
+      // Only the odd one out gets the white head. The lines it disagrees with
+      // keep their axis colour and wear the faint halo instead: they are part
+      // of the argument, but the arrow being questioned is this one.
+      ctx.fillStyle = suspect ? ALARM_COLOR : col;
       ctx.fill();
+      if (suspect) {
+        // outlined as well as filled, so it reads as the thing being pointed at
+        ctx.strokeStyle = '#0d0f12';
+        ctx.lineWidth = 1.5 / z;
+        ctx.stroke();
+      }
     } else if (isHover) {
       // which group this belongs to, where the eye already is
       ctx.fillStyle = col;
@@ -2818,7 +2865,13 @@ function flipLine(im, index) {
   }
   [ln.p0, ln.p1] = [ln.p1, ln.p0];
   markDirty();
-  setStatus(`${AXIS_NAME[ln.axis]} line ${index} reversed — the arrow now points the other way`, 'ok');
+  // Numbered within its axis and from 1, which is how the direction check, the
+  // observability panel and the solve report all name a control line. This said
+  // "line 7" for the second Z line, so acting on a warning about "Z #2" meant
+  // reading a confirmation about a line 7 that appears nowhere else.
+  const n = im.axis_lines.filter(
+    (o, i) => i < index && !o.direction_group && o.axis === ln.axis).length + 1;
+  setStatus(`${AXIS_NAME[ln.axis]} line #${n} reversed — the arrow now points the other way`, 'ok');
   renderPanels();
   render();
 }
@@ -4364,20 +4417,44 @@ async function refreshObservability() {
   const im = currentImage();
   const panel = $('obspanel');
   const badge = $('obsverdict');
-  if (!im) { panel.innerHTML = ''; badge.textContent = ''; badge.className = 'count'; return; }
+  if (!im) {
+    panel.innerHTML = ''; badge.textContent = ''; badge.className = 'count';
+    state.lineAlarm = null; return;
+  }
   try {
-    renderObservability(await api('/api/observability', {
+    const d = await api('/api/observability', {
       width: im.width,
       height: im.height,
       axis_lines: im.axis_lines,
       sigma_px: (state.project.settings && state.project.settings.sigma_line_px) || 2.0,
-    }));
+    });
+    // Tagged with the photo it was computed for. This is an await inside a
+    // debounce: the answer can arrive after the user has stepped to the next
+    // image, and an alarm painted on the wrong photograph is worse than none.
+    setLineAlarm(im.id, d.reversed || []);
+    renderObservability(d, im);
   } catch (err) {
+    state.lineAlarm = null;
     panel.innerHTML = `<div class="note bad">${escapeHtml(err.message)}</div>`;
   }
 }
 
-function renderObservability(d) {
+/** Mark, on the canvas, which arrows the sign check disagrees about. */
+function setLineAlarm(imageId, reversed) {
+  if (!reversed.length) {
+    if (state.lineAlarm) { state.lineAlarm = null; render(); }
+    return;
+  }
+  const lines = new Set(), agreeing = new Set();
+  for (const r of reversed) {
+    for (const l of r.lines) lines.add(l.index);
+    for (const l of r.agreeing || []) agreeing.add(l.index);
+  }
+  state.lineAlarm = { image: imageId, lines, agreeing };
+  render();
+}
+
+function renderObservability(d, im) {
   const panel = $('obspanel');
   const badge = $('obsverdict');
   const best = d.best;
@@ -4386,6 +4463,33 @@ function renderObservability(d) {
   badge.className = 'count ' + (best ? 'v-' + best.verdict : '');
 
   let html = '';
+
+  /* Reversed control lines go above the focal-length verdict, which is the only
+   * place they can go. A photo with one axis arrow backwards still reports a
+   * tight, confident focal length -- the number this panel exists to show --
+   * and a reader who has just seen "good, +-1.2%" has already stopped reading. */
+  for (const r of d.reversed || []) {
+    // `n` throughout, never `index`: the user sees the line's number within its
+    // axis, the same one the message and the solve report use. `index` is the
+    // row in the photo's list, which only the canvas and flipLine care about.
+    const names = r.lines.map((l) => `#${l.n}`).join(', ');
+    const flipBtn = (l, suffix) =>
+      `<button class="smallbtn" data-flip="${l.index}">flip ${r.name} #${l.n}${suffix}</button>`;
+    html += `<div class="obs-flip">`
+          + `<div class="obs-flip-head">&#9888; ${r.name} direction: line${r.lines.length > 1 ? 's' : ''} `
+          + `${names} drawn ${r.worst_opposition_deg.toFixed(0)}&deg; opposed</div>`
+          + `<div class="msg">${escapeHtml(r.message)}</div>`
+          + `<div class="obs-flip-acts">`
+          + r.lines.map((l) => flipBtn(l, '')).join('')
+          // The minority is not necessarily the wrong one: with two lines on an
+          // axis both readings fit the vanishing point, so the other side has to
+          // be offered as a flip too or the panel is guessing.
+          + (r.too_close_to_call
+              ? r.agreeing.map((l) => flipBtn(l, ' instead')).join('')
+              : '')
+          + `</div></div>`;
+  }
+
   if (best && best.relative_sigma != null) {
     const pct = best.relative_sigma * 100;
     // full bar at 0%, empty by 20% -- the range where the answer stops meaning anything
@@ -4423,6 +4527,19 @@ function renderObservability(d) {
   if (d.advice) html += `<div class="obs-advice">${escapeHtml(d.advice)}</div>`;
 
   panel.innerHTML = html;
+
+  for (const btn of panel.querySelectorAll('[data-flip]')) {
+    btn.onclick = () => {
+      const idx = Number(btn.dataset.flip);
+      // against the live image, not the one this panel was rendered for: a
+      // stale index would flip an innocent line in a different photograph
+      const now = currentImage();
+      if (!im || !now || now.id !== im.id) return;
+      // flipLine re-renders the panels, which re-polls this check, so the
+      // flag either clears or moves to the other line without another click
+      flipLine(now, idx);
+    };
+  }
 }
 
 /* ------------------------------------------------------------ nominals

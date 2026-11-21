@@ -300,15 +300,22 @@ def observability_payload(body: dict) -> dict:
         raise ValueError("need image dimensions")
 
     by_axis: dict[int, list[list[float]]] = {}
-    for ln in body.get("axis_lines") or []:
+    origin: dict[int, list[int]] = {}
+    for idx, ln in enumerate(body.get("axis_lines") or []):
         # a grouped line has no world axis to analyse: its direction is an output
         # of the bundle, so it cannot contribute to a vanishing point here any
         # more than it can in ``calibrate_all``
         if ln.get("direction_group"):
             continue
-        by_axis.setdefault(int(ln["axis"]), []).append(
+        axis = int(ln["axis"])
+        by_axis.setdefault(axis, []).append(
             [float(ln["p0"][0]), float(ln["p0"][1]), float(ln["p1"][0]), float(ln["p1"][1])]
         )
+        # Grouped lines were skipped, so the row a sign check reports is not the
+        # line's position in the photo's own list. Carried along rather than
+        # recomputed, because an off-by-one here points the user's eye at an
+        # innocent line, which is worse than not pointing it anywhere.
+        origin.setdefault(axis, []).append(idx)
     segments = {a: np.array(v, dtype=float) for a, v in by_axis.items()}
 
     analysis = analyse_axes(segments, width, height, sigma_px=float(body.get("sigma_px") or 2.0))
@@ -339,11 +346,45 @@ def observability_payload(body: dict) -> dict:
     best = None
     if analysis.best is not None:
         best = next(p for p in pairs_out if p["note"] == analysis.best.note)
+
+    # Reversed control lines, kept apart from "problems" -- those are advice
+    # about how well the focal length is observable, this is an error with a fix.
+    #
+    # Two numbers per line, and they are not interchangeable. ``index`` is the
+    # row in the photo's own list, which the canvas needs and nobody should ever
+    # read; ``n`` counts within the axis, which is what the solve report, the
+    # panel text and the buttons all say, so that one reversed line is "Z #2"
+    # everywhere it is mentioned rather than #2 in one place and #8 in another.
+    def _ref(rows: list[int], vote) -> dict:
+        return {"index": rows[vote.index], "n": vote.index + 1}
+
+    reversed_out = []
+    for axis in analysis.contested_axes:
+        check = analysis.signs[axis]
+        rows = origin.get(axis, [])
+        reversed_out.append({
+            "axis": axis,
+            "name": AXIS_NAMES[axis],
+            "lines": [_ref(rows, v) for v in check.dissenting if v.index < len(rows)],
+            "agreeing": [
+                _ref(rows, v) for v in check.votes
+                if v.agrees and v.length_px > 0.0 and v.index < len(rows)
+            ],
+            "worst_opposition_deg": check.worst_opposition_deg,
+            "majority_px": check.majority_px,
+            "minority_px": check.minority_px,
+            "too_close_to_call": bool(check.too_close_to_call),
+            "message": check.message(),
+        })
     return {
         "axes": axes_out,
         "pairs": pairs_out,
         "best": best,
-        "problems": analysis.problems,
+        # ...and not said twice: analyse_axes appends the same sentence to
+        # problems so that a client reading only text still gets it
+        "problems": [p for p in analysis.problems
+                     if p not in {r["message"] for r in reversed_out}],
+        "reversed": reversed_out,
         "advice": _observability_advice(analysis) if analysis.best else "",
     }
 

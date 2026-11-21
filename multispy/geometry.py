@@ -547,6 +547,18 @@ class AxisAnalysis:
     pairs: list[FocalObservability] = field(default_factory=list)
     best: FocalObservability | None = None
     problems: list[str] = field(default_factory=list)
+    signs: dict[int, AxisSignCheck] = field(default_factory=dict)
+    """Per-axis direction poll of the control lines; see :class:`AxisSignCheck`.
+
+    Kept separate from ``problems`` even though a contested axis also appends a
+    line there, because this one is not advice about how well the focal length
+    is observable -- it is a markup error with a specific line number behind it,
+    and the UI needs the number to point at the line on the photo.
+    """
+
+    @property
+    def contested_axes(self) -> list[int]:
+        return [a for a, s in sorted(self.signs.items()) if s.contested]
 
 
 def analyse_axes(
@@ -580,6 +592,14 @@ def analyse_axes(
             out.axes[axis] = estimate_vanishing_point(segs, width, height, sigma_px)
         except ValueError as exc:
             out.problems.append(f"{AXIS_NAMES[axis]}: {exc}")
+            continue
+        # Checked here rather than only in the solve because this is the one
+        # place that runs while the lines are still being drawn, and a reversed
+        # arrow is cheapest to fix in the second after it was drawn.
+        check = check_axis_signs(out.axes[axis].v, segs, axis=axis)
+        out.signs[axis] = check
+        if check.contested:
+            out.problems.append(check.message())
 
     axes = sorted(out.axes)
     if len(axes) < 2:
@@ -664,6 +684,194 @@ def direction_from_vp(v: np.ndarray, cam: Intrinsics) -> np.ndarray:
     return d / n
 
 
+@dataclass
+class SignVote:
+    """How one control line voted on the sign of its own axis.
+
+    ``score`` is the segment's drawn displacement ``p0 -> p1`` projected onto
+    the direction of its own vanishing point, so it reads in pixels: a 400 px
+    line drawn cleanly along the axis votes about +-400, and the sign is the
+    whole of what it has to say. ``opposition_deg`` is that same fact as an
+    angle, measured against whichever way the majority of the length went --
+    near 0 for a line drawn like the others, near 180 for one drawn backwards.
+    The angle is the form worth showing someone, because it is what they are
+    looking at on the photo.
+    """
+
+    index: int
+    """Row in the segment array handed in, so a caller can name the line."""
+    score: float
+    length_px: float
+    opposition_deg: float
+
+    @property
+    def agrees(self) -> bool:
+        return self.opposition_deg < 90.0
+
+
+@dataclass
+class AxisSignCheck:
+    """Whether one image's control lines on one axis agree which way it points.
+
+    The failure this exists for: a vanishing point is blind to the direction a
+    segment was drawn in -- reversing ``p0`` and ``p1`` leaves the line, and so
+    the vanishing point, identical. Only the drag direction fixes the *sign* of
+    the axis, and :func:`resolve_direction_sign` settles it by a vote weighted
+    by segment length. So one line drawn backwards among several does not fail,
+    it dilutes: the axis still comes out, pointing whichever way the longer
+    lines happened to go.
+
+    That is worth a flag of its own rather than a residual, because it leaves no
+    residual. Flipping one axis flips the right-handed completion of the other
+    two with it, so the camera arrives as a perfectly legal rotation 180 degrees
+    out, with a clean orthogonality error and a focal length nothing argues
+    with. Everything downstream inherits the 180 and nothing anywhere complains.
+
+    What this cannot see: lines that *all* agree with each other and are *all*
+    drawn backwards. That is a consistent choice, indistinguishable in this
+    image from a camera turned around, and it takes a third marked axis to
+    catch -- which is what the right-handed completion warning in
+    :func:`calibrate_image` is for.
+    """
+
+    votes: list[SignVote] = field(default_factory=list)
+    sign: float = 1.0
+    """+1 when the length-weighted majority drew toward the vanishing point."""
+    axis: int | None = None
+
+    @property
+    def dissenting(self) -> list[SignVote]:
+        return [v for v in self.votes if not v.agrees and v.length_px > 0.0]
+
+    @property
+    def contested(self) -> bool:
+        return bool(self.dissenting)
+
+    @property
+    def majority_px(self) -> float:
+        return sum(v.length_px for v in self.votes if v.agrees)
+
+    @property
+    def minority_px(self) -> float:
+        return sum(v.length_px for v in self.dissenting)
+
+    @property
+    def worst_opposition_deg(self) -> float:
+        return max((v.opposition_deg for v in self.dissenting), default=0.0)
+
+    @property
+    def too_close_to_call(self) -> bool:
+        """The two camps are near enough equal in length that the vote is noise.
+
+        With two lines and one of them reversed, the sign of the whole axis
+        turns on which one the user happened to drag further, which is not
+        evidence about the part.
+        """
+        return self.contested and self.majority_px < 1.6 * max(self.minority_px, 1e-9)
+
+    def message(self) -> str:
+        """Plain account of the disagreement, ending in what to do about it."""
+        if not self.contested:
+            return ""
+        name = AXIS_NAMES[self.axis] if self.axis is not None else "this axis"
+        bad = self.dissenting
+        which = ", ".join(f"#{v.index + 1}" for v in bad)
+        total = len(self.votes)
+        others = total - len(bad)
+        head = (
+            f"{name}: control line{'s' if len(bad) > 1 else ''} {which} of {total} "
+            f"{'are' if len(bad) > 1 else 'is'} drawn {self.worst_opposition_deg:.0f} deg "
+            f"opposed to the {'others' if others > 1 else 'other'} -- "
+        )
+        if self.worst_opposition_deg < 150.0:
+            head += (
+                "not a clean reversal, so besides a backwards drag this can mean the line sits "
+                f"on an edge that is not really parallel to {name}, or belongs to another axis. "
+            )
+        elif len(bad) > 1:
+            # The majority is by length, not by count, so "two against one" here
+            # can mean two short lines outvoted by one long one -- in which case
+            # the single line is the likelier culprit, and saying "one of them
+            # is reversed" would point at the pair.
+            head += f"the {name} lines are split, and a clean reversal is somewhere in them. "
+        else:
+            head += "one of them is reversed. "
+        body = (
+            f"The sign of the whole {name} axis is settled by a length vote, "
+            f"{self.majority_px:.0f} px against {self.minority_px:.0f} px"
+        )
+        if self.too_close_to_call:
+            body += ", far too close to call"
+        body += ". "
+        if others == len(bad):
+            tail = (
+                "Which of them is wrong the image cannot say -- both readings fit the vanishing "
+                "point exactly as well -- so check the arrowheads against the part itself. "
+            )
+        else:
+            tail = (
+                "Look at the arrowheads on the photo and click the one pointing the wrong way "
+                "to flip it. "
+            )
+        tail += (
+            f"Left alone, a wrong sign on {name} turns the camera into a legal rotation 180 deg "
+            "about another axis, with clean residuals and a focal length nothing argues with, so "
+            "nothing downstream will object."
+        )
+        return head + body + tail
+
+
+def check_axis_signs(v: np.ndarray, segments: np.ndarray, axis: int | None = None) -> AxisSignCheck:
+    """Poll each control line on which way its axis points, and compare them.
+
+    The per-line test is the one :func:`resolve_direction_sign` already applies
+    to the bundle as a whole: a point travelling along the positive direction
+    has its image approach the vanishing point, so a segment drawn along the
+    positive direction has ``p1`` nearer the vanishing point than ``p0``.
+    Projecting the drawn displacement onto the direction toward the vanishing
+    point therefore gives a signed number per line, in pixels, and the lines on
+    one axis have to agree on its sign. Where they do not, one of them was drawn
+    backwards.
+
+    Compared against the vanishing point, not against each other, and that is
+    the whole reason this is a function rather than a dot product at the call
+    site. Two lines straddling a vanishing point that falls inside the frame
+    legitimately have image directions nearly 180 degrees apart -- both point at
+    it from opposite sides -- so comparing drawn displacements with each other
+    would flag every such pair. Measured toward the vanishing point they both
+    read as agreeing, which they do.
+    """
+    segments = np.atleast_2d(np.asarray(segments, dtype=float))
+    v = np.asarray(v, dtype=float)
+    at_infinity = abs(v[2]) < 1e-9
+
+    raw: list[tuple[int, float, float, float]] = []
+    for i, seg in enumerate(segments):
+        p0, p1 = seg[0:2], seg[2:4]
+        drawn = p1 - p0
+        length = float(np.linalg.norm(drawn))
+        toward = v[:2] if at_infinity else v[:2] / v[2] - 0.5 * (p0 + p1)
+        n = np.linalg.norm(toward)
+        if n < 1e-12 or length < 1e-12:
+            # a midpoint sitting on the vanishing point, or a zero-length line:
+            # no information, so an abstention rather than a vote either way
+            raw.append((i, 0.0, length, 90.0))
+            continue
+        score = float(drawn @ (toward / n))
+        cos = max(-1.0, min(1.0, score / length))
+        raw.append((i, score, length, math.degrees(math.acos(cos))))
+
+    total = sum(r[1] for r in raw)
+    sign = 1.0 if total >= 0.0 else -1.0
+    check = AxisSignCheck(sign=sign, axis=axis)
+    for i, score, length, angle in raw:
+        opposition = 90.0 if length < 1e-12 else (angle if sign > 0.0 else 180.0 - angle)
+        check.votes.append(
+            SignVote(index=i, score=score, length_px=length, opposition_deg=opposition)
+        )
+    return check
+
+
 def resolve_direction_sign(d: np.ndarray, v: np.ndarray, segments: np.ndarray) -> np.ndarray:
     """Flip ``d`` so it agrees with the direction the control lines were drawn in.
 
@@ -681,23 +889,17 @@ def resolve_direction_sign(d: np.ndarray, v: np.ndarray, segments: np.ndarray) -
     A vanishing point at infinity is a separate case: there ``d`` is
     proportional to the homogeneous ``(p, q, 0)``, so its sign already tracks
     ``v``, and the drawn displacement is compared with ``(p, q)`` directly.
-    """
-    segments = np.atleast_2d(np.asarray(segments, dtype=float))
-    v = np.asarray(v, dtype=float)
-    at_infinity = abs(v[2]) < 1e-9
-    if not at_infinity and d[2] < 0.0:
-        d = -d
 
-    score = 0.0
-    for seg in segments:
-        p0, p1 = seg[0:2], seg[2:4]
-        drawn = p1 - p0
-        toward = v[:2] if at_infinity else v[:2] / v[2] - 0.5 * (p0 + p1)
-        n = np.linalg.norm(toward)
-        if n < 1e-12:
-            continue
-        score += float(drawn @ (toward / n))
-    return d if score >= 0.0 else -d
+    The vote is length-weighted and that is a deliberate choice, but it is also
+    what makes one backwards line dangerous rather than fatal -- see
+    :class:`AxisSignCheck`, which is the same poll kept per line instead of
+    summed, so that a disagreement can be reported rather than averaged away.
+    """
+    v = np.asarray(v, dtype=float)
+    if abs(v[2]) >= 1e-9 and d[2] < 0.0:
+        d = -d
+    check = check_axis_signs(v, segments)
+    return d if check.sign >= 0.0 else -d
 
 
 @dataclass
@@ -712,6 +914,18 @@ class Calibration:
     orthogonality_error_deg: float = 0.0
     observability: AxisAnalysis | None = None
     focal_relative_sigma: float | None = None
+    signs: dict[int, AxisSignCheck] = field(default_factory=dict)
+    """Per-axis direction poll, so a caller can promote a contested axis.
+
+    The warning is in ``warnings`` as well, but this is a structured copy on
+    purpose: ``calibrate_all`` raises a reversed line to a project-level
+    warning rather than a per-image note, and deciding that from a string is
+    how a check quietly stops firing.
+    """
+
+    @property
+    def contested_axes(self) -> list[int]:
+        return [a for a, s in sorted(self.signs.items()) if s.contested]
 
 
 def calibrate_image(
@@ -812,9 +1026,16 @@ def calibrate_image(
     cam = Intrinsics(f=f, cx=cx, cy=cy)
 
     dirs: dict[int, np.ndarray] = {}
+    signs: dict[int, AxisSignCheck] = {}
     for axis, vp in vps.items():
         d = direction_from_vp(vp.v, cam)
         dirs[axis] = resolve_direction_sign(d, vp.v, axis_segments[axis])
+        # The same poll resolve_direction_sign just summed, kept per line. A
+        # reversed arrow among several does not raise the residual of anything,
+        # so if it is not said here it is not said at all.
+        signs[axis] = check_axis_signs(vp.v, axis_segments[axis], axis=axis)
+        if signs[axis].contested:
+            warnings.append(signs[axis].message())
 
     a0, a1 = axes[0], axes[1]
     d0, d1 = dirs[a0], dirs[a1]
@@ -838,9 +1059,30 @@ def calibrate_image(
     if missing in dirs:
         drawn = dirs[missing]
         if float(drawn @ cols[missing]) < 0.0:
+            # Three axes, and this says only that they do not form a right-handed
+            # set -- not which of the three is the odd one. Naming the third axis
+            # and stopping there was actively misleading: flip an X line and the
+            # completion disagrees with a perfectly well drawn Z, so the advice
+            # "flip them" sent someone to correct the one axis that was right.
+            # An axis whose own lines contradict each other is the better
+            # suspect, and that is what check_axis_signs has just worked out.
+            culprits = [AXIS_NAMES[a] for a in sorted(signs) if signs[a].contested]
+            where = (
+                f" The {', '.join(culprits)} control lines in this photo disagree among "
+                "themselves about direction, which is the likelier place the reversal is -- "
+                "fix that first and re-read this."
+                if culprits
+                else (
+                    f" Which axis is reversed this cannot say: any one of "
+                    f"{AXIS_NAMES[a0]}, {AXIS_NAMES[a1]} or {AXIS_NAMES[missing]} drawn backwards "
+                    "looks like this. Each axis's own lines agree with each other, so compare "
+                    "them against the part rather than against each other."
+                )
+            )
             warnings.append(
                 f"axis {AXIS_NAMES[missing]} control lines were drawn opposite to the "
-                "right-handed completion of the other two axes; flip them or expect a mirrored solve"
+                "right-handed completion of the other two axes, so the solve will be mirrored "
+                "or 180 deg out." + where
             )
 
     R = orthonormalize(np.column_stack([cols[0], cols[1], cols[2]]))
@@ -853,4 +1095,5 @@ def calibrate_image(
         orthogonality_error_deg=ortho_err,
         observability=observability,
         focal_relative_sigma=focal_sigma,
+        signs=signs,
     )

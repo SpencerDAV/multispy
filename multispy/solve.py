@@ -390,6 +390,13 @@ def calibrate_all(project: Project, report: SolveReport) -> dict[str, Intrinsics
                 f"used camera group {group.id}'s locked focal of {locked_f:.1f} px."
             )
         rep.notes.extend(calib.warnings)
+        # Promoted out of the per-image notes, deliberately. A contested axis
+        # sign is not a quality remark about one photograph like the rest of
+        # these -- it is a markup error that produces a confident, clean,
+        # 180-degree-wrong camera, and the per-image notes column is exactly
+        # where something that leaves no residual goes unread.
+        for axis in calib.contested_axes:
+            report.warnings.append(f"{im.id}: {calib.signs[axis].message()}")
         if calib.focal_relative_sigma is not None:
             rep.focal_sigma_pct = 100.0 * calib.focal_relative_sigma
             if calib.observability and calib.observability.best:
