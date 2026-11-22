@@ -204,7 +204,10 @@ def test_the_damage_it_prevents_is_a_clean_180():
             rotation_error_deg(spoiled.R, truth["R"][0]),
         )
 
-    used = sorted(calibrate(build_project(max_lines_per_axis=2)[0].images[0]).axes_used)[:2]
+    # Asked, not assumed. This was `sorted(axes_used)[:2]` while the rotation
+    # was always built from the two lowest-numbered axes; it is now the
+    # best-determined pair, so the photo has to be asked which one it used.
+    used = sorted(calibrate(build_project(max_lines_per_axis=2)[0].images[0]).rotation_axes)
     for axis in used:
         before, after = rotations[axis]
         assert before < 1.0 and after > 175.0, (axis, before, after)

@@ -6,6 +6,119 @@ worth more than one without.
 
 ---
 
+## Done: the rotation comes from the best-determined axis pair (Nov 2026)
+
+`calibrate_image` built every rotation from `axes[0], axes[1]` — X and Y
+whenever both were marked — and derived the third axis by cross product. The
+focal in the same function has always been an inverse-variance weighted average
+over *every* axis pair, "because a pair whose vanishing points sit near the
+image is worth orders of magnitude more than one relying on a near-infinite
+vanishing point". Only the rotation went on taking whichever pair came first.
+`observability.best` was computed forty lines above it and never read.
+
+It leaves no residual, which is why it survived. A pair whose vanishing points
+sit far outside the frame fixes its two directions badly and the rotation built
+on them is *confident*: the lines fit it to the pixel, the focal absorbs the
+rest, and the orthogonality figure stays small because it is measured on those
+same two directions. The only hint was the per-image `focal_sigma_pct`, which
+is reported against the **best** pair — not the pair the rotation used.
+
+Noticed 2026-11-20 during the third-axis-flip work and filed as *surprising but
+cosmetic*, with the workaround "the lever is which axes you supply". Measured
+2026-11-21. It is not cosmetic.
+
+On `projects/alberto` — nine handheld phone photographs, mixed portrait and
+landscape, mixed lens — the choice differs on four of the eight photographs and
+moves those rotations by 0.48 to 1.19 deg:
+
+| image | pair used / its focal sigma | best pair / sigma | rotations differ |
+|---|---|---|---|
+| img5 | X×Y / **51.5%** | X×Z / 2.8% | **1.19 deg** |
+| img3 | X×Y / 16.4% | X×Z / 1.2% | 0.83 deg |
+| img2 | X×Y / 2.8% | X×Z / 1.3% | 0.54 deg |
+| img0 | X×Y / 2.9% | Y×Z / 2.8% | 0.48 deg |
+
+| | before | after |
+|---|---|---|
+| group A (img3 4 5 7) | 0.510 / 1.132 px | 0.510 / 1.132 px |
+| group C (img0 img2) | 0.335 / 1.036 px | 0.335 / 1.036 px |
+| **all 8 photographs** | **34.749 / 32.352 px** | **2.222 / 3.026 px** |
+
+Per image on the eight-photograph solve: img0 **117.95 → 0.27 px**, img2's
+control-line RMS **84.67 → 1.19 px**. The cull note goes from "a further 15
+mark(s) look just as bad but were kept" to "a further 1". Fifteen marks were
+being blamed for a rotation error.
+
+**Neutral on every other project** — artifex4, perceptron, prm1 and rearmod3 are
+identical to the digit both ways. That is *not* because the choice never
+differs, which was the first guess and is wrong. The pair changes on **21 of the
+34 photographs** in `projects/`:
+
+| project | images whose pair changed | solve moved? |
+|---|---|---|
+| **alberto** | **4 of 8** (img0 XY→YZ, img2/3/5 XY→XZ) | **yes, 15×** |
+| prm1 | 7 of 9 | no |
+| rearmod3 | 7 of 8 | no |
+| perceptron | 3 of 7 | no |
+| artifex4 | 0 of 2 | — |
+
+So the change moves the *initialisation* on two thirds of every photograph in
+the collection, and the converged answer on one project. That is a better
+safety argument than neutrality would have been: the bundle demonstrably
+recovers from the worse initialisation when the geometry lets it, and the one
+place it cannot is the one place the old choice was doing damage.
+
+**Why alberto and not the others — the honest version.** Which pair is well
+determined depends on which world axis runs near the optical axis and on how
+much of each axis the frame can see, and turning a phone on its side changes
+the second by a factor of two (alberto's img8 has a ±40.5 deg vertical field of
+view in portrait against img9's ±21.5 in landscape). So a mixed-orientation set
+should be exactly where this bites. But alberto is **the only mixed-orientation
+set in `projects/`** — every other is single-orientation and single-camera —
+*and* the only one whose cameras sit within a hundredth of the scene of each
+other. The two explanations are confounded in this collection and it cannot say
+which is the discriminator. What it does say: on four single-orientation sets
+with ordinary baselines the bundle absorbed the worse initialisation entirely,
+and on the mixed-orientation near-panorama it did not.
+
+`Calibration.rotation_axes` now reports the pair, because the old answer was
+`axes_used[:2]` by construction and callers read it off there —
+`tests/test_axissign.py` among them. A reversed line on the derived axis is
+cosmetic while one on either chosen axis turns the camera half a turn, so
+anything reasoning about that has to be able to ask.
+
+The whole suite — all 25 files in `tests/` — passes with the change in, and was
+confirmed passing before it, so nothing here is inherited. `test_axissign` was
+the only existing test that needed touching: it read `axes_used[:2]` as the
+rotation pair, which was true by construction and no longer is.
+
+`tests/test_rotationpair.py` pins it on a geometry built from first principles:
+a camera turned so world X runs nearly parallel to the image plane, which sends
+X's vanishing point toward infinity while Y and Z stay well placed. Over 80
+draws of the pixel noise the median rotation error falls 1.3× to 1.7× and the
+90th percentile 1.2× to 1.8×, and both ratios grow as X is tipped further out of
+view — the conditioning gap is the mechanism, so that trend is the real claim.
+
+Two things deliberately **not** asserted. The worst draw: it reads well at the
+shallow end (9.1 deg against 3.8) but at tip 0.10 the bad pair's worst, 3.31
+deg, is *better* than the good pair's 3.79, and an extremum over 80 samples is
+not a statistic. And per-draw superiority: the first version of the test
+demanded it and failed at tip 0.02, seed 29 — 0.96 deg against 1.02. A
+worse-conditioned pair is not reliably wrong on one draw, it is higher
+variance, and it gets lucky on about a fifth of them. Both facts are pinned as
+facts so the next reader does not "disprove" the change from a single
+photograph.
+
+### Still open: use all three measured directions, not two
+
+Where all three axes are marked the third measured direction is used for the
+right-handed check and then discarded. A weighted orthogonal Procrustes fit of
+all three, each weighted by its own vanishing point's covariance, would use
+everything that was clicked. Unmeasured, so no claim about what it is worth —
+but note the ceiling: on alberto the two chosen directions are already good to
+3.2% focal-equivalent, so this is a refinement of a solved problem, not another
+15×.
+
 ## Done: IMAGE_ID is read out of COLMAP rather than guessed (Nov 2026)
 
 `point_triangulator` refuses a model whose `IMAGE_ID`s disagree with the

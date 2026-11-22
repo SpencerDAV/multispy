@@ -922,10 +922,38 @@ class Calibration:
     warning rather than a per-image note, and deciding that from a string is
     how a check quietly stops firing.
     """
+    rotation_axes: tuple[int, int] = (0, 1)
+    """The two axes the rotation was actually built from, third by cross product.
+
+    Worth reporting rather than inferring. It used to be ``axes_used[:2]`` by
+    construction, so callers read it off there; it is now the best-determined
+    pair, which is a different pair on about half of a mixed-orientation set.
+    Anything reasoning about which axis the rotation depends on -- a reversed
+    line on the derived axis is cosmetic, on either of these two it turns the
+    camera 180 deg -- has to read this rather than guess.
+    """
 
     @property
     def contested_axes(self) -> list[int]:
         return [a for a, s in sorted(self.signs.items()) if s.contested]
+
+
+def _rotation_pair(
+    axes: tuple[int, ...], observability: "AxisAnalysis | None"
+) -> tuple[int, int]:
+    """The axis pair to build a rotation from: the best determined one.
+
+    Falls back to the two lowest-numbered axes when no pair yields a real focal
+    length. That is the case a locked group focal exists to rescue, and there is
+    nothing to rank the pairs by, so the old behaviour is as good as any.
+    """
+    fallback = (axes[0], axes[1])
+    if observability is None or observability.best is None:
+        return fallback
+    a, b = observability.best.axis_a, observability.best.axis_b
+    if a == b or a not in axes or b not in axes:
+        return fallback
+    return (a, b)
 
 
 def calibrate_image(
@@ -1037,7 +1065,33 @@ def calibrate_image(
         if signs[axis].contested:
             warnings.append(signs[axis].message())
 
-    a0, a1 = axes[0], axes[1]
+    # Which pair of axes the rotation is built from, the third derived by cross
+    # product. The best-determined pair, not the two lowest-numbered ones.
+    #
+    # It used to be `axes[0], axes[1]` -- X and Y whenever both were marked --
+    # and that was wrong in a way that leaves no residual. A pair whose
+    # vanishing points sit far outside the frame fixes its two directions
+    # badly, and the rotation built on them is *confident*: the control lines
+    # fit it to the pixel, the focal absorbs the rest of the error, and the
+    # orthogonality figure stays small because it is measured on the same two
+    # directions. `focal_observability` already scores every pair, and the
+    # focal has long been an inverse-variance weighted average over all of
+    # them; only the rotation went on taking whichever came first.
+    #
+    # It costs most on a set shot at mixed orientations, where which pair is
+    # well conditioned changes from photograph to photograph: turning a phone on
+    # its side changes how much of each axis the frame can see by a factor of
+    # two, so taking X x Y every time is no better than taking one at random.
+    # Shot all one way up the choice is wrong in the same way everywhere and the
+    # bundle absorbs much of it, which is why this stayed hidden so long.
+    # Measured at 34.75 px reprojection against 2.22 on a nine-photo handheld
+    # set, and identical to the digit on the four single-orientation projects;
+    # figures and the test's own caveats are in TODO.md.
+    #
+    # Still only a pair. Where all three axes are marked the third measured
+    # direction is used for the right-handed check below and then discarded,
+    # and a joint weighted fit of all three would be better -- see TODO.md.
+    a0, a1 = _rotation_pair(axes, observability)
     d0, d1 = dirs[a0], dirs[a1]
     ortho_err = math.degrees(math.asin(max(-1.0, min(1.0, abs(float(d0 @ d1))))))
     if ortho_err > 10.0:
@@ -1092,6 +1146,7 @@ def calibrate_image(
         axes_used=axes,
         vps=vps,
         warnings=warnings,
+        rotation_axes=(a0, a1),
         orthogonality_error_deg=ortho_err,
         observability=observability,
         focal_relative_sigma=focal_sigma,

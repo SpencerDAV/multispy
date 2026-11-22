@@ -45,3 +45,22 @@ Thumbs.db
 # Static build output (rebuilt by tools/build_static.py)
 dist/
 tests/_scratch_sensorcheck/
+
+# Per-machine launch configuration for the Browser pane. Deliberately not
+# tracked: every entry names a project under projects/, which is itself
+# gitignored because it holds the user's own photos and marks. A committed copy
+# would point a fresh clone at folders it does not have, which is the same class
+# of fault tests.yml exists to catch.
+.claude/
+
+# Diagnostic plots written next to the tool that produced them
+# (tools/crossval.py --cull-sweep, and the residual field). Output, not source:
+# regenerate rather than read an old one, since neither records which solve it
+# came from.
+/cull-sweep.png
+/residual-field.png
+
+# Project save archives dropped in the working folder. Tens of megabytes each
+# and permanent once committed, so they are excluded by name rather than left
+# to be noticed in `git status`.
+*Save.zip

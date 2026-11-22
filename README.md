@@ -57,6 +57,17 @@ the weights come from the same error propagation that drives the Focal check
 panel. The joint solve still beats it by 50x on the median and 1600x on the
 worst case, which is the whole argument for marking a set rather than a photo.)
 
+The **rotation** is built from the best-determined of those pairs too, the third
+axis following by cross product. It used to take whichever pair came first,
+which is a quiet error: a pair whose vanishing points sit far outside the frame
+fixes its directions badly, and the rotation built on them is confident — the
+lines fit it to the pixel, the focal absorbs the rest, and the orthogonality
+figure stays small because it is measured on the same two directions. The
+choice changes the initial rotation on two thirds of the photographs in
+`projects/` and the converged answer on one of them, a nine-photo handheld set
+shot at mixed orientations, where it was worth 34.7 px of reprojection against
+2.2. Elsewhere the bundle absorbs it. See `TODO.md`.
+
 Rotations land within 0.2°, camera positions within 0.3% of the scene diagonal,
 and reprojection RMS settles below the injected click noise.
 
@@ -1320,6 +1331,7 @@ for.
 .venv\Scripts\python.exe tests\test_rig.py
 .venv\Scripts\python.exe tests\test_exif.py
 .venv\Scripts\python.exe tests\test_cameragroups.py
+.venv\Scripts\python.exe tests\test_rotationpair.py
 .venv\Scripts\python.exe tests\test_muting.py
 ```
 
@@ -1350,6 +1362,16 @@ single-lens import still lands in one group called `cam0`, a set with no EXIF
 behaves exactly as before, a quarter turn does not split a group, and an old
 project's `cam0` is adopted with its solved focal and its locks intact rather
 than duplicated beside.
+
+`test_rotationpair` covers choosing which axis pair a rotation is built from, on
+a camera turned so that one world axis runs nearly parallel to the image plane
+and its vanishing point runs off toward infinity. What it pins is a
+*distribution* and a trend, not a threshold: over 80 draws of the pixel noise
+the best-determined pair roughly halves the median rotation error, and the gain
+grows as the conditioning gap widens. It also pins the two things that are **not**
+true — the worst single draw is not reliably better, and on about a fifth of
+draws the badly conditioned pair wins by luck — so that nobody disproves the
+change from one photograph.
 
 `test_muting` covers taking a body's anchors out of the solve. The two
 properties it exists for are that **nothing is deleted** — the marks survive the
