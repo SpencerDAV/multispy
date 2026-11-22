@@ -194,6 +194,48 @@ def true_focal() -> float:
     return float(build_part_project()[1]["focal"])
 
 
+def assert_destroyed(unguarded: list[float], true: float, bound: float = 1.5) -> None:
+    """Every unguarded focal left the window the wall enforces.
+
+    Both arms of the wall tests need the unguarded run to *actually* collapse,
+    or they are measuring nothing and would keep passing with the wall removed.
+    The question is how to say "collapsed" without pinning where a diverging
+    optimiser happens to stop, which is not a property of this code and has now
+    gone red twice on numbers nobody chose:
+
+    * at ``true/1000``, a Linux CI seed settled at 6.5 px rather than under 2.1,
+      so the suite failed over a collapse of three hundred times instead of a
+      thousand;
+    * at ``true/50`` -- the loosening that answered the first -- a Windows CI
+      seed settled at **332.92** px, a collapse of six times instead of fifty.
+      On the machine this was written on the same three seeds give 4.5 to 6.7,
+      so the threshold was never close locally and there is no local run that
+      would have caught it. The trigger was a change of initialisation
+      (``calibrate_image`` taking the best-determined axis pair), which moves
+      one of the eight images in this scene and therefore moves where the
+      divergence lands. It did not make the collapse less of a collapse.
+
+    So the assertion is the property instead of the magnitude: without the wall
+    the focal ends up **outside the +-``bound`` window the wall would have
+    enforced**, which is exactly the claim "the wall was needed". It keeps the
+    test's teeth -- a focal that stayed good would sit inside the window and
+    fail this -- while being blind to which side of the window it left by and
+    how far, both of which are hardware noise. 6.5, 42 and 332.92 are all the
+    same verdict and the arithmetic now agrees.
+
+    Reach for a magnitude again only with a reason that is about the optics
+    rather than about where an optimiser stopped.
+    """
+    lo, hi = true / bound, true * bound
+    survivors = [f for f in unguarded if lo <= f <= hi]
+    assert not survivors, (
+        f"the unguarded solve kept the focal inside the wall's own window "
+        f"({lo:.0f}-{hi:.0f} px): {survivors}. Either the wall is no longer "
+        f"doing anything, or this scene stopped being a trap -- both make the "
+        f"guarded arm below vacuous. All values: {unguarded}"
+    )
+
+
 # --------------------------------------------------------------------------
 # the bug
 # --------------------------------------------------------------------------
@@ -211,7 +253,7 @@ def test_a_mismarked_body_cannot_collapse_the_focal():
     true = guarded[0][1]
 
     # the trap is real: without the wall the focal is gone, not merely off
-    assert all(f < true / 50 for f in unguarded), unguarded
+    assert_destroyed(unguarded, true)
 
     for f, _true, _rep, _proj in guarded:
         assert f > 0, f
@@ -224,6 +266,33 @@ def test_a_mismarked_body_cannot_collapse_the_focal():
     assert abs(median - true) < 0.05 * true, (median, true)
 
 
+def test_the_collapse_check_still_has_teeth():
+    """`assert_destroyed` has to reject a focal that survived.
+
+    Cheap, and it is the whole risk of stating the claim as a property rather
+    than a magnitude: a predicate that cannot fail is worse than a brittle
+    threshold, because it goes green for ever and says nothing. No solve here --
+    the two tests above supply the real values, this one supplies the ones that
+    must be refused.
+    """
+    true = 2100.0
+    # the failure that matters: the wall removed and the focal fine anyway
+    for survivor in (true, true * 1.4, true / 1.4):
+        try:
+            assert_destroyed([6.5, survivor], true)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"{survivor} is inside the window and was accepted")
+
+    # and the values the real runs have produced, which must all pass
+    assert_destroyed([4.49, 6.57, 6.68], true)        # this machine
+    assert_destroyed([6.68, 6.58, 332.92], true)      # windows CI
+    assert_destroyed([6.5], true)                     # the linux CI seed
+    # destroyed upwards counts too; "collapse" was never the real claim
+    assert_destroyed([true * 8], true)
+
+
 def test_the_wall_holds_against_the_worst_a_correspondence_can_be():
     """Anchors scattered at random across the frame.
 
@@ -234,14 +303,7 @@ def test_the_wall_holds_against_the_worst_a_correspondence_can_be():
     rather than destroyed.
     """
     unguarded = [solved_focal(0.0, "scattered", seed)[0] for seed in SCATTER_SEEDS]
-    # A fiftieth of the true focal, matching the sibling assertion above, and not
-    # the thousandth this used to demand. The claim being made is that the focal
-    # is destroyed without the wall, and 42 px against a true 2100 says that
-    # beyond argument. A thousandth was pinning where a diverging optimiser
-    # happens to stop, which is not a property of this code: on Linux CI one of
-    # these three seeds settled at 6.5 px rather than under 2.1 and the suite
-    # went red over a collapse of three hundred times instead of a thousand.
-    assert all(f < true_focal() / 50 for f in unguarded), unguarded
+    assert_destroyed(unguarded, true_focal())
 
     for seed in SCATTER_SEEDS:
         f, true, _rep, _proj = solved_focal(1.5, "scattered", seed)
@@ -453,6 +515,7 @@ def test_without_the_lock_the_same_photo_is_dropped():
 
 def main() -> int:
     tests = [
+        test_the_collapse_check_still_has_teeth,
         test_a_mismarked_body_cannot_collapse_the_focal,
         test_the_wall_holds_against_the_worst_a_correspondence_can_be,
         test_the_wall_is_inert_on_a_clean_solve,
